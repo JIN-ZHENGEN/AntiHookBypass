@@ -1,0 +1,13 @@
+build/
+*.jks
+*.keystore
+*.idsig
+__pycache__/
+*.pyc
+.idea/
+*.swp
+*.bak
+*.tmp
+.keys/
+review/**/*.jks
+review/**/*.apk
