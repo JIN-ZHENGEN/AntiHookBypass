@@ -9,5 +9,7 @@ __pycache__/
 *.bak
 *.tmp
 .keys/
+
+# 历史故障快照里的旧签名密钥与安装包：不入公共仓库
 review/**/*.jks
 review/**/*.apk

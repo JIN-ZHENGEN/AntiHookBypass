@@ -1,0 +1,551 @@
+/**
+ * Native 层总入口：把 L2（PLT/GOT）与 L3（syscall 层）合成一个库。
+ *
+ * ============================================================================
+ * 为什么合并成一个 so
+ * ============================================================================
+ * 最初 L2、L3 各写一个 .so，各有自己的 native_init。问题有三：
+ *
+ *   1. 两者都会 hook libc 的同一批函数，后装的会覆盖先装的 backup 指针，
+ *      互相打架；
+ *   2. L3 的 syscall 拦截要转发给"真正的 syscall"，如果转发目标本身已被
+ *      L2 换过，就会形成环或重复判断；
+ *   3. 两个 so 都要出现在 maps 里，暴露面翻倍。
+ *
+ * 合并后只有一个 so、一次安装、一份 backup 指针链，逻辑清晰且暴露面最小。
+ *
+ * ============================================================================
+ * 分层职责（合并后仍是两层逻辑）
+ * ============================================================================
+ * L2  PLT/GOT 层：替换 libc 导出的 open/openat/ptrace/fork/prctl/
+ *                 process_vm_readv。拦住"走 libc 函数调用"的检测。
+ * L3  syscall 层：替换 libc 的 syscall() 通用入口。拦住
+ *                 "syscall(SYS_xxx, ...)" 这种绕过具名函数的写法。
+ *
+ * 两者互补：L2 管具名函数，L3 管通用入口。
+ * 唯一都管不到的只有内联汇编 svc —— 那需要改代码字节，
+ * 会触发完整性校验，本模块刻意不做（理由见文档）。
+ */
+
+#include <jni.h>
+
+/* 观测面伪装（observe_mask.c） */
+extern char *mask_content_for(const char *path, const char *src, size_t len, size_t *out_len);
+extern int is_sensitive_path(const char *path);
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <dlfcn.h>
+#include <android/log.h>
+#include <stdint.h>
+#include <stdarg.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/ptrace.h>
+#include <sys/wait.h>
+#include <sys/uio.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+
+/* ---------------- LSPosed native hook 接口 ---------------- */
+
+typedef int (*HookFunType)(void *func, void *replace, void **backup);
+typedef int (*UnhookFunType)(void *func);
+typedef void (*NativeOnModuleLoaded)(const char *name, void *handle);
+
+typedef struct {
+    uint32_t version;
+    HookFunType hook_func;
+    UnhookFunType unhook_func;
+} NativeAPIEntries;
+
+static HookFunType g_hook = NULL;
+
+/* ---------------- 判定：是否来自检测逻辑 ---------------- */
+
+static const char *SUSPICIOUS[] = {
+    "antihook", "detect", "check", "scan", "integrity",
+    "tamper", "verify", "inspect", "probe", "audit",
+    "rootcheck", "emulator", "hookdetect", NULL
+};
+
+static const char *SAFE_LIBS[] = {
+    "libc.so", "linker", "libm.so", "libdl.so",
+    "libart.so", "libandroid_runtime.so", NULL
+};
+
+static int str_has(const char *h, const char *n) {
+    return (h && n) ? (strstr(h, n) != NULL) : 0;
+}
+
+/**
+ * 判断调用者是否可疑。
+ *
+ * 关键：查不到模块名时返回 0（放行）。
+ * 主可执行文件、JIT 代码堆、部分 ROM 的正常调用都查不到名字，
+ * 一律当可疑会把宿主直接搞崩。
+ */
+static int caller_suspicious(void *addr) {
+    if (!addr) return 0;
+    Dl_info info;
+    memset(&info, 0, sizeof(info));
+    if (dladdr(addr, &info) == 0 || !info.dli_fname) return 0;
+    for (int i = 0; SAFE_LIBS[i]; i++) {
+        if (str_has(info.dli_fname, SAFE_LIBS[i])) return 0;
+    }
+    for (int i = 0; SUSPICIOUS[i]; i++) {
+        if (str_has(info.dli_fname, SUSPICIOUS[i])) return 1;
+    }
+    return 0;
+}
+
+static int is_maps_path(const char *p) {
+    if (!p) return 0;
+    if (str_has(p, "/proc/self/maps")) return 1;
+    if (str_has(p, "/proc/self/smaps")) return 1;
+    if (str_has(p, "/proc/") && str_has(p, "/maps")) return 1;
+    return 0;
+}
+
+/* ================================================================== */
+/* L2：具名函数替换                                                    */
+/* ================================================================== */
+
+static int (*orig_open)(const char *, int, ...);
+static int (*orig_openat)(int, const char *, int, ...);
+static long (*orig_ptrace)(int, pid_t, void *, void *);
+static pid_t (*orig_fork)(void);
+static int (*orig_prctl)(int, unsigned long, unsigned long, unsigned long, unsigned long);
+static ssize_t (*orig_pvr)(pid_t, const struct iovec *, unsigned long,
+                           const struct iovec *, unsigned long, unsigned long);
+
+
+/* fd 追踪（定义在后面，这里先声明） */
+static void track_fd(int fd, const char *path);
+static const char *tracked_path(int fd);
+
+/* ================================================================== */
+/* 观测面伪装：把 fd 的内容替换成过滤后的版本                          */
+/* ================================================================== */
+
+/**
+ * 读整个 fd 内容，过滤，然后用 memfd 顶替。
+ *
+ * 为什么用 memfd 而不是写临时文件：
+ *   1. 不落盘，不会留下痕迹；
+ *   2. 没有路径，检测方查 /proc/self/fd 看到的是 /memfd:xxx，
+ *      比 /data/local/tmp/xxx 自然得多；
+ *   3. 进程退出自动回收，不需要清理。
+ *
+ * 失败时静默放行 —— 宁可漏拦，也不能让宿主崩溃或读到坏数据。
+ */
+static void mask_fd_content(int fd, const char *path) {
+    /*
+     * 关键修复：不能依赖 st_size。
+     *
+     * /proc/self/* 是伪文件系统，stat 出来的 size 恒为 0。
+     * 旧代码 `if (st.st_size <= 0) return;` 导致这个函数一次都没执行过 ——
+     * observe_mask.c 里那套精心的行过滤全是死代码。
+     *
+     * 正确做法：直接尝试读取。伪文件不支持 seek，用 read 循环读到 EOF。
+     */
+    struct stat st;
+    (void) fstat(fd, &st);      /* 只用来判断是否目录，不用 size */
+    if (st.st_size > 4 * 1024 * 1024) return;      /* 超大文件不处理 */
+
+    /* 伪文件：一次性读到一个足够大的缓冲区（maps 通常几十到几百 KB） */
+    size_t cap = 1024 * 1024;
+    char *buf = (char *) malloc(cap + 1);
+    if (!buf) return;
+    ssize_t got = 0;
+    for (;;) {
+        if ((size_t) got + 65536 > cap) break;
+        ssize_t r = read(fd, buf + got, cap - (size_t) got);
+        if (r <= 0) break;
+        got += r;
+    }
+    if (got <= 0) { free(buf); return; }
+    buf[got] = '\0';
+
+    size_t newlen = 0;
+    char *masked = mask_content_for(path, buf, (size_t) got, &newlen);
+    if (!masked) { free(buf); return; }
+
+    /* 建一个内存文件装伪装内容 */
+    int mfd = syscall(__NR_memfd_create, "jit-cache", 0);
+    if (mfd < 0) { free(masked); free(buf); return; }
+
+    ssize_t wr = write(mfd, masked, newlen);
+    free(masked);
+    free(buf);
+    if (wr < 0) { syscall(__NR_close, mfd); return; }
+
+    /* 把临时 fd 的内容顶到原 fd 号上（调用方会从 0 开始读） */
+    lseek(mfd, 0, SEEK_SET);
+    dup2(mfd, fd);
+    syscall(__NR_close, mfd);
+}
+
+static int fake_open(const char *path, int flags, ...) {
+    /*
+     * 关键：open 是变参函数，第三个参数只在 O_CREAT/O_TMPFILE 时才存在。
+     *
+     * 旧写法无条件调用 orig_open(path, flags, mode) —— 即使没有 O_CREAT
+     * 也把第三个参数塞进寄存器。这在 aarch64 上侥幸不崩（多余参数被忽略），
+     * 但在某些调用约定/内联场景下会读到垃圾值，进而破坏文件行为。
+     * 实测后果：检测器只报出 1 项而不是 6 项，说明它自己加载资源时被搞坏了。
+     *
+     * 正确做法：按是否有 O_CREAT 分两种调用，不制造多余参数。
+     */
+    if (flags & (O_CREAT | O_TMPFILE)) {
+        va_list ap; va_start(ap, flags);
+        mode_t mode = (mode_t) va_arg(ap, int);
+        va_end(ap);
+        int fd = orig_open(path, flags, mode);
+        if (fd >= 0 && is_sensitive_path(path)) mask_fd_content(fd, path);
+        return fd;
+    }
+    int fd = orig_open(path, flags);
+    /*
+     * 关键设计变更：
+     *
+     * 旧做法是"检测方一读 maps 就返回 ENOENT"。
+     * 那是很强的特征 —— 真实机器的 /proc/self/maps 永远打得开。
+     * 检测方只要判断 "open 失败" 就等于确认"有人在拦我"。
+     *
+     * 新做法：正常打开，然后把内容换成伪装版。
+     * 检测方读到的是合法 maps，只是里面没有可疑段。
+     * 这是通杀方案的核心 —— 改观测面，不改结论。
+     */
+    if (fd >= 0 && is_sensitive_path(path)) {
+        mask_fd_content(fd, path);
+    }
+    return fd;
+}
+
+static int fake_openat(int dirfd, const char *path, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags); mode = (mode_t) va_arg(ap, int); va_end(ap);
+    }
+    int fd = orig_openat(dirfd, path, flags, mode);
+    if (fd >= 0) {
+        track_fd(fd, path);
+        if (is_sensitive_path(path)) mask_fd_content(fd, path);
+    }
+    return fd;
+}
+
+static long fake_ptrace(int request, pid_t pid, void *addr, void *data) {
+    if ((request == PTRACE_ATTACH || request == PTRACE_SEIZE) && pid == getpid()) {
+        errno = EPERM;
+        return -1;
+    }
+    return orig_ptrace(request, pid, addr, data);
+}
+
+static pid_t fake_fork(void) {
+    if (caller_suspicious(__builtin_return_address(0))) {
+        errno = EAGAIN;
+        return -1;
+    }
+    return orig_fork();
+}
+
+static int fake_prctl(int option, unsigned long a2, unsigned long a3,
+                      unsigned long a4, unsigned long a5) {
+    /* 阻止检测把自己改成可 ptrace */
+    if (option == PR_SET_DUMPABLE && a2 == 1) {
+        return 0;
+    }
+    return orig_prctl(option, a2, a3, a4, a5);
+}
+
+/*
+ * process_vm_readv 拦截 —— 这是本模块最重要的一处。
+ *
+ * ============================ 为什么是关键 ============================
+ *
+ * 读了检测器的 Rust 源码后发现，它的两项核心检测全部走这个函数：
+ *
+ *   artcount.rs（ClassLoader 计数）:
+ *       process_vm_readv(getpid(), ...)   // 逐个读指针，数链表节点
+ *
+ *   inlinehook.rs（Inline Hook 扫描）:
+ *       safe_read() { process_vm_readv(getpid(), ...) }   // 读代码段找跳转
+ *
+ * 也就是说：**只要让 process_vm_readv 读自己时失败，这两项就都拿不到数据**，
+ * 它们的代码里对读取失败的处理是"跳过/报 info"，而不是"判定异常"。
+ *
+ * ============================ 之前为什么没生效 ============================
+ *
+ * 旧实现用 caller_suspicious() 判断"调用方 so 名里有没有 detect/scan 等词"。
+ * 这个判据有两个致命问题：
+ *   1. 检测器是 Rust 编译的 libantihook.so，dladdr 可能拿不到路径；
+ *   2. 更糟的是 libart.so 被列进了 SAFE_LIBS —— 而检测代码可能被 JIT 到
+ *      libart 的匿名段里执行，于是被判成"安全调用方"直接放行。
+ *
+ * ============================ 现在的策略 ============================
+ *
+ * 不再猜调用方是谁。只看一个事实：**读的目标是不是自己这个进程**。
+ *
+ *  - pid == getpid()：这是在自省内存。正常业务代码几乎不会用
+ *    process_vm_readv 读自己（要做也直接解引用指针了）。这类调用
+ *    九成以上是检测/分析行为，直接让它失败。
+ *  - pid != getpid()：跨进程读取（调试器、性能工具），放行。
+ *
+ * 返回 EPERM 而不是假数据，是因为检测器对 EPERM 的处理是"读不到，跳过"，
+ * 不会当成异常证据；如果返回假数据，反而可能构造出畸形链表让它报错。
+ */
+static ssize_t fake_pvr(pid_t pid, const struct iovec *liov, unsigned long liovcnt,
+                        const struct iovec *riov, unsigned long riovcnt,
+                        unsigned long flags) {
+    if (pid == getpid()) {
+        /*
+         * 还有一个例外要放行：ART 自己的 GC / 调试接口偶尔会用
+         * process_vm_readv 读自身做 compaction，拦了会崩。
+         * 判据：单次读取长度很大（>1MB）的通常是内部批量操作。
+         */
+        unsigned long total = 0;
+        if (riov && riovcnt > 0) {
+            for (unsigned long i = 0; i < riovcnt && i < 8; i++) {
+                total += riov[i].iov_len;
+            }
+        }
+        if (total > 1024 * 1024) {
+            return orig_pvr(pid, liov, liovcnt, riov, riovcnt, flags);
+        }
+        errno = EPERM;
+        return -1;
+    }
+    return orig_pvr(pid, liov, liovcnt, riov, riovcnt, flags);
+}
+
+/* ================================================================== */
+/* L3：syscall 通用入口                                                */
+/* ================================================================== */
+
+static long (*orig_syscall)(long, ...);
+
+/**
+ * syscall() 通用入口拦截。
+ *
+ * 这是 L2 的最大盲区：检测方用 syscall(SYS_openat, ...) 就绕过所有具名函数。
+ *
+ * varargs 转发说明：syscall 的参数个数随号而变，但内核只取它需要的个数，
+ * 多读几个寄存器值无害。统一按 6 个读是安全的。
+ */
+static long fake_syscall(long number, ...) {
+    va_list ap;
+    va_start(ap, number);
+    long a1 = va_arg(ap, long);
+    long a2 = va_arg(ap, long);
+    long a3 = va_arg(ap, long);
+    long a4 = va_arg(ap, long);
+    long a5 = va_arg(ap, long);
+    long a6 = va_arg(ap, long);
+    va_end(ap);
+
+    switch (number) {
+        case __NR_openat: {
+            const char *p = (const char *) a2;
+            if (is_maps_path(p) && caller_suspicious(__builtin_return_address(0))) {
+                errno = ENOENT;
+                return -1;
+            }
+            break;
+        }
+#ifdef __NR_open
+        case __NR_open: {
+            const char *p = (const char *) a1;
+            if (is_maps_path(p) && caller_suspicious(__builtin_return_address(0))) {
+                errno = ENOENT;
+                return -1;
+            }
+            break;
+        }
+#endif
+    case __NR_ptrace: {
+            if (((long) a1 == PTRACE_ATTACH || (long) a1 == PTRACE_SEIZE)
+                && (pid_t) a2 == getpid()) {
+                errno = EPERM;
+                return -1;
+            }
+            break;
+        }
+        case __NR_process_vm_readv: {
+            if ((pid_t) a1 == getpid() && caller_suspicious(__builtin_return_address(0))) {
+                errno = EPERM;
+                return -1;
+            }
+            break;
+        }
+        default:
+            break;
+    }
+
+    return orig_syscall(number, a1, a2, a3, a4, a5, a6);
+}
+
+/* ================================================================== */
+/* 安装与回调                                                          */
+/* ================================================================== */
+
+
+/* ================================================================== */
+/* 观测面：read/readv 内容过滤                                          */
+/* ================================================================== */
+
+/*
+ * 为什么必须拦 read 而不只是 open：
+ *
+ * 检测器读 /proc/self/maps 的完整流程是：
+ *     fd = open("/proc/self/maps", O_RDONLY);
+ *     while ((n = read(fd, buf, sizeof buf)) > 0) { ...分析... }
+ *
+ * 只在 open 阶段做手脚有两个问题：
+ *   1. 返回 ENOENT 太假（真机上 maps 永远存在）；
+ *   2. 就算 open 成功，检测器 read 出来的还是真实内容。
+ *
+ * 所以必须在这里对"从敏感 fd 读出来的数据"做过滤。
+ *
+ * 实现要点：需要一个 fd -> 路径 的映射。
+ * 我们在 open/openat 成功时记录下来，read 时查表。
+ */
+#define MAX_TRACKED_FD 512
+static char g_fd_path[MAX_TRACKED_FD][160];
+
+static void track_fd(int fd, const char *path) {
+    if (fd < 0 || fd >= MAX_TRACKED_FD) return;
+    if (!path) { g_fd_path[fd][0] = '\0'; return; }
+    size_t n = strlen(path);
+    if (n >= sizeof(g_fd_path[0])) n = sizeof(g_fd_path[0]) - 1;
+    memcpy(g_fd_path[fd], path, n);
+    g_fd_path[fd][n] = '\0';
+}
+
+static const char *tracked_path(int fd) {
+    if (fd < 0 || fd >= MAX_TRACKED_FD) return NULL;
+    return g_fd_path[fd][0] ? g_fd_path[fd] : NULL;
+}
+
+/*
+ * read 的过滤策略：
+ *
+ * 麻烦在于 read 是流式的 —— 检测器可能分多次读，每次只读几 KB。
+ * 如果每次只过滤"本次读到的内容"，跨缓冲区边界的行会被漏掉。
+ *
+ * 折中方案（足够实用）：
+ *   - 对 /proc/self/maps 这类"行式"文件，大多数检测器一次读完（几 KB~几十 KB）；
+ *   - 我们按"本次缓冲区"做行过滤，命中行替换成无害行；
+ *   - 边界行可能漏，但漏掉的那一行不会造成"发现 hook"，
+ *     只会让它少看到一个可疑段 —— 效果仍然达到。
+ *
+ * 这个取舍是明确的：宁可漏掉极少数边界情况，也不引入复杂的状态机
+ * （状态机会增加崩溃风险，且需要额外缓冲，违背"不影响宿主"的约束）。
+ */
+static ssize_t (*orig_read)(int, void *, size_t);
+static int (*orig_close)(int);
+
+static int fake_close(int fd) {
+    if (fd >= 0 && fd < MAX_TRACKED_FD) g_fd_path[fd][0] = '\0';
+    return orig_close(fd);
+}
+
+static ssize_t fake_read(int fd, void *buf, size_t count) {
+    ssize_t n = orig_read(fd, buf, count);
+    if (n <= 0 || !buf) return n;
+
+    const char *path = tracked_path(fd);
+    if (!path || !is_sensitive_path(path)) return n;
+
+    size_t outlen = 0;
+    char *masked = mask_content_for(path, (const char *) buf, (size_t) n, &outlen);
+    if (!masked) return n;
+
+    /* 伪装后可能变长（补空格），必须不超过调用方缓冲区 */
+    if (outlen <= count) {
+        memcpy(buf, masked, outlen);
+        n = (ssize_t) outlen;
+    }
+    free(masked);
+    return n;
+}
+
+void set_hook_func(void *fn) {
+    g_hook = (HookFunType) fn;
+}
+
+static void hook_one(void *handle, const char *name, void *fake, void **backup) {
+    void *sym = dlsym(handle, name);
+    if (!sym) {
+        __android_log_print(ANDROID_LOG_ERROR, "AHBPROBE", "  dlsym(%s) -> NULL", name);
+        return;
+    }
+    if (!g_hook) {
+        __android_log_print(ANDROID_LOG_ERROR, "AHBPROBE", "  %s: g_hook NULL", name);
+        return;
+    }
+    /* Dobby 语义：0 = RS_SUCCESS，-1 = RS_FAILED。旧代码从不检查，等于盲装。 */
+    int rc = g_hook(sym, fake, backup);
+    __android_log_print(ANDROID_LOG_ERROR, "AHBPROBE", "  hook %-20s sym=%p rc=%d %s",
+                        name, sym, rc, rc == 0 ? "OK" : "FAILED");
+    (void) backup;
+}
+
+void install_all(void *handle) {
+    /*
+     * 只保留 7 个低频、语义明确的入口。
+     *
+     * read / close 不在其中：实测在 libc 上 hook 这两个函数会触发
+     * SIGILL @ libc.so+0x11aa30（fault addr 0x781d3dba30，可复现）。
+     * 它们被 libc 内部大量内联调用，Dobby 改写入口后与自身日志/分配器
+     * 产生冲突。要处理文件内容，改用 open 时替换 fd 的方式，不碰 read。
+     */
+    hook_one(handle, "open",             (void *) fake_open,  (void **) &orig_open);
+    hook_one(handle, "openat",           (void *) fake_openat,(void **) &orig_openat);
+    hook_one(handle, "ptrace",           (void *) fake_ptrace,(void **) &orig_ptrace);
+    hook_one(handle, "fork",             (void *) fake_fork,  (void **) &orig_fork);
+    hook_one(handle, "prctl",            (void *) fake_prctl, (void **) &orig_prctl);
+    hook_one(handle, "process_vm_readv", (void *) fake_pvr,   (void **) &orig_pvr);
+    hook_one(handle, "syscall",          (void *) fake_syscall,(void **) &orig_syscall);
+}
+
+
+static void on_library_loaded(const char *name, void *handle) {
+    if (!name || !handle) return;
+    if (strstr(name, "libc.so")) {
+        install_all(handle);
+    }
+}
+
+/**
+ * 模块 native 入口。
+ * 名字必须是 native_init 且导出，由 META-INF/xposed/native_init.list 指定。
+ */
+__attribute__((visibility("default"))) __attribute__((used))
+NativeOnModuleLoaded native_init(const NativeAPIEntries *entries) {
+    /* 用 logcat 做标记：不依赖文件权限，一定能看到 */
+    __android_log_print(ANDROID_LOG_ERROR, "AHBPROBE", "native_init ENTERED entries=%p", (void*)entries);
+    if (entries) {
+        __android_log_print(ANDROID_LOG_ERROR, "AHBPROBE", "  version=%u hookFunc=%p unhookFunc=%p",
+                            entries->version, (void*)entries->hook_func, (void*)entries->unhook_func);
+    }
+    if (!entries || !entries->hook_func) {
+        __android_log_print(ANDROID_LOG_ERROR, "AHBPROBE", "  REJECT: no hook_func");
+        return NULL;
+    }
+    g_hook = entries->hook_func;
+    __android_log_print(ANDROID_LOG_ERROR, "AHBPROBE", "  g_hook set OK");
+
+    /* libc 已加载，立刻挂；后续加载的库走回调 */
+    void *libc = dlopen("libc.so", RTLD_NOW | RTLD_NOLOAD);
+    __android_log_print(ANDROID_LOG_ERROR, "AHBPROBE", "  libc handle=%p", libc);
+    if (libc) install_all(libc);
+    __android_log_print(ANDROID_LOG_ERROR, "AHBPROBE", "  install_all done");
+
+    return on_library_loaded;
+}
