@@ -847,7 +847,7 @@ static void *maps_popen_wrap(const char *cmd, const char *mode) {
  */
 
 #define AHB_MAX_SO      768
-#define AHB_MAX_SEG     4096
+#define AHB_MAX_SEG     8192
 
 #define R_AARCH64_JUMP_SLOT  1026
 #define R_AARCH64_GLOB_DAT   1025
@@ -1202,6 +1202,9 @@ static int ahb_patch_one_so(ahb_so_ent *so) {
                     continue;
                 }
                 so->has_target = 1;
+                if (strstr(so->path, "/libc.so")) {
+                    ahb_filelog("MAPS libc-target %s slot=%p", nm, (void *)(so->base + r[k].r_offset));
+                }
                 slot = so->base + (uintptr_t)r[k].r_offset;
                 if (!ahb_addr_mapped(slot, sizeof(uintptr_t))) continue;
                 if (!ahb_write_slot(slot, repl)) continue;
@@ -1312,14 +1315,42 @@ static int maps_patch_got_all(void) {
         char perm[16] = {0}, path[AHB_PATH_MAX] = {0};
         if (sscanf(line, "%llx-%llx %15s %llx %*s %*s %319[^\n]",
                    &s, &e, perm, &off, path) < 4) continue;
-        ahb_seg_add((uintptr_t)s, (uintptr_t)e, perm);
         if (path[0] != '/') continue;
         if (!strstr(path, ".so")) continue;
         if (ahb_so_skip(path)) continue;
+        /*
+         * 段表只记录 .so 的段。
+         *
+         * 早期对每一条 maps 行都 ahb_seg_add，而进程 maps 有两三千行
+         * （含大量匿名段、[anon:...]、堆栈等），表瞬间被填满，
+         * 排在后面的库（libc 就在 apex 段，顺序靠后）连段都进不来，
+         * 更不可能被校验通过。
+         *
+         * 只记 .so 段之后，条目数降到几百，表永远够用。
+         */
+        ahb_seg_add((uintptr_t)s, (uintptr_t)e, perm);
         ahb_so_note(path, (uintptr_t)s, (uintptr_t)off);
     }
     fclose(fp);
 
+    {
+        static int rep = 0;
+        if (rep < 6) {
+            rep++;
+            ahb_filelog("MAPS scan so_n=%d seg_n=%d done_n=%d", g_so_n, g_seg_n, g_done_n);
+        }
+        /* 列出表里所有含 "libc.so" 的条目，确认它到底在不在 */
+        if (rep <= 2) {
+            int k;
+            for (k = 0; k < g_so_n; k++) {
+                if (strstr(g_so_tab[k].path, "/libc.so")) {
+                    ahb_filelog("MAPS inlist %s base=%#lx done=%d",
+                                g_so_tab[k].path, (unsigned long)g_so_tab[k].base,
+                                ahb_already_done(g_so_tab[k].path));
+                }
+            }
+        }
+    }
     for (i = 0; i < g_so_n; i++) {
         ahb_patch_one_so(&g_so_tab[i]);
     }

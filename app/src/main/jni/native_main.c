@@ -937,6 +937,10 @@ static ssize_t clv_pvr(pid_t pid, const struct iovec *local, unsigned long liovc
         }
     }
 
+    /*
+     * 只有在"读的是已登记候选 head 或合成节点"时才改写。
+     * 若 pid 不是自己、或读的不是这些地址，原样返回，不引入任何额外语义。
+     */
     ssize_t remaining = n;
     for (unsigned long i = 0; i < riovcnt && i < liovcnt && remaining > 0; i++) {
         size_t rlen = remote[i].iov_len;
@@ -975,6 +979,11 @@ static ssize_t clv_pvr(pid_t pid, const struct iovec *local, unsigned long liovc
                         memcpy((void *)(lstart + (ovs - rstart)),
                                sl->headbuf + src_off, len);
                         g_clv_hits++;
+                        if (g_clv_hits <= 12) {
+                            ahb_filelog("VIEW hithead head=%#lx roff=%zu len=%zu",
+                                        (unsigned long)sl->head,
+                                        (size_t)(ovs - rstart), len);
+                        }
                     }
                 }
             }
@@ -1109,6 +1118,8 @@ static void clv_install_now(void) {
 
     if (!g_real_pvr) {
         g_real_pvr = (pvr_fn)dlsym(RTLD_DEFAULT, "process_vm_readv");
+    }
+    if (!g_real_syscall) {
         g_real_syscall = (syscall_fn)dlsym(RTLD_DEFAULT, "syscall");
     }
     clv_patch_got();
@@ -1528,6 +1539,17 @@ jint JNI_OnLoad(JavaVM *vm, void *reserved) {
      * clv_patch_got（现委托给重定位驱动），而那个函数受 g_enable_maps_hide
      * 控制。开关晚一步，前面那次扫描就整轮跳过。
      */
+    /*
+     * 先把真实函数地址解析好，再开始任何接管。
+     *
+     * 顺序问题会造成间歇性失败：clv_patch_got 依赖 g_real_pvr 非空才干活，
+     * 而它原来是在 clv_install_now 之后才被赋值的。若首轮扫描发生在赋值前，
+     * 那一轮就整轮跳过，接管只能等下一轮 —— 实测表现为"约一半的启动
+     * ClassLoader 项读到真值 32"。
+     */
+    if (!g_real_pvr)      g_real_pvr      = (pvr_fn)dlsym(RTLD_DEFAULT, "process_vm_readv");
+    if (!g_real_syscall)  g_real_syscall  = (syscall_fn)dlsym(RTLD_DEFAULT, "syscall");
+
     g_enable_maps_hide = 1;
     {
         FILE *cf = fopen("/data/local/tmp/ahb_layers", "r");
