@@ -106,6 +106,25 @@ AHB_KEYSTORE=/path/to/release.jks bash tools/build.sh
 | 检测完全在 native 闭环，用内联汇编 `svc` 直接杀进程 | 要拦得改代码字节，那会触发完整性校验，反而暴露 |
 | 结果发到服务器二次校验 | 客户端改不了 |
 | 检测器比模块更早加载并完成扫描 | 时序竞态，本模块已经抢到最早时机，但不能保证对所有实现都赢 |
+| 宿主自身存在与注入无关的崩溃 | 例如 hunter 在本机会 `FORTIFY: strcpy` abort、twin 进程 SIGSEGV —— 关掉模块同样复现，属它自己的兼容性问题 |
+
+## 关于性能
+
+这一版把模块自身的启动开销压到了 **71 ms**（`native_init` 到装载完毕）。几处关键取舍：
+
+- **GOT 槽写入走 `/proc/self/mem` 而不是 `mprotect`**。后者会把内核 VMA 拆碎 —— 实测 linker64 的 `r-x` 从 1 段变 3 段，任何按 maps 解析库布局的检测器都会算错基址。`pwrite` 走 `FOLL_FORCE`，页表与 VMA 结构都保持原样。
+- **fd 复用**：`/proc/self/mem` 长期持有，不再每槽 open/close。
+- **持久 done 集合**：接过的库不再重复解析 ELF。
+- **maps 过滤 120ms 时间窗口缓存 + 250ms 去抖**：目标连读几百次 maps 时，只有第一次真的解析。
+- **日志按库汇总**：一次启动从上千次写文件降到几十次。
+
+## 关于崩溃排查的三条硬结论
+
+都是实测踩出来的，写下来省得后人再踩：
+
+1. **不要给匿名可执行页撤执行权限**。ART 的 JIT 代码缓存本身就是匿名 `r-x`，且含 `ldr x16,#8 / br x16` 桩（JIT 正常产物，与 hook 跳板形态一致，无法靠指令区分）。撤权限会让 ART 直接 abort（`"Jit code cache for mutator"(exclusive held)`）。LSPosed 的 stack trace hook 也跑在匿名可执行页上，撤权限同样会崩。
+2. **不要用 `_Unwind_Backtrace` 做诊断**。ART 持锁 abort 时遍历栈会读正在被改写的栈帧，把「目标主动退出」变成「ART 崩溃」。用 `__builtin_return_address` 取几层就够。
+3. **不要无条件标记「该库已处理」**。检测器自己的 `.so` 是进程起来后才 `dlopen` 的，第一次扫描时符号还没解析完，一个槽都接不上；此时标记完成就永久跳过了它。判据应该是「重定位表里有没有目标符号」而不是「试过几次」。
 
 ---
 
