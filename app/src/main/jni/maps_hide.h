@@ -1264,7 +1264,77 @@ static int ahb_patch_one_so(ahb_so_ent *so) {
 
 /* 扫全部已映射的 .so，收集基址与段保护位，再逐个按重定位接管 */
 static int g_maps_no_debounce = 0;   /* 1 = 跳过去抖，供视图接管使用 */
+
+/*
+ * 串行化。
+ *
+ * maps_patch_got_all 会被三处并发调用：
+ *   1) JNI_OnLoad 主线程
+ *   2) clv_fast_patch_thread 抢跑线程
+ *   3) guard_loop 守护线程
+ * 它内部依赖 g_so_tab / g_seg_tab 两个全局表，并发进来必然互相踩：
+ * 一个线程刚把 g_so_n 清零、表写到一半，另一个线程就遍历它 ——
+ * 实测会读到半截表项，然后用错的 base 去解析 ELF，SIGSEGV。
+ *
+ * 用原子自旋锁而不是 pthread_mutex：这里临界区短、竞争极少，
+ * 且不能依赖 pthread 初始化时机。
+ */
+static volatile int g_maps_lock = 0;
+
+/*
+ * 用内联汇编实现自旋锁，不依赖任何编译器内建。
+ *
+ * 踩过两次坑，都是同一类问题：
+ *   __atomic_compare_exchange_n  -> 引用 __aarch64_cas4_acq
+ *   __sync_lock_test_and_set     -> 引用 __aarch64_swp4_acq_rel
+ * 这些 libatomic 符号 Bionic 不导出，dlopen 直接失败，
+ * 整个模块装不上（"cannot locate symbol ..."）。
+ *
+ * 直接写 ldaxr/stxr：单条指令、无外部依赖、跨 clang 版本行为一致。
+ * 其它 ABI（x86/x86_64/armv7）用对应指令。
+ */
+static int maps_try_lock(void) {
+    int expected = 0;
+#if defined(__aarch64__)
+    int tmp, ok;
+    __asm__ __volatile__(
+        "ldaxr  %w0, [%2]\n"
+        "cbnz   %w0, 1f\n"
+        "stxr   %w1, %w3, [%2]\n"
+        "b      2f\n"
+        "1:\n"
+        "mov    %w1, #1\n"
+        "2:\n"
+        : "=&r"(tmp), "=&r"(ok)
+        : "r"(&g_maps_lock), "r"(1)
+        : "memory");
+    return ok == 0;
+#elif defined(__x86_64__) || defined(__i386__)
+    return __sync_bool_compare_and_swap(&g_maps_lock, expected, 1);
+#else
+    return __sync_lock_test_and_set(&g_maps_lock, 1) == 0;
+#endif
+}
+
+static void maps_unlock(void) {
+#if defined(__aarch64__)
+    __asm__ __volatile__("stlrb wzr, [%0]" :: "r"(&g_maps_lock) : "memory");
+#else
+    __sync_lock_release(&g_maps_lock);
+#endif
+}
+
+static int maps_patch_got_all_locked(void);
+
 static int maps_patch_got_all(void) {
+    int r;
+    if (!maps_try_lock()) return 0;   /* 别人正在扫，直接跳过这一轮 */
+    r = maps_patch_got_all_locked();
+    maps_unlock();
+    return r;
+}
+
+static int maps_patch_got_all_locked(void) {
     FILE *fp;
     char line[1024];
     int before, i;

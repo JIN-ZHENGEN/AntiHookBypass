@@ -171,6 +171,7 @@ static volatile int g_l3_done = 0;
  * 且不碰代码段、不影响其他模块的 hook。
  */
 #define CLV_KEEP 4
+#define CLV_MAX_CHAIN 64
 #define CLV_MAX_HEADS 8
 
 /*
@@ -182,7 +183,9 @@ static volatile int g_l3_done = 0;
 struct clv_slot {
     uintptr_t head;
     unsigned char headbuf[0x40];
-    unsigned char nodes[CLV_KEEP][0x40];
+    uintptr_t     node_addr[CLV_MAX_CHAIN]; /* 真实节点地址 */
+    unsigned char nodebuf[CLV_MAX_CHAIN][0x10]; /* 每个真实节点要返回的 prev/next */
+    int           keep;
     volatile int ready;
 };
 static struct clv_slot g_clv[CLV_MAX_HEADS];
@@ -195,6 +198,7 @@ static volatile int g_clv_got_patched = 0;
 static uintptr_t g_dbg_addr[64];
 static volatile int g_dbg_i = 0;
 static volatile int g_clv_rescanned = 0;
+static uintptr_t g_clv_need_build = 0;
 
 typedef ssize_t (*pvr_fn)(pid_t, const struct iovec *, unsigned long,
                           const struct iovec *, unsigned long, unsigned long);
@@ -859,33 +863,137 @@ static struct clv_slot *clv_find(uintptr_t head) {
 
 static void clv_build(uintptr_t head) {
     if (head == 0) return;
+    /*
+     * 防递归：clv_build 内部用 read_ptr_untagged 读内存，而那走的是
+     * process_vm_readv —— 已经被我们自己接管。若不加标记，
+     * 就会 clv_build -> read -> clv_pvr -> clv_install_now -> clv_build
+     * 无限递归，栈溢出。实测表现是崩在 maps_patch_got_all 附近。
+     */
+    if (g_clv_in_wrap) return;
     struct clv_slot *sl = clv_find(head);
-    if (!sl) {
-        if (g_clv_n >= CLV_MAX_HEADS) return;
-        sl = &g_clv[g_clv_n];
-        sl->head = head;
-        memset(sl->headbuf, 0, sizeof(sl->headbuf));
-        memset(sl->nodes, 0, sizeof(sl->nodes));
-        for (int i = 0; i < CLV_KEEP; i++) {
-            uintptr_t node = (uintptr_t)sl->nodes[i];
-            uintptr_t prev = (i == 0) ? head : (uintptr_t)sl->nodes[i - 1];
-            uintptr_t next = (i == CLV_KEEP - 1) ? head : (uintptr_t)sl->nodes[i + 1];
-            memcpy(sl->nodes[i] + 0x00, &prev, 8);
-            memcpy(sl->nodes[i] + 0x08, &next, 8);
+    if (sl) return;
+    if (g_clv_n >= CLV_MAX_HEADS) return;
+
+    sl = &g_clv[g_clv_n];
+    sl->head = head;
+    memset(sl->headbuf, 0, sizeof(sl->headbuf));
+    memset(sl->node_addr, 0, sizeof(sl->node_addr));
+
+    /*
+     * 直接在**真实节点**上做视图改写，不再合成假节点。
+     *
+     * 之前的做法是让 head 指向模块自己的缓冲区（合成节点），
+     * 但实测无效：检测器会沿它拿到的 next 继续读，而那些地址
+     * 一旦离开我们伪造的那几个字节，后面读到的就是真实节点的
+     * next/prev —— 于是它照样把整条真链走完，数出 32。
+     * 实测证据：calls=1310 hits=10，1310 次读取里只有 10 次命中。
+     *
+     * 现在的做法：先把真实链表的前 KEEP 个节点走一遍拿到地址，
+     * 然后改写这些真实节点的 next/prev，让链表在 KEEP 步内闭合。
+     * 检测器无论从 head 还是从中间节点进入，走 KEEP 步就回到 head。
+     *
+     * 关键：只改视图（process_vm_readv 返回的字节），
+     * 真实内存里的链表一个字节不动 —— ART 与 GC 完全不受影响。
+     */
+    {
+        uintptr_t cur = 0;
+        int n = 0;
+        /*
+         * 链表头的 prev/next 字段顺序在 libc++ 的不同实现里是
+         * {prev,next} 或 {next,prev}，不能假定 +8 一定是 next。
+         *
+         * 检测器自己就是这么处理的：它取 a=rp(head)、b=rp(head+8)，
+         * 然后分别用 walk_chain(b,head,8) 和 walk_chain(a,head,0)
+         * 双向各走一遍取最大值。这里用同一套判定：
+         * 哪个方向能闭环回 head，就用哪个作为 next。
+         */
+        {
+            uintptr_t a = 0, b = 0, an = 0, bp = 0;
+            int ok_a = 0, ok_b = 0;
+            if (read_ptr_untagged(head, &a) && read_ptr_untagged(head + 8, &b)) {
+                a = UNTAG_PTR(a); b = UNTAG_PTR(b);
+                if (read_ptr_untagged(a + 8, &an)) ok_a = (UNTAG_PTR(an) == head);
+                if (read_ptr_untagged(b, &bp))     ok_b = (UNTAG_PTR(bp) == head);
+            }
+            if (ok_b)      cur = b;   /* head+8 是 next */
+            else if (ok_a) cur = a;   /* head+0 是 next */
+            else           return;
         }
-        uintptr_t tail = (uintptr_t)sl->nodes[CLV_KEEP - 1];
-        uintptr_t first = (uintptr_t)sl->nodes[0];
-        uintptr_t size = CLV_KEEP;
-        memcpy(sl->headbuf + 0x00, &tail, 8);
-        memcpy(sl->headbuf + 0x08, &first, 8);
-        memcpy(sl->headbuf + 0x10, &size, 8);
-        sl->ready = 1;
-        g_clv_n++;
-        LOGI("L3 view: 登记候选 head=%#lx -> %d 节点 (共%d条)",
-             (unsigned long)head, CLV_KEEP, g_clv_n);
-        ahb_filelog("VIEW register head=%#lx keep=%d total=%d",
-                    (unsigned long)head, CLV_KEEP, g_clv_n);
+        while (n < CLV_MAX_CHAIN && cur != 0 && cur != head &&
+               cur >= USER_PTR_MIN && cur < USER_PTR_MAX) {
+            uintptr_t nxt = 0;
+            sl->node_addr[n] = cur;
+            n++;
+            if (!read_ptr_untagged(cur + 8, &nxt)) break;
+            cur = UNTAG_PTR(nxt);
+            if (n > 64) break;   /* 防跑飞 */
+        }
+        if (n == 0) return;
+        sl->keep = n;
+
+        /*
+         * 构造**整条链**的视图，而不是只前 4 个。
+         *
+         * 检测器从 head 出发一路走到回到 head 为止，读的是链上**每一个**
+         * 真实节点的 next。只覆盖前 4 个的话，它走到第 5 个节点时读到的
+         * 就是真实 next，于是继续沿真链走完，数出 31。
+         * 实测证据：calls=1310 hits=10 —— 1310 次读取里只有 10 次命中。
+         *
+         * 因此把整条链（最多 CLV_MAX_CHAIN 个节点）都纳入视图：
+         * 第 KEEP-1 个节点的 next 直接指回 head，链在 KEEP 步内闭合。
+         * 其余节点的 next 也统一指向 head，保证从任何节点进入都能快速收敛。
+         */
+        for (int i = 0; i < n; i++) {
+            uintptr_t prev, next;
+            if (i < CLV_KEEP) {
+                /* 前 KEEP 个节点构成闭环：head <-> n0 <-> n1 <-> n2 <-> n3 <-> head */
+                prev = (i == 0) ? head : sl->node_addr[i - 1];
+                next = (i == CLV_KEEP - 1) ? head : sl->node_addr[i + 1];
+            } else {
+                /*
+                 * 超出 KEEP 的节点：两个方向都直接指回 head。
+                 *
+                 * 这一步是决定性的。检测器不是只走一个方向 ——
+                 * 它做 c1 = walk_chain(head->next, head, +8)
+                 * 与 c2 = walk_chain(head->prev, head, +0)，
+                 * 然后取**最大值**。
+                 *
+                 * 早期只让 forward 在 KEEP 步闭合，backward 仍沿真实 prev
+                 * 走完整条链（实测 20 个节点），于是 max(4, 20) = 20，
+                 * 照样判风险。日志里 "检测到 20 个" 就是这么来的。
+                 *
+                 * 现在两个方向都在 KEEP 步内收敛，从任何节点进入
+                 * 最多 KEEP 步就回到 head。
+                 */
+                prev = head;
+                next = head;
+            }
+            memcpy(sl->nodebuf[i] + 0x00, &prev, 8);
+            memcpy(sl->nodebuf[i] + 0x08, &next, 8);
+        }
+        /*
+         * head 的 prev/next 指向**闭环内**的两端（第 KEEP-1 个 / 第 0 个），
+         * 不能指向整条链的最后一个节点 —— 那会让 backward 从链尾开始走，
+         * 一路读回真实前驱。
+         */
+        {
+            uintptr_t prev = sl->node_addr[(n < CLV_KEEP) ? (n - 1) : (CLV_KEEP - 1)];
+            uintptr_t next = sl->node_addr[0];
+            memcpy(sl->headbuf + 0x00, &prev, 8);
+            memcpy(sl->headbuf + 0x08, &next, 8);
+            ahb_filelog("VIEW built head=%#lx n=%d headnext=%#lx node0=%#lx node3next=%#lx",
+                        (unsigned long)head, n, (unsigned long)next,
+                        (unsigned long)sl->node_addr[0],
+                        (unsigned long)(sl->keep > CLV_KEEP ? 0 : 0));
+        }
     }
+
+    sl->ready = 1;
+    g_clv_n++;
+    LOGI("L3 view: 登记 head=%#lx 真实节点=%d (共%d条)",
+         (unsigned long)head, sl->keep, g_clv_n);
+    ahb_filelog("VIEW register head=%#lx keep=%d total=%d",
+                (unsigned long)head, sl->keep, g_clv_n);
 }
 
 /*
@@ -916,13 +1024,28 @@ static ssize_t clv_pvr(pid_t pid, const struct iovec *local, unsigned long liovc
      * 所以只要包装第一次被走到，就说明它已经开扫，立刻按当时的结构重扫一遍，
      * 把所有闭环候选补登记。重扫只做一次，避免和它的读取互相拖慢。
      */
-    if (!g_clv_rescanned) {
-        g_clv_rescanned = 1;
+    /*
+     * 候选清单必须在"检测器开始读"到"它真正选中某条链"之间保持最新。
+     *
+     * 原来只重扫一次，实测不够：Runtime 里的闭环是在启动过程中陆续成形的，
+     * 检测器先读 vm/runtime（触发我的那一次重扫），之后才真正遍历它选中的链 ——
+     * 那条链可能是重扫之后才闭合的，于是没被登记，读到的仍是真值。
+     * 表现就是 ClassLoader 项间歇性翻红（实测 3 轮里坏 1 轮）。
+     *
+     * 改为：前若干次读取里每次都补扫一遍，直到候选数稳定为止。
+     * 扫描本身是"扫 Runtime 的 0..0x500 指针 + 找闭环"，开销很小。
+     */
+    {
+        static int rescans = 0;
         uintptr_t ra0 = (riovcnt >= 1) ? (uintptr_t)remote[0].iov_base : 0;
-        if (ra0 != 0) {
+        if (ra0 != 0 && rescans < 64) {
+            rescans++;
             int before = g_clv_n;
             clv_install_now();
-            LOGI("RESCAN: 检测器首次读取时重扫 slots %d -> %d", before, g_clv_n);
+            if (g_clv_n != before) {
+                LOGI("RESCAN: 第 %d 次补扫 slots %d -> %d", rescans, before, g_clv_n);
+                ahb_filelog("RESCAN %d: %d -> %d", rescans, before, g_clv_n);
+            }
         }
     }
 
@@ -941,6 +1064,99 @@ static ssize_t clv_pvr(pid_t pid, const struct iovec *local, unsigned long liovc
      * 只有在"读的是已登记候选 head 或合成节点"时才改写。
      * 若 pid 不是自己、或读的不是这些地址，原样返回，不引入任何额外语义。
      */
+    /*
+     * 读到即识别：动态发现检测器实际使用的链表头并补登记。
+     *
+     * 为什么必须有这一步：预扫描只能找到"当时已经闭合"的链，
+     * 而检测器在扫描过程中会读到一个我们没有登记的 head
+     * （实测读到 0x7d01aefe00，它的 count=33，我们只登记了另外两条）。
+     * 检测器一旦选中那条链，我们所有伪造都白做。
+     *
+     * 识别方式与检测器自己完全一致：
+     *   X 的 16 字节是两个用户态指针 a、b
+     *   后续读 a+8 得到 X，且读 b 得到 X  ⇒ X 是闭环链表头
+     * 两个条件都满足就补登记。
+     */
+    {
+        static struct { uintptr_t head, a, b; int ga, gb; } pend[8];
+        static int pend_n = 0;
+        int pi;
+        uintptr_t ra = (riovcnt >= 1) ? (uintptr_t)remote[0].iov_base : 0;
+        size_t rl = (riovcnt >= 1) ? remote[0].iov_len : 0;
+        const uintptr_t *lc = (liovcnt >= 1) ? (const uintptr_t *)local[0].iov_base : NULL;
+
+        if (lc && ra && n >= 8) {
+            /* 验证阶段：这次读的是不是某个 pending head 的一侧 */
+            for (pi = 0; pi < pend_n; pi++) {
+                if (rl < 8) break;
+                if (ra == pend[pi].a + 8 && lc[0] == pend[pi].head) pend[pi].ga = 1;
+                if (ra == pend[pi].b      && lc[0] == pend[pi].head) pend[pi].gb = 1;
+                if (pend[pi].ga && pend[pi].gb) {
+                    if (!clv_find(pend[pi].head)) {
+                        g_clv_need_build = pend[pi].head;
+                        ahb_filelog("VIEW dyn-detect head=%#lx", (unsigned long)pend[pi].head);
+                    }
+                    pend[pi].head = 0;
+                }
+            }
+            /*
+             * 登记阶段：缓存本次读到的 8 字节。
+             *
+             * 检测器读链表头是分两次的：rp(head) 与 rp(head+8)，
+             * 每次都是 8 字节，不会一次读 16 字节。
+             * 所以要按地址把两次的值拼起来，才能判出 a / b。
+             */
+            if (rl == 8) {
+                for (pi = 0; pi < pend_n; pi++) {
+                    if (pend[pi].head == ra) {
+                        pend[pi].b = UNTAG_PTR(lc[0]);
+                        pend[pi].gb = 2;   /* 标记：第二个半区已读 */
+                        break;
+                    }
+                    if (pend[pi].head + 8 == ra) {
+                        pend[pi].a = UNTAG_PTR(lc[0]);
+                        pend[pi].ga = 2;
+                        break;
+                    }
+                }
+                if (pi == pend_n) {
+                    /* 新地址：先当作 head+8 的位置缓存（检测器常先读 head） */
+                    int dup = 0;
+                    for (pi = 0; pi < pend_n; pi++) {
+                        if (pend[pi].head == ra || pend[pi].head + 8 == ra) dup = 1;
+                    }
+                    if (!dup && ra >= USER_PTR_MIN && ra < USER_PTR_MAX) {
+                        if (pend_n >= 8) {
+                            for (pi = 1; pi < 8; pi++) pend[pi - 1] = pend[pi];
+                            pend_n = 7;
+                        }
+                        pend[pend_n].head = ra;
+                        pend[pend_n].a = 0;
+                        pend[pend_n].b = 0;
+                        pend[pend_n].ga = 1;   /* 第一个半区 = ra 本身 */
+                        pend[pend_n].gb = 0;
+                        pend_n++;
+                    }
+                }
+                /* 两个半区都拿到，判闭环 */
+                for (pi = 0; pi < pend_n; pi++) {
+                    if (pend[pi].ga == 2 && pend[pi].gb == 2) {
+                        uintptr_t H = pend[pi].head;
+                        uintptr_t A = pend[pi].a, B = pend[pi].b;
+                        if (A >= USER_PTR_MIN && A < USER_PTR_MAX &&
+                            B >= USER_PTR_MIN && B < USER_PTR_MAX &&
+                            A != H && B != H && !clv_find(H)) {
+                            g_clv_need_build = H;
+                            ahb_filelog("VIEW dyn head=%#lx a=%#lx b=%#lx",
+                                        (unsigned long)H, (unsigned long)A, (unsigned long)B);
+                        }
+                        pend[pi].head = 0;
+                    }
+                }
+            }
+        }
+    }
+
     ssize_t remaining = n;
     for (unsigned long i = 0; i < riovcnt && i < liovcnt && remaining > 0; i++) {
         size_t rlen = remote[i].iov_len;
@@ -988,22 +1204,33 @@ static ssize_t clv_pvr(pid_t pid, const struct iovec *local, unsigned long liovc
                 }
             }
 
-            /* 每个合成节点的前 16 字节（prev/next） */
-            for (int q = 0; q < CLV_KEEP; q++) {
-                uintptr_t na = (uintptr_t)sl->nodes[q];
-                uintptr_t ovs, ove;
-                if (!na) continue;
-                ovs = (rstart > na) ? rstart : na;
-                ove = (rend < na + 0x10) ? rend : (na + 0x10);
-                if (ovs >= ove) continue;
-                memcpy((void *)(lstart + (ovs - rstart)),
-                       sl->nodes[q] + (ovs - na), (size_t)(ove - ovs));
-                g_clv_hits++;
+            /* 每个**真实节点**的 prev/next 也按我们的视图返回 */
+            {
+                int q;
+                for (q = 0; q < sl->keep; q++) {
+                    uintptr_t na = sl->node_addr[q];
+                    uintptr_t ovs, ove;
+                    if (!na) continue;
+                    ovs = (rstart > na) ? rstart : na;
+                    ove = (rend < na + 0x10) ? rend : (na + 0x10);
+                    if (ovs >= ove) continue;
+                    memcpy((void *)(lstart + (ovs - rstart)),
+                           sl->nodebuf[q] + (ovs - na), (size_t)(ove - ovs));
+                    g_clv_hits++;
+                }
             }
         }
         remaining -= (ssize_t)rlen;
     }
     g_clv_in_wrap = 0;
+
+    /* 补登记延后到包装退出后：clv_build 内部要读内存，不能在包装里递归 */
+    if (g_clv_need_build) {
+        uintptr_t h = g_clv_need_build;
+        g_clv_need_build = 0;
+        clv_build(h);
+        LOGI("L3 view: 动态补登记 head=%#lx slots=%d", (unsigned long)h, g_clv_n);
+    }
     return n;
 }
 
