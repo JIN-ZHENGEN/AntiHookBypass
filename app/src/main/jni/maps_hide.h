@@ -846,8 +846,8 @@ static void *maps_popen_wrap(const char *cmd, const char *mode) {
  * 命中就无条件写入。这样与"槽里现在是什么值"完全无关。
  */
 
-#define AHB_MAX_SO      192
-#define AHB_MAX_SEG     768
+#define AHB_MAX_SO      768
+#define AHB_MAX_SEG     4096
 
 #define R_AARCH64_JUMP_SLOT  1026
 #define R_AARCH64_GLOB_DAT   1025
@@ -870,7 +870,7 @@ static ahb_so_ent  g_so_tab[AHB_MAX_SO];
 static int         g_so_n = 0;
 
 /* 已接管过的库路径（跨轮持久） */
-#define AHB_DONE_MAX 256
+#define AHB_DONE_MAX 512
 static char g_done_paths[AHB_DONE_MAX][AHB_PATH_MAX];
 static int  g_done_n = 0;
 
@@ -958,6 +958,11 @@ static void ahb_so_note(const char *path, uintptr_t seg_start, uintptr_t file_of
     g_so_n++;
 }
 
+/* 是否为 libc：只允许接管 process_vm_readv，其余一律不碰 */
+static int ahb_is_libc(const char *path) {
+    return strstr(path, "/libc.so") != NULL;
+}
+
 static int ahb_so_skip(const char *path) {
     /*
      * 绝不动 libc/libart/linker：那会破坏系统调用层与 ART 自身。
@@ -967,7 +972,8 @@ static int ahb_so_skip(const char *path) {
      * ahb_filelog -> open -> maps_open_wrap -> ahb_filelog 无限递归，
      * 表现是日志写不出来、进程卡死或栈溢出。
      */
-    return strstr(path, "/libc.so") || strstr(path, "/libart.so") ||
+    /* libc 允许进入（只接管 process_vm_readv，见上面的白名单） */
+    return strstr(path, "/libart.so") ||
            strstr(path, "/linker") || strstr(path, "/libbase.so") ||
            strstr(path, "/libc++.so") || strstr(path, "/libm.so") ||
            strstr(path, "libantihook_bypass");
@@ -1176,6 +1182,25 @@ static int ahb_patch_one_so(ahb_so_ent *so) {
                 if (!ahb_addr_mapped((uintptr_t)nm, 2)) continue;
                 repl = ahb_repl_for(nm);
                 if (!repl) continue;
+                /*
+                 * libc 只接管 process_vm_readv 一个符号。
+                 *
+                 * 原因：process_vm_readv 是检测器读链表的唯一通道，
+                 * 但它的 GOT 在 libantihook.so 里 —— 而那个库是进程起来
+                 * 之后才 dlopen 的，接管必然晚于检测器第一次读取。
+                 * 实测这就是 ClassLoader 项间歇性翻红的根因（约一半轮次
+                 * 读到真值 31，另一半读到伪造值 4）。
+                 *
+                 * libc 的槽在进程启动时就已解析完毕，接管它等于
+                 * "进程内所有 process_vm_readv 调用都经过我们"，
+                 * 不再依赖目标库的加载时机。
+                 *
+                 * 绝不能顺带接管 libc 的 open/fopen —— 那会让模块自己的
+                 * 日志写入递归回包装函数。
+                 */
+                if (ahb_is_libc(so->path) && strcmp(nm, "process_vm_readv") != 0) {
+                    continue;
+                }
                 so->has_target = 1;
                 slot = so->base + (uintptr_t)r[k].r_offset;
                 if (!ahb_addr_mapped(slot, sizeof(uintptr_t))) continue;
@@ -1199,6 +1224,9 @@ static int ahb_patch_one_so(ahb_so_ent *so) {
     }
     if (patched) {
         ahb_filelog("MAPS lib %s patched=%d", so->path, patched);
+    } else if (so->has_target) {
+        /* 有目标符号但一个槽都没写成功：必须留证，这类库会一直重试 */
+        ahb_filelog("MAPS lib %s has_target_but_patched=0", so->path);
     }
     /*
      * 只有真的接管到槽才标记完成。
