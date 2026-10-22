@@ -51,14 +51,31 @@ public class HookEntry implements IXposedHookLoadPackage {
             installed = true;
         }
 
+        log("装载配置: " + ModuleConfig.describe());
+
+        /*
+         * 最先装 native 层，再装 Java 层。
+         *
+         * 顺序很重要：目标进程可能在启动后一两秒内就因为检测到注入而自杀，
+         * 而 Java 层的每一个 hook 都要走类查找、方法解析、反射调用，
+         * 累加起来足以把 native 拖到那之后。native 只要一次 dlopen 就能上膛，
+         * 抢时间的收益远大于 Java 层的先手。
+         */
+        boolean l2Early = false;
+        if (ModuleConfig.l2() || ModuleConfig.l3()) {
+            try {
+                System.loadLibrary("antihook_bypass");
+                log("L2+L3 native 已优先加载");
+                l2Early = true;
+            } catch (Throwable t) {
+                log("native 优先加载失败: " + t);
+            }
+        }
+
         /*
          * 判定取证：只读记录检测器自己的判定 JSON，不修改任何返回值。
-         * 目的不是绕过，是让"到底哪一项是红的"这件事有直接证据，
-         * 而不是靠像素或猜。取证开关独立，默认仅在调试版生效。
          */
         installVerdictProbe(lpparam.classLoader);
-
-        log("装载配置: " + ModuleConfig.describe());
 
         boolean l1Trace = false, l1Kill = false, l1Crash = false;
 
@@ -110,6 +127,8 @@ public class HookEntry implements IXposedHookLoadPackage {
         if (ModuleConfig.l2() || ModuleConfig.l3()) {
             prewarmHookedClasses();
             l2 = NativeLayer.installAndSanitize(hostContext(lpparam));
+        } else if (l2Early) {
+            l2 = true;
         }
 
         log("已装载: " + lpparam.packageName

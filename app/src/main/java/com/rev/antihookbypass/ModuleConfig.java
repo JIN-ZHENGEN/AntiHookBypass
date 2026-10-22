@@ -73,6 +73,21 @@ final class ModuleConfig {
         return v;
     }
 
+    /**
+     * 是否启用注入痕迹的读视图过滤。
+     *
+     * 默认开启：这是"隐藏"能力，不改变宿主任何真实内存，
+     * 只影响对方读 maps / dl_iterate_phdr 时看到的内容。
+     * 关掉它，检测器就能直接看到 zygisk 注入库的映射。
+     */
+    static boolean mapsHide() {
+        String s = readCfgLine();
+        if (s == null) return true;              /* 无配置：默认开 */
+        if (s.contains("nomapshide")) return false;
+        if (s.contains("mapshide")) return true;
+        return true;                             /* 有配置但未提及：仍默认开 */
+    }
+
     /** 当前启用 L2 的哪几个 Native 动作，默认三项全开 */
     static int nativeOps() {
         int v = cachedNative;
@@ -208,19 +223,44 @@ final class ModuleConfig {
      * {@code l2=tramp} → 只收敛跳板页；可组合 {@code l2=art+tramp}。
      */
     private static int parseNative(String s) {
-        final int ALL = NATIVE_ART | NATIVE_LINKER | NATIVE_TRAMPOLINE | NATIVE_CL | NATIVE_GUARD;
+        /*
+         * 默认全开：代码段还原（art/linker）、跳板页收敛、ClassLoader 视图、周期复查。
+         *
+         * 关于"会不会破坏别的模块的 hook"（R-38）：
+         * 还原逻辑只把**与磁盘不一致的字节**写回，而它比对的是本进程
+         * 的 libart / linker 映射。LSPosed 的注入走的是 zygisk 侧，
+         * 不在这两个库的代码段里留 inline hook；真正会写这两个库的是
+         * 老式 LSPlant 的 FixupStaticTrampolines，那种情况本来就需要还原，
+         * 否则检测器一读 CRC 就红。
+         *
+         * 曾经把这里默认关掉，是因为 hunter 崩溃在 libhunter.so+0xc787c。
+         * 后经定位，那个崩溃的真实成因是 dl_iterate_phdr 包装用全局变量
+         * 存回调上下文、多线程并发时互相覆盖，导致目标拿到错误的库基址。
+         * 该缺陷已修复（上下文改走 data 参数），与代码段还原无关，
+         * 所以这里恢复默认全开。
+         */
+        final int ALL = NATIVE_ART | NATIVE_LINKER | NATIVE_TRAMPOLINE
+                      | NATIVE_CL | NATIVE_GUARD;
         if (s == null) return ALL;
         if (s.equals("all") || s.equals("default") || s.equals("none") || s.equals("off")) {
             return s.startsWith("none") || s.equals("off") ? 0 : ALL;
         }
 
+        /*
+         * 先按逗号切出各段，再对每段按第一个 '=' 拆成 head=value。
+         *
+         * 早期实现直接按 "[+,]" 切，于是 "l2=cl+guard" 被切成
+         * ["l2=cl", "guard"]，第二段没有 '=' 被整段丢弃——
+         * guard 永远不生效，守护循环永远不启动，而日志上看不出任何异常。
+         * 值内部的分隔符只能是 '+'，逗号只用于分隔不同的 head。
+         */
         int out = 0;
         boolean sawExplicit = false;
-        for (String raw : s.split("[+,]")) {
+        for (String raw : s.split(",")) {
             String p = raw.trim();
             int eq = p.indexOf('=');
             if (eq < 0) continue;
-            String head = p.substring(0, eq);
+            String head = p.substring(0, eq).trim();
             if (!head.equals("l2") && !head.equals("native") && !head.equals("2")
                     && !head.equals("l3") && !head.equals("cl")
                     && !head.equals("l4") && !head.equals("guard")) continue;

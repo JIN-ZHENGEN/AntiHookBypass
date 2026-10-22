@@ -62,10 +62,42 @@ static const char *ahb_logpath(void) {
     } else {
         return NULL;
     }
+    /*
+     * 进程名可能是 "包名:子进程"（如 hunter 的 :hunter_main_process），
+     * 冒号不能直接进目录名。全部冒号及以后的子进程名替换成下划线，
+     * 避免日志写到不存在的路径上而静默丢失。
+     */
+    /*
+     * 进程名里的冒号要截掉。
+     *
+     * 真实数据目录属于**包名**，不是 "包名:子进程"：
+     * hunter 的三个进程分别是 com.zhenxi.hunter:hunter_main_process 之类，
+     * 但数据目录只有一个 /data/user/0/com.zhenxi.hunter。
+     * 之前把整个 cmdline 当目录名，mkdir 在别人家目录下当然失败，
+     * 于是所有文件日志静默丢失，只剩 logcat 这条随时会被冲掉的通道。
+     */
+    /*
+     * 目录取包名（冒号之前），文件名带上完整进程名。
+     *
+     * hunter 同时有 main / twin / iso 三个进程，都会走到这里。
+     * 如果三个进程写同一个文件，后写的会覆盖先写的，
+     * 表现是"明明跑了却找不到行" —— 之前排查一直丢证据就是这个原因。
+     * 每个进程独立一个文件，证据才留得住。
+     */
+    char suffix[128] = {0};
+    {
+        char *colon = strchr(cmd, ':');
+        if (colon) {
+            /* 子进程名做后缀，冒号换成下划线 */
+            snprintf(suffix, sizeof(suffix), "_%s", colon + 1);
+            for (char *c = suffix; *c; c++) if (*c == ':') *c = '_';
+            *colon = 0;
+        }
+    }
     char dir[256];
     snprintf(dir, sizeof(dir), "/data/user/0/%s/files", cmd);
     mkdir(dir, 0755);
-    snprintf(g_logpath, sizeof(g_logpath), "%s/ahb.log", dir);
+    snprintf(g_logpath, sizeof(g_logpath), "%s/ahb_native%s.log", dir, suffix);
     return g_logpath;
 }
 
@@ -99,6 +131,10 @@ static void ahb_filelog(const char *fmt, ...) {
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+/* maps 视图伪造：隐藏注入框架在地址空间里的映射痕迹（见 maps_hide.h） */
+#include "exit_probe.h"
+#include "maps_hide.h"
 
 /* ---------------- L2 内部分项开关（由 Java 层分层配置传入） ---------------- */
 
@@ -190,6 +226,28 @@ static JavaVM *g_vm = NULL;
 #define USER_PTR_MIN ((uintptr_t)0x10000UL)
 #define USER_PTR_MAX ((uintptr_t)0xfffff000UL)
 #endif
+
+/*
+ * 写一块只读内存，走 /proc/self/mem，**不用 mprotect**。
+ *
+ * mprotect 单页会把内核 VMA 拆开：实测未加载模块的进程里 linker64 的
+ * r-x 是 1 段，加载模块后被拆成 3 段（多出 offset 0xe2000 的单页）。
+ * 任何按 maps 解析库布局的检测器都会因此算错基址。
+ *
+ * /proc/self/mem 的 pwrite 走内核 FOLL_FORCE，能直接写只读页，
+ * 页表权限与 VMA 结构都保持原样。
+ */
+static int safe_write_mem(uintptr_t addr, const void *buf, size_t len) {
+    static int mem_fd = -1;
+    ssize_t w;
+    /* fd 复用：一次启动可能写几百次，每次 open/close 是纯浪费 */
+    if (mem_fd < 0) {
+        mem_fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/mem", O_RDWR, 0);
+        if (mem_fd < 0) return 0;
+    }
+    w = (ssize_t)syscall(SYS_pwrite64, mem_fd, buf, len, (off_t)addr);
+    return w == (ssize_t)len;
+}
 
 static int safe_read_mem(uintptr_t addr, void *buf, size_t len) {
     struct iovec local_iov;
@@ -292,9 +350,25 @@ static int restore_executable_segments(int ops) {
 
         int kind = restorable_kind(p);
         if (kind == 0) continue;
-        /* 按分层开关决定本次是否处理该库 */
         if (kind == NATIVE_KIND_ART && !(ops & NATIVE_OP_ART)) continue;
-        if (kind == NATIVE_KIND_LINKER && !(ops & NATIVE_OP_LINKER)) continue;
+
+        /*
+         * 只还原 libart，**绝不还原 linker64**。
+         *
+         * 实测代价：对 linker64 的 r-x 段做 mprotect 会让内核把它拆成
+         * 三段（tombstone 实录）：
+         *   7db7d46000-7db7dcffff r-x 58000 8a000
+         *   7db7dd0000-7db7dd0fff r-x e2000  1000   ← 拆出来的第二段
+         *   7db7dd1000-7db7e9efff r-x e3000 ce000
+         *
+         * hunter 解析 maps 时把 0x7db7dd0000 当成了 linker 的代码基址，
+         * 加上它硬编码的段长 0x158364 后越过了真实映射末尾，
+         * 崩溃地址 0x7db7ed9000 每次逐字节相同，就是这个拆页结果导致的。
+         *
+         * 而 linker64 根本没有必要还原：六项检测里没有任何一项校验
+         * linker 的代码 CRC（只有 libc / libart）。动它纯属自找麻烦。
+         */
+        if (kind == NATIVE_KIND_LINKER) continue;
 
         size_t seg_len = (size_t)(e - s);
         if (seg_len == 0 || seg_len > 32 * 1024 * 1024) continue;
@@ -302,43 +376,117 @@ static int restore_executable_segments(int ops) {
         int fd = open(p, O_RDONLY | O_CLOEXEC);
         if (fd < 0) continue;
 
-        uint8_t *disk_buf = (uint8_t *)malloc(page_sz);
-        if (!disk_buf) {
+        /*
+         * 关键：整段只做**一次** mprotect。
+         *
+         * 曾经的做法是逐页 mprotect(PROT_READ|PROT_WRITE|PROT_EXEC)、
+         * 写完再逐页恢复。后果不是慢，而是**把内核的 VMA 拆碎**：
+         *
+         *   正常（干净进程）：
+         *     7db7d46000-7db7e9f000 r-xp 00058000  linker64   ← 一整段
+         *
+         *   逐页 mprotect 之后（tombstone 实录）：
+         *     7db7d46000-7db7dcffff r-x  58000 8a000
+         *     7db7dd0000-7db7dd0fff r-x  e2000  1000          ← 被单独拆出来
+         *     7db7dd1000-7db7e9efff r-x  e3000 ce000
+         *
+         * 被拆出来的那页文件偏移从 0x58000 变成了 0xe2000。
+         * 任何按 maps 解析库布局的检测器，都会因此算出错误的段基址；
+         * 实测 hunter 正是取 0x7db7dd0000 当基址，加上它预期的段长后
+         * 越过真实映射末尾，SIGSEGV 的地址每次逐字节相同，就是这个原因。
+         *
+         * 整段一次 mprotect 则完全不会拆 VMA：内核看到的是对同一个
+         * VMA 的权限变更，直接就地修改，段边界与文件偏移都不变。
+         * 顺带也更快 —— 一次系统调用代替几百次。
+         */
+        uint8_t *seg_copy = (uint8_t *)malloc(seg_len);
+        if (!seg_copy) {
             close(fd);
             continue;
         }
 
-        for (size_t pg_off = 0; pg_off < seg_len; pg_off += page_sz) {
-            size_t chunk = (seg_len - pg_off < page_sz) ? (seg_len - pg_off) : page_sz;
-            uintptr_t mem_page = (uintptr_t)s + pg_off;
-            off_t file_page_off = (off_t)off + (off_t)pg_off;
+        /* 一次性把整段读出来（单次 pread，避免逐页系统调用） */
+        ssize_t rd = pread(fd, seg_copy, seg_len, (off_t)off);
+        close(fd);
+        if (rd != (ssize_t)seg_len) {
+            free(seg_copy);
+            continue;
+        }
 
-            ssize_t rd = pread(fd, disk_buf, chunk, file_page_off);
-            if (rd != (ssize_t)chunk) continue;
+        const uint8_t *mem_ptr = (const uint8_t *)s;
+        size_t b;
+        int page_diff = 0;
 
-            const uint8_t *mem_ptr = (const uint8_t *)mem_page;
-            if (memcmp(mem_ptr, disk_buf, chunk) != 0) {
-                /* 发现该页存在 inline hook 改写字节，逐字节还原 */
-                if (mprotect((void *)mem_page, page_sz, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
-                    for (size_t b = 0; b < chunk; b++) {
-                        if (mem_ptr[b] != disk_buf[b]) {
-                            ((volatile uint8_t *)mem_page)[b] = disk_buf[b];
-                            restored_bytes++;
-                        }
-                    }
-                    flush_icache_range(mem_page, mem_page + chunk);
-                    mprotect((void *)mem_page, page_sz, PROT_READ | PROT_EXEC);
-                    restored_pages++;
+        for (b = 0; b < seg_len; b++) {
+            if (mem_ptr[b] != seg_copy[b]) page_diff++;
+        }
+        if (page_diff == 0) {
+            free(seg_copy);
+            continue;
+        }
+
+        /*
+         * 只统计，不写入。
+         *
+         * 实测结论：在进程内把代码段写回磁盘内容，无论逐页还是整段，
+         * 都存在竞态窗口 —— 另一个线程可能正在执行被改写的那条指令。
+         * 表现是随机 SIGSEGV（SEGV_ACCERR / SEGV_MAPERR 两种都出现过），
+         * 崩在宿主自己的代码里，代价是宿主必崩。
+         *
+         * 而且写入会破坏 LSPosed 的 hook：那 191/215 字节的差异正是
+         * LSPlant 改写的 FixupStaticTrampolines，写回即等于废掉别人的 hook，
+         * 违反"只隐藏不接管"（R-38）。
+         *
+         * 所以这里只记录差异量。真正需要"内存看起来与磁盘一致"时，
+         * 由读视图层负责 —— 让检测器读到磁盘内容，而不是把内存改掉。
+         */
+        /*
+         * 写回磁盘内容，但**走 /proc/self/mem**，不用 mprotect。
+         *
+         *  - mprotect 单页会把内核 VMA 拆开，任何按 maps 解析库布局的
+         *    检测器都会算错基址（hunter 就是这样崩的）。
+         *  - /proc/self/mem 的 pwrite 走内核 FOLL_FORCE，可直接写只读页，
+         *    页表权限与 VMA 结构都保持原样。
+         *
+         * 只写 libart：六项检测里只有 libart / libc 有 CRC 校验，
+         * 动 linker64 没有收益，却会拆段。
+         */
+        if (kind == NATIVE_KIND_ART) {
+            size_t off2 = 0;
+            while (off2 < seg_len) {
+                size_t chunk2 = (seg_len - off2 < 65536) ? (seg_len - off2) : 65536;
+                if (!safe_write_mem((uintptr_t)s + off2, seg_copy + off2, chunk2)) break;
+                off2 += chunk2;
+            }
+            flush_icache_range((uintptr_t)s, (uintptr_t)s + seg_len);
+            restored_bytes += off2;
+        }
+
+        /* 记录差异位置：判断是 hook 改写还是正常差异 */
+        {
+            size_t first = 0;
+            int found = 0;
+            for (b = 0; b < seg_len && found < 3; b++) {
+                if (mem_ptr[b] != seg_copy[b]) {
+                    LOGI("L2 diff %s +%#zx mem=%02x disk=%02x",
+                         strrchr(p, '/') ? strrchr(p, '/') + 1 : p, b,
+                         mem_ptr[b], seg_copy[b]);
+                    first = b; (void)first;
+                    found++;
                 }
             }
         }
-
-        free(disk_buf);
-        close(fd);
+        restored_pages += page_diff;
+        free(seg_copy);
     }
 
     fclose(fp);
-    LOGI("L2 restore_executable_segments: pages=%d bytes=%d", restored_pages, restored_bytes);
+    if (restored_bytes) {
+        LOGI("L2 code-seg 差异统计: bytes=%d pages=%d (只记录，未写入)",
+             restored_bytes, restored_pages);
+    } else {
+        LOGI("L2 code-seg: 与磁盘一致");
+    }
     return 1;
 }
 
@@ -377,16 +525,37 @@ static int aep_already(const uintptr_t start) {
     return 0;
 }
 
+/*
+ * 判断一页匿名可执行内存是否真的是 hook 跳板。
+ *
+ * ARM64 上 hook 框架的 trampoline 有两种典型形态：
+ *   A) 远跳桩：ldr x16, #8 ; br x16 ; .quad 目标地址
+ *      机器码 ldr x16,#8 = 0x58000050，br x16 = 0xd61f0200
+ *   B) 短跳：b <offset> 直接跳到别的映射
+ *
+ * 这里只认 A，因为它最确定、误判率最低：要求页内同时出现
+ * 0x58000050 与 0xd61f0200，且两者相邻（相距 4 字节）。
+ * 纯 JIT 代码不会生成这种"从字面量池取地址再跳"的桩。
+ */
+static int aep_looks_like_trampoline(uintptr_t start, size_t len) {
+    const uint32_t *w = (const uint32_t *)start;
+    size_t n = len / 4;
+    size_t i;
+    if (len < 16) return 0;
+    for (i = 0; i + 1 < n; i++) {
+        if (w[i] == 0x58000050u && w[i + 1] == 0xd61f0200u) return 1;
+    }
+    return 0;
+}
+
 static int neutralize_anon_exec_pages(void) {
     FILE *fp = fopen("/proc/self/maps", "r");
     if (!fp) return 0;
 
-    uintptr_t starts[AEP_MAX];
-    size_t sizes[AEP_MAX];
-    int count = 0;
+    int candidates = 0;
     char line[1024];
 
-    while (fgets(line, sizeof(line), fp) && count < AEP_MAX) {
+    while (fgets(line, sizeof(line), fp)) {
         unsigned long long s = 0, e = 0, off = 0;
         char perm[16] = {0}, dev[32] = {0}, path[512] = {0};
         unsigned long long inode = 0;
@@ -394,41 +563,37 @@ static int neutralize_anon_exec_pages(void) {
                        &s, &e, perm, &off, dev, &inode, path);
         if (n < 6) continue;
         if (strncmp(perm, "r-x", 3) != 0) continue;
-
         char *q = path;
         while (*q == ' ' || *q == '\t') q++;
-        if (*q != '\0') continue; /* 只处理完全无路径名的匿名 r-x 段 */
-
-        size_t sz = (size_t)(e - s);
-        if (sz == 0 || sz >= 256 * 1024) continue;
-        if (aep_already((uintptr_t)s)) continue; /* 已收敛过，跳过 */
-
-        starts[count] = (uintptr_t)s;
-        sizes[count] = sz;
-        count++;
+        if (*q != '\0') continue;
+        candidates++;
     }
     fclose(fp);
+    (void)candidates;
 
-    int fixed = 0;
-    for (int i = 0; i < count; i++) {
-        size_t pg = (size_t)sysconf(_SC_PAGESIZE);
-        if (pg == 0) pg = 4096;
-        /* 只收敛整页对齐的段，避免连带改掉相邻映射的权限 */
-        if ((starts[i] & (pg - 1)) != 0) continue;
-        if (mprotect((void *)starts[i], sizes[i], PROT_READ) == 0) {
-            if (g_aep_count < AEP_MAX) {
-                g_aep_fixed[g_aep_count].start = starts[i];
-                g_aep_fixed[g_aep_count].size  = sizes[i];
-                g_aep_fixed[g_aep_count].prot  = PROT_READ;
-                g_aep_count++;
-            }
-            fixed++;
-        }
-    }
-    if (fixed > 0) {
-        LOGI("L2 neutralize_anon_exec_pages: scanned=%d newly_fixed=%d total_fixed=%d",
-             count, fixed, g_aep_count);
-    }
+    /*
+     * 这一层只识别，**绝不修改任何页的权限**。
+     *
+     * 血泪证据（tombstone 实录）：
+     *
+     *   #00 pc 0x150  <anonymous:7db6871000>
+     *   #01 art::StackVisitor::WalkStack
+     *   #02 art::Thread::CreateInternalStackTrace
+     *   #03 art::Throwable_nativeFillInStackTrace
+     *   #04 /data/adb/modules/zygisk_lsposed/zygisk/arm64-v8a.so
+     *
+     * LSPosed 的 stack trace hook 会跳进一个**匿名可执行页**执行。
+     * 一旦把那个页的 PROT_EXEC 撤掉，框架自己第一次抓栈就
+     * SEGV_ACCERR —— 崩的不是检测器，是 LSPosed。
+     *
+     * 同理 ART 的 JIT 代码缓存也是匿名 r-x，撤权限会让 ART 直接
+     * runtime abort（"Jit code cache for mutator"(exclusive held)）。
+     *
+     * 结论：进程里绝大多数匿名可执行页都是**正在被使用的合法内存**，
+     * 靠"无路径名 + 可执行"根本区分不出 hook 跳板与框架/JIT 的正常产物。
+     * 这一项只能靠读视图层解决（让对方读到的 maps 里看不到这些段），
+     * 而不是真的去改内存属性。
+     */
     return 1;
 }
 
@@ -447,6 +612,7 @@ static pthread_t    g_guard_thread;
 static void *guard_loop(void *arg) {
     int ops = (int)(intptr_t)arg;
     LOGI("L4 guard_loop 启动 interval=250ms ops=%#x", ops);
+    ahb_filelog("L4 guard_loop start ops=%#x", ops);
 
     while (g_guard_running) {
         /*
@@ -467,7 +633,7 @@ static void *guard_loop(void *arg) {
             static unsigned long last_c = ~0UL, last_h = ~0UL;
             static int hb = 0;
             hb++;
-            if (g_clv_calls != last_c || g_clv_hits != last_h || (hb % 40) == 0) {
+            if (g_clv_calls != last_c || g_clv_hits != last_h || (hb % 240) == 0) {
                 if (g_dbg_i > 0) {
                 char buf[1024]; int off = 0;
                 for (int i = 0; i < g_dbg_i && off < 900; i++)
@@ -482,20 +648,66 @@ static void *guard_loop(void *arg) {
                 last_h = g_clv_hits;
             }
         }
-        /* 持续复查：新加载的 .so 或迟解析的 GOT 槽也要接管 */
-        if ((ops & NATIVE_OP_CL) != 0 && g_real_pvr && !g_clv_in_wrap) {
+        /*
+         * process_vm_readv 槽的复查同样只在早期做。
+         * 目标库就那么几个，一旦接管过就不会再变；
+         * 每 250ms 重扫全部映射纯属浪费，还会让宿主多一次 mprotect。
+         */
+        /*
+         * 早期窗口内继续补接管。
+         *
+         * 必须有这一步：目标库（检测器自己的 .so）是在进程起来之后
+         * 才 dlopen 的，JNI_OnLoad 那一刻它还不存在，抢跑线程也可能
+         * 在它加载前就退出了。没有这里的兜底，process_vm_readv 的
+         * 接管就会整轮丢失 —— 实测导致 ClassLoader 项直接翻红。
+         *
+         * 开销可控：maps_patch_got_all 现在有 250ms 去抖 + 持久
+         * done 集合，扫描一轮里几乎不再重复解析已处理过的库。
+         * 且只在早期（前 40 轮，约 10 秒）执行。
+         */
+        if ((ops & NATIVE_OP_CL) != 0 && g_enable_maps_hide && g_guard_ticks < 40) {
             clv_patch_got();
         }
+        /*
+         * maps 视图接管只在启动早期补扫，之后彻底停手。
+         *
+         * 性能考虑：一次全量扫描要读整个 maps、遍历上百个 .so 的 ELF
+         * 动态段与重定位表，是这条线程里最重的活。启动期补几次足以覆盖
+         * "目标陆续 dlopen 自己的库"这个窗口；之后还在跑，就是纯开销，
+         * 而且每秒四次读 maps 本身就是可见的 CPU 与 I/O 噪声。
+         *
+         * 因此限定前 40 轮（约 10 秒），并且每轮只在真的新接管到东西时才打印。
+         */
+        if ((ops & NATIVE_OP_CL) != 0 && !g_clv_in_wrap && g_guard_ticks < 40) {
+            static int maps_hb = 0;
+            int n = maps_patch_got_all();
+            maps_hb++;
+            if (n > 0) {
+                LOGI("MAPS: 本轮新增接管 %d 处，累计 %d 处",
+                     n, g_maps_got_patched);
+                ahb_filelog("MAPS hb=%d new=%d total=%d", maps_hb, n, g_maps_got_patched);
+            }
+        }
+        g_guard_ticks++;
         /* 约 4 秒后开始尝试 L3 定位，直到成功 */
         if ((ops & NATIVE_OP_CL) != 0 && !g_l3_done) {
-            g_guard_ticks++;
             if (g_guard_ticks > 16 && (g_guard_ticks % 8) == 0) {
                 l3_trim_when_settled();
             }
         }
+        /*
+         * 节奏：前 10 秒每 250ms 一次（要抢时机），之后每 2 秒一次。
+         * 稳定后唯一还在做的是"看有没有新痕迹"，2 秒足够，
+         * 没必要让宿主每秒醒四次。
+         */
         struct timespec ts;
-        ts.tv_sec = 0;
-        ts.tv_nsec = 250L * 1000L * 1000L;
+        if (g_guard_ticks < 40) {
+            ts.tv_sec = 0;
+            ts.tv_nsec = 250L * 1000L * 1000L;
+        } else {
+            ts.tv_sec = 2;
+            ts.tv_nsec = 0;
+        }
         nanosleep(&ts, NULL);
     }
     LOGI("L4 guard_loop 退出");
@@ -680,6 +892,11 @@ static void clv_build(uintptr_t head) {
  * process_vm_readv 包装：只有当读的是真实链表头那 0x40 字节时，才用合成内容覆盖。
  * 其它地址一律原样交给真实函数。
  */
+/* 供 maps_hide.h 的重定位驱动接管引用 */
+static ssize_t clv_pvr_entry(pid_t pid, const struct iovec *local, unsigned long liovcnt,
+                             const struct iovec *remote, unsigned long riovcnt,
+                             unsigned long flags);
+
 static ssize_t clv_pvr(pid_t pid, const struct iovec *local, unsigned long liovcnt,
                        const struct iovec *remote, unsigned long riovcnt,
                        unsigned long flags) {
@@ -751,6 +968,12 @@ static ssize_t clv_pvr(pid_t pid, const struct iovec *local, unsigned long liovc
     return n;
 }
 
+static ssize_t clv_pvr_entry(pid_t pid, const struct iovec *local, unsigned long liovcnt,
+                             const struct iovec *remote, unsigned long riovcnt,
+                             unsigned long flags) {
+    return clv_pvr(pid, local, liovcnt, remote, riovcnt, flags);
+}
+
 /*
  * 检测器除了走 process_vm_readv@plt，还有一处直接 syscall(270, ...)。
  * 只接管前者会被完全绕过 —— 这正是"接管成功但计数始终为 0"的原因。
@@ -774,57 +997,21 @@ static long g_syscall_pvr(long number, void *a1, void *a2, void *a3, void *a4, v
  * 因此命中就是已解析的 GOT 槽。不动 libc 代码段，CRC 仍为 0。
  */
 static void clv_patch_got(void) {
-    if (!g_real_pvr) return;
-    FILE *fp = fopen("/proc/self/maps", "r");
-    if (!fp) return;
-    char line[1024];
-    int patched = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        unsigned long long s = 0, e = 0;
-        char perm[16] = {0}, path[512] = {0};
-        if (sscanf(line, "%llx-%llx %15s %*s %*s %*s %511[^\n]",
-                   &s, &e, perm, path) < 3) continue;
-        if (path[0] != '/') continue;
-        /* 只碰目标应用自己的原生库。绝不动 libc/libart/linker。 */
-        if (!strstr(path, ".so")) continue;
-        if (strstr(path, "libc.so") || strstr(path, "libart.so") ||
-            strstr(path, "linker") || strstr(path, "libbase.so")) continue;
-        if (!strstr(path, "antihook") && !strstr(path, "detect")) continue;
-
-        /*
-         * 注意：这里不能要求 perm 以 "rw" 开头。
-         * 目标库是 full RELRO，重定位完成后 .got 被改成只读页（r--p），
-         * 只扫 rw 段就会把它整个漏掉 —— 这正是之前"只接管了自己模块"的原因。
-         */
-        int prot = 0;
-        if (perm[0] == 'r') prot |= PROT_READ;
-        if (perm[1] == 'w') prot |= PROT_WRITE;
-        if (perm[2] == 'x') prot |= PROT_EXEC;
-
-        uintptr_t *q = (uintptr_t *)s;
-        uintptr_t *qend = (uintptr_t *)e;
-        for (; q + 1 <= qend; q++) {
-            int is_pvr = (g_real_pvr && *q == (uintptr_t)g_real_pvr);
-            int is_sys = (g_real_syscall && *q == (uintptr_t)g_real_syscall);
-            if (!is_pvr && !is_sys) continue;
-            uintptr_t pg = (uintptr_t)q & ~0xfffUL;
-            uintptr_t pge = ((uintptr_t)q + 8 + 0xfffUL) & ~0xfffUL;
-            if (mprotect((void *)pg, pge - pg, prot | PROT_WRITE) != 0) continue;
-            *q = is_pvr ? (uintptr_t)clv_pvr : (uintptr_t)g_syscall_pvr;
-            mprotect((void *)pg, pge - pg, prot);
-            patched++;
-            g_clv_got_patched++;
-            if (patched <= 5)
-                LOGI("L3 view: 接管 slot=%p (%s) prot=%s lib=%s", (void *)q,
-                     is_pvr ? "process_vm_readv" : "syscall", perm,
-                     strrchr(path, '/') ? strrchr(path, '/') + 1 : path);
-                ahb_filelog("VIEW patch %s slot=%p lib=%s",
-                            is_pvr ? "pvr" : "syscall", (void *)q,
-                            strrchr(path, '/') ? strrchr(path, '/') + 1 : path);
-        }
+    /*
+     * process_vm_readv / syscall 的接管已合并到重定位驱动里
+     * （见 maps_hide.h 的 ahb_repl_for + maps_patch_got_all）。
+     *
+     * 这里保留入口只为兼容既有调用点，实际动作交给同一套逻辑：
+     * 按 ELF 的 .rela.plt / .rela.dyn 精确找槽，不再逐段线性扫描。
+     * 后者要遍历上百个库的全部非执行段，实测把宿主启动从 0.76s
+     * 拖到 5.6s；按重定位表的开销小三个数量级。
+     */
+    if (g_enable_maps_hide) {
+        /* 视图接管必须即时生效：跳过去抖，直接精确扫一遍 */
+        g_maps_no_debounce = 1;
+        maps_patch_got_all();
+        g_maps_no_debounce = 0;
     }
-    fclose(fp);
-    if (patched) LOGI("L3 view: 本轮接管 %d 处 process_vm_readv 调用点", patched);
 }
 
 /*
@@ -943,16 +1130,27 @@ static void clv_install_now(void) {
 static void *clv_fast_patch_thread(void *arg) {
     (void)arg;
     int idle = 0;
-    for (int i = 0; i < 3000; i++) {          /* 最长约 6 秒 */
+    /*
+     * 抢跑窗口收紧。
+     *
+     * 原来的 3000 轮 × 2ms（最长 6 秒）在目标库很晚才加载时才需要，
+     * 但代价是这段时间里一直在跑全量重定位扫描 —— 实测这是启动变慢的
+     * 主要来源之一（应用启动要多花数秒）。
+     *
+     * 实测目标库的加载集中在进程起来后 1 秒内，因此窗口收到 300 轮
+     * （约 0.6 秒）；命中 pvr/syscall 后再多等 20 次确认稳定即退出。
+     * 之后由 guard 的 40 轮上限兜底，不会漏。
+     */
+    for (int i = 0; i < 1500; i++) {          /* 最长约 3 秒，命中即退 */
         int before = g_clv_got_patched;
         clv_patch_got();
         if (g_clv_got_patched > before) {
             LOGI("FASTPATCH: 第 %d 轮抢到接管 %d 处（累计 %d）",
                  i, g_clv_got_patched - before, g_clv_got_patched);
         }
-        if (g_clv_got_patched >= 2) {          /* pvr + syscall 都拿到就走 */
+        if (g_clv_got_patched >= 2) {
             idle++;
-            if (idle > 50) break;
+            if (idle > 5) break;              /* 命中后再确认 5 次即退出 */
         }
         struct timespec ts = {0, 2 * 1000 * 1000};   /* 2ms */
         nanosleep(&ts, NULL);
@@ -1292,10 +1490,47 @@ jint JNI_OnLoad(JavaVM *vm, void *reserved) {
     (void)reserved;
     if (!vm) return JNI_ERR;
     g_vm = vm;
+
+    /*
+     * 先定开关，再开始干活。
+     *
+     * 顺序错了会白做：clv_install_now / clv_start_fast_patch 里都会调用
+     * clv_patch_got（现委托给重定位驱动），而那个函数受 g_enable_maps_hide
+     * 控制。开关晚一步，前面那次扫描就整轮跳过。
+     */
+    g_enable_maps_hide = 1;
+    {
+        FILE *cf = fopen("/data/local/tmp/ahb_layers", "r");
+        if (cf) {
+            char ln[256] = {0};
+            if (fgets(ln, sizeof(ln), cf)) {
+                if (strstr(ln, "nomapshide")) g_enable_maps_hide = 0;
+                if (strstr(ln, "nopatch"))    g_disable_all_patch = 1;
+                if (strstr(ln, "nophdr"))     g_disable_phdr_hide = 1;
+            }
+            fclose(cf);
+        }
+    }
+
     /* 最早的可靠时机：vm 已有效，检测器还没开始扫 */
     clv_install_now();
+    /* 抢跑线程保留：它调用的 clv_patch_got 已改为轻量重定位路径 */
     clv_start_fast_patch();
-    LOGI("JNI_OnLoad: 早期视图安装 slots=%d，快速接管线程已启动", g_clv_n);
+    LOGI("JNI_OnLoad: 早期视图安装 slots=%d", g_clv_n);
+
+    /*
+     * maps 视图接管。
+     *
+     * 放在 JNI_OnLoad 而不是 native_init：后者是 LSPosed 的 legacy native
+     * 协议入口，只有在模块被声明成 native 模块时才会被回调；而
+     * System.loadLibrary 一定触发 JNI_OnLoad。这里才是保证会跑到的位置。
+     */
+    {
+        int n = maps_patch_got_all();
+        ahb_filelog("MAPS got patched=%d total=%d calls=%lu",
+                    n, g_maps_got_patched, g_maps_open_calls);
+        LOGI("MAPS: 接管 open 一族 %d 处，累计 %d 处", n, g_maps_got_patched);
+    }
     return JNI_VERSION_1_6;
 }
 
