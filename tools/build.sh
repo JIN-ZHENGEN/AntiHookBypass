@@ -73,7 +73,11 @@ mv "$OUT/aligned.apk" "$UNSIGNED"
 echo "==> [6/6] 签名"
 # 签名密钥：优先用环境变量里指定的既有密钥库（便于在别的机器上复现同一签名），
 # 没有才生成。密钥库一律落在 build/ 下，不进版本库。
-if [ -n "${AHB_KEYSTORE:-}" ] && [ -f "$AHB_KEYSTORE" ]; then
+# 优先使用仓库内的固定密钥库，保证每次构建签名一致
+if [ -f "$ROOT/.keys/release.jks" ]; then
+    KS="$ROOT/.keys/release.jks"
+    echo "    使用固定密钥库: $KS"
+elif [ -n "${AHB_KEYSTORE:-}" ] && [ -f "$AHB_KEYSTORE" ]; then
     KS="$AHB_KEYSTORE"
     echo "    使用既有密钥库: $KS"
 else
