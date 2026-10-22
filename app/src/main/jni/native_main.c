@@ -945,22 +945,52 @@ static ssize_t clv_pvr(pid_t pid, const struct iovec *local, unsigned long liovc
         uintptr_t rend = rstart + rlen;
         uintptr_t lstart = (uintptr_t)local[i].iov_base;
 
-        /* 对每条已登记候选，求"本次读取区间"与"head 那 0x40 字节"的交集 */
+        /*
+         * 对每条已登记候选求交集。
+         *
+         * 覆盖范围必须包含**合成节点本身**，不能只伪造 head。
+         *
+         * 检测器的遍历是这样的：
+         *   a = head->next / b = head->prev   ← 读 head 的 16 字节
+         *   然后沿 a/b 的 next/prev 一路走，直到回到 head
+         * 它遍历时读的是**真实节点地址**上的 next/prev。
+         * 如果只把 head 伪造了，返回给它的 head->next 指向我们合成的节点，
+         * 它会去读那个合成节点的 next —— 那也必须由我们提供，
+         * 否则它读到的是模块自己缓冲区里的内容，语义不可控。
+         *
+         * 所以这里把 head 与所有合成节点一起纳入覆盖范围。
+         */
         for (int k = 0; k < g_clv_n; k++) {
             struct clv_slot *sl = &g_clv[k];
             if (!sl->ready) continue;
-            uintptr_t ovs = (rstart > sl->head) ? rstart : sl->head;
-            uintptr_t ove = (rend < sl->head + 0x40) ? rend : (sl->head + 0x40);
-            if (ovs >= ove) continue;
-            size_t src_off = (size_t)(ovs - sl->head);
-            size_t len = (size_t)(ove - ovs);
-            if (src_off + len > 0x40) continue;
-            memcpy((void *)(lstart + (ovs - rstart)), sl->headbuf + src_off, len);
-            g_clv_hits++;
-            if ((g_clv_hits & 0x3f) == 1)
-                ahb_filelog("VIEW hit head=%#lx off=%zu len=%zu hid=%lu",
-                            (unsigned long)sl->head, src_off, len,
-                            (unsigned long)g_clv_hits);
+
+            /* head 的 0x40 字节 */
+            {
+                uintptr_t ovs = (rstart > sl->head) ? rstart : sl->head;
+                uintptr_t ove = (rend < sl->head + 0x40) ? rend : (sl->head + 0x40);
+                if (ovs < ove) {
+                    size_t src_off = (size_t)(ovs - sl->head);
+                    size_t len = (size_t)(ove - ovs);
+                    if (src_off + len <= 0x40) {
+                        memcpy((void *)(lstart + (ovs - rstart)),
+                               sl->headbuf + src_off, len);
+                        g_clv_hits++;
+                    }
+                }
+            }
+
+            /* 每个合成节点的前 16 字节（prev/next） */
+            for (int q = 0; q < CLV_KEEP; q++) {
+                uintptr_t na = (uintptr_t)sl->nodes[q];
+                uintptr_t ovs, ove;
+                if (!na) continue;
+                ovs = (rstart > na) ? rstart : na;
+                ove = (rend < na + 0x10) ? rend : (na + 0x10);
+                if (ovs >= ove) continue;
+                memcpy((void *)(lstart + (ovs - rstart)),
+                       sl->nodes[q] + (ovs - na), (size_t)(ove - ovs));
+                g_clv_hits++;
+            }
         }
         remaining -= (ssize_t)rlen;
     }

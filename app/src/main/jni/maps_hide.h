@@ -856,6 +856,8 @@ typedef struct {
     char      path[AHB_PATH_MAX];
     uintptr_t base;
     int       tried;
+    int       miss_count;
+    int       has_target;   /* 该库的重定位表里是否存在我们要接管的符号 */
 } ahb_so_ent;
 
 typedef struct {
@@ -951,6 +953,8 @@ static void ahb_so_note(const char *path, uintptr_t seg_start, uintptr_t file_of
     g_so_tab[g_so_n].path[AHB_PATH_MAX - 1] = 0;
     g_so_tab[g_so_n].base  = b;
     g_so_tab[g_so_n].tried = 0;
+    g_so_tab[g_so_n].miss_count = 0;
+    g_so_tab[g_so_n].has_target = 0;
     g_so_n++;
 }
 
@@ -1172,6 +1176,7 @@ static int ahb_patch_one_so(ahb_so_ent *so) {
                 if (!ahb_addr_mapped((uintptr_t)nm, 2)) continue;
                 repl = ahb_repl_for(nm);
                 if (!repl) continue;
+                so->has_target = 1;
                 slot = so->base + (uintptr_t)r[k].r_offset;
                 if (!ahb_addr_mapped(slot, sizeof(uintptr_t))) continue;
                 if (!ahb_write_slot(slot, repl)) continue;
@@ -1205,7 +1210,24 @@ static int ahb_patch_one_so(ahb_so_ent *so) {
      *
      * 改为：patched > 0 才标记；没接到的库留给后续轮次继续尝试。
      */
-    if (patched > 0) ahb_mark_done(so->path);
+    /*
+     * 标记策略按"这个库到底需不需要接管"来定，而不是按尝试次数。
+     *
+     *  - has_target == 0：它的重定位表里根本没有 open/syscall/process_vm_readv
+     *    这类目标符号，永远不用再扫 —— 直接标记完成。
+     *    这一类占了系统库的绝大多数，是真正该跳过的。
+     *
+     *  - has_target == 1 但 patched == 0：有目标符号却没写成功，
+     *    典型原因是当时符号还没解析完。这种必须继续重试，绝不能放弃 ——
+     *    实测按"尝试 6 次就放弃"会让检测器自己的 libantihook.so
+     *    在符号解析完成前被永久跳过，process_vm_readv 接管整轮丢失，
+     *    ClassLoader 项直接翻红。
+     *
+     *  - patched > 0：已经接上了，标记完成。
+     */
+    if (patched > 0 || so->has_target == 0) {
+        ahb_mark_done(so->path);
+    }
     return patched;
 }
 
