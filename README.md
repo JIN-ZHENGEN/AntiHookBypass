@@ -140,6 +140,19 @@ AHB_KEYSTORE=/path/to/release.jks bash tools/build.sh
 | 宿主自身存在与注入无关的崩溃 | 例如 hunter 在本机会 `jit_code_cache.cc:1309 Check failed: !ContainsElement(zombie_code_, code_ptr)` abort —— 见下节实测 |
 | 宿主把「检测到自己被 hook」当成致命错误主动退出 | hunter 属这一类：任何 hook 都让它更快退出（1.1 秒），完全不 hook 反而能活 2.8–7.5 秒 |
 
+### 关于模块声明：两套格式都要给
+
+LSPosed 2.x 同时存在两套模块声明机制：
+
+| 路径 | 谁读它 |
+|---|---|
+| `assets/xposed_init` + manifest 里的 `xposedmodule` 等 meta-data | 旧框架 |
+| `META-INF/xposed/module.prop` + `META-INF/xposed/java_init.list` | 新框架（API 93+） |
+
+只给旧路径时，部分框架版本会把模块当成「非完整模块」直接跳过。症状很容易误判成别的问题：配置里 `enabled=1`、作用域也齐全、日志里却一条模块记录都没有，模块从不注入。
+
+两套并存没有副作用，构建脚本里两条都写。
+
 ### 关于 hunter 的实测结论
 
 hunter（`com.zhenxi.hunter`）在本机会在 1–3 秒内退出，这个现象**不是本模块造成的**，三条对照实验可以定性：
