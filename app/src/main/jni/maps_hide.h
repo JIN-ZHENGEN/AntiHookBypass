@@ -90,10 +90,45 @@ static const char *const g_trace_markers[] = {
  * 实测给 JIT 页撤执行权限会让 ART 当场 abort
  * （"Jit code cache for mutator"(exclusive held)）。
  */
-static int maps_line_is_trace(const char *line) {
+static int maps_line_is_trace_len(const char *line, size_t len);
+
+/*
+ * 有界子串搜索。
+ *
+ * 这是整个模块里最严重的一处性能缺陷，值得写清楚它的成因：
+ *
+ * strstr(hay, needle) 会在 hay 里一直找到 '\0' 为止。而这里 hay 是
+ * 指向"整个 maps 缓冲区中当前行开头"的指针 —— 缓冲区是一整块、
+ * 只在最末尾有一个 '\0'。于是对第 i 行调用 strstr，它会从第 i 行
+ * 一路扫到缓冲区末尾才肯罢休。
+ *
+ * 量级：缓冲区约 317KB、3000 行、25 个 marker，
+ *      累计扫描量 ≈ 25 × Σ(剩余字节) ≈ 25 × 3000 × 158KB ≈ 12 GB。
+ * 实测代价：单次 maps 过滤要 5.6~5.9 秒，而空转同样的循环只要 3ms。
+ * 这个时间全程压在检测器刚开始检测的那几秒上，是"检测明显变慢"的主因。
+ *
+ * 旁证：日志里每 250 行的耗时是递减的（830ms → 145ms）——
+ * 因为越靠后的行，剩余缓冲区越短。这正是"扫到缓冲区末尾"的指纹。
+ *
+ * 修法：按行长度做上界，命中即返回，绝不越过本行。
+ */
+static const char *ahb_memstr(const char *hay, size_t haylen, const char *needle) {
+    size_t nl = strlen(needle);
+    if (nl == 0 || haylen < nl) return NULL;
+    const char *end = hay + haylen - nl;
+    const char c0 = needle[0];
+    for (const char *p = hay; p <= end; p++) {
+        /* 先比首字节再走完整比较：maps 里绝大多数位置首字节就不同 */
+        if (*p != c0) continue;
+        if (memcmp(p, needle, nl) == 0) return p;
+    }
+    return NULL;
+}
+
+static int maps_line_is_trace_len(const char *line, size_t len) {
     const char *const *m;
     for (m = g_trace_markers; *m; m++) {
-        if (strstr(line, *m)) return 1;
+        if (ahb_memstr(line, len, *m)) return 1;
     }
 
     /*
@@ -114,10 +149,29 @@ static int maps_line_is_trace(const char *line) {
      * 若已到行尾则这一行没有路径，就是匿名段。
      */
     {
-        unsigned long long s = 0, e = 0;
-        char perm[8] = {0};
-        if (sscanf(line, "%llx-%llx %7s", &s, &e, perm) == 3 &&
-            strncmp(perm, "r-x", 3) == 0) {
+        /*
+         * 手工取前三个字段，不用 sscanf。
+         *
+         * 这个函数对 maps 的每一行都要跑一次（实测约 3000 行），
+         * 而 Bionic 的 sscanf 要走完整的格式串解析与可变参数处理，
+         * 单次几十微秒；乘上 3000 行就是几百毫秒的纯开销，
+         * 全部落在检测器刚开始检测、最不该被拖慢的那几秒里。
+         *
+         * 这里只需要"跳过前两个十六进制数 + 取第三个字段"，
+         * 用指针走一遍即可，代价是每行几个字节的比较。
+         */
+        const char *pp = line;
+        const char *pend = line + len;
+        const char *perm_p = NULL;
+        int tok = 0;
+        while (pp < pend && *pp && tok < 3) {
+            while (pp < pend && *pp == ' ') pp++;
+            if (pp >= pend || !*pp) break;
+            tok++;
+            if (tok == 3) { perm_p = pp; break; }
+            while (pp < pend && *pp && *pp != ' ') pp++;
+        }
+        if (perm_p && perm_p[0] == 'r' && perm_p[1] == '-' && perm_p[2] == 'x') {
             const char *p = line;
             int tokens = 0;
             while (tokens < 5 && *p) {
@@ -133,9 +187,25 @@ static int maps_line_is_trace(const char *line) {
     return 0;
 }
 
+/* 无长度版本：内部按 strnlen 取本行长度，仅供没有行边界的调用点使用 */
+static int maps_line_is_trace(const char *line) {
+    return maps_line_is_trace_len(line, strlen(line));
+}
+
 /* ---------------- 状态 ---------------- */
 
 static unsigned long g_maps_open_calls = 0;
+
+/* 各通道调用次数与累计耗时：用于把"检测变慢"精确归因到某个包装 */
+static volatile unsigned long g_c_open = 0,  g_t_open = 0;
+/* 每个被接管入口的调用计数：用来定位"到底是哪条通道被高频穿过" */
+static volatile unsigned long g_c_openat = 0, g_c_open2 = 0, g_c_open64 = 0;
+static volatile unsigned long g_c_openat2 = 0, g_c_open642 = 0;
+static volatile unsigned long g_c_fopen = 0, g_c_popen = 0, g_c_opendir = 0;
+static volatile unsigned long g_c_sys = 0, g_c_dlphdr = 0;
+static volatile unsigned long g_c_self = 0,  g_t_self = 0;
+static volatile unsigned long g_c_read = 0,  g_t_read2 = 0;
+static volatile unsigned long g_c_fread = 0;
 static unsigned long g_maps_filtered   = 0;
 /*
  * 不再需要"防递归"全局标志。
@@ -278,23 +348,26 @@ static int maps_read_all(char **out_buf, size_t *out_cap) {
  *
  * 指纹失效时重新生成，保证内容始终反映当时的真实映射。
  */
-#define MAPS_CACHE_MAX 4
-
-typedef struct {
-    int      fd;
-    uint64_t sig;
-} maps_cache_ent;
-
-static maps_cache_ent g_maps_cache[MAPS_CACHE_MAX];
-static int            g_maps_cache_n = 0;
-static uint64_t       g_maps_pending_sig = 0;
-static int            g_maps_pending = 0;
-
 #define MAPS_TTL_MS 120
-static int      g_maps_ttl_fd   = -1;
+static char    *g_maps_ttl_buf  = NULL;
+static size_t   g_maps_ttl_len  = 0;
 static time_t   g_maps_ttl_sec  = 0;
 static long     g_maps_ttl_nsec = 0;
 static unsigned long g_maps_ttl_hits = 0;
+
+/* 用一段内容造一个全新的 memfd，调用方独占其偏移 */
+static int maps_memfd_of(const char *buf, size_t len) {
+    int fd = (int)syscall(SYS_memfd_create, "maps", 0);
+    size_t off = 0;
+    if (fd < 0) return -1;
+    while (off < len) {
+        long k = syscall(SYS_write, fd, buf + off, len - off);
+        if (k <= 0) { syscall(SYS_close, fd); return -1; }
+        off += (size_t)k;
+    }
+    syscall(SYS_lseek, fd, 0, SEEK_SET);
+    return fd;
+}
 
 /*
  * 指纹必须覆盖**整块**内容，不能只取首尾。
@@ -314,6 +387,139 @@ static uint64_t maps_sig_of(const char *buf, size_t len) {
         h *= 1099511628211ULL;
     }
     return h;
+}
+
+/*
+ * 单行 maps 记录。
+ *
+ * 为什么要自己分词，而不是 sscanf("%llx-%llx %7s %llx %15s %llu %319[^\n]")：
+ *
+ *   sscanf 格式串里的**空格会匹配并吞掉任意数量的空白，包括换行符**。
+ *   而 maps 里"没有路径"的行（匿名段、memfd 段等）在 inode 后面
+ *   紧跟的是换行 —— 于是那个空格会吃掉 \n，%[^\n] 接着把**下一整行**
+ *   读成 path。
+ *
+ *   后果不是"解析失败"，而是解析成功但内容错位：本行被当成
+ *   "路径 = 下一行全文"，原样写回输出，两行就粘成了一行。
+ *   实测过滤产物里有 246 行这种粘连，
+ *   形如 "30f938e000-30f938f000 rw-p 0 00:00 0 30f938f000-30f9537000 r-xp ..."。
+ *
+ *   任何按行解析的读方遇到这种行都会算出错误的段范围。hunter 就是
+ *   拿它去 strcpy 进一个 5 字节字段，被 FORTIFY 拦住后 abort。
+ *
+ * 所以这里手工按空格切，**永远不跨过 \n**，且在极端行长下照样安全。
+ */
+struct maps_ent {
+    unsigned long long start;
+    unsigned long long end;
+    unsigned long long off;
+    unsigned long long inode;
+    char perm[8];
+    char dev[16];
+    char path[AHB_PATH_MAX];
+    /* 原始字节指针与长度：输出时可以逐字复制，不做任何重排 */
+    const char *raw;
+    size_t raw_len;
+};
+
+/* 在 [p,end) 内取一个空格分隔的 token，返回下一个 token 的起点；没有则返回 NULL */
+static const char *maps_tok(const char *p, const char *end, char *out, size_t outsz) {
+    size_t n = 0;
+    while (p < end && *p == ' ') p++;
+    if (p >= end || *p == '\n') { if (outsz) out[0] = 0; return NULL; }
+    while (p < end && *p != ' ' && *p != '\n') {
+        if (n + 1 < outsz) out[n++] = *p;
+        p++;
+    }
+    if (outsz) out[n] = 0;
+    return p;
+}
+
+static int maps_parse_line(const char *line, size_t len, struct maps_ent *e) {
+    const char *end = line + len;
+    const char *p;
+    char addr[64] = {0}, off[32] = {0}, ino[32] = {0};
+
+    memset(e, 0, sizeof(*e));
+    e->raw = line;
+    e->raw_len = len;
+
+    /* 字段顺序：addr perm offset dev inode [path]，路径可缺省 */
+    p = maps_tok(line, end, addr, sizeof(addr));
+    if (!p) return 0;
+    p = maps_tok(p, end, e->perm, sizeof(e->perm));
+    if (!p) return 0;
+    p = maps_tok(p, end, off, sizeof(off));
+    if (!p) return 0;
+    p = maps_tok(p, end, e->dev, sizeof(e->dev));
+    if (!p) return 0;
+    p = maps_tok(p, end, ino, sizeof(ino));
+    if (!p) return 0;
+    /* 到行尾就置空串，绝不会跨过 \n 去吞下一行 */
+    (void)maps_tok(p, end, e->path, sizeof(e->path));
+
+    {
+        char *dash = strchr(addr, '-');
+        if (!dash) return 0;
+        *dash = 0;
+        e->start = strtoull(addr, NULL, 16);
+        e->end   = strtoull(dash + 1, NULL, 16);
+    }
+    e->off   = strtoull(off, NULL, 16);
+    e->inode = strtoull(ino, NULL, 10);
+    return 1;
+}
+
+/*
+ * 输出一行。
+ *
+ * 用记录的原始字节打底，只替换其中的起始/结束地址（合并段时要做），
+ * 其余空格、对齐、路径原样保留 —— 保证字段个数与分隔形式与内核一致。
+ */
+static size_t maps_emit_line(char *out, size_t w, size_t cap, const struct maps_ent *e) {
+    char head[80];
+    int hn = 0;
+    size_t i = 0;
+
+    /*
+     * 手工把 start/end 写成十六进制，不用 snprintf。
+     *
+     * 与 is_trace 的 sscanf 同理：这段对每一行都跑，
+     * 而 Bionic 的 snprintf 单次开销在几十微秒量级，
+     * 3000 行累加成百毫秒，正好压在检测期上。
+     * 十六进制格式化本身只是移位与查表，没有理由借道 printf 系列。
+     */
+    {
+        static const char hexd[] = "0123456789abcdef";
+        unsigned long long v[2];
+        v[0] = (unsigned long long)e->start;
+        v[1] = (unsigned long long)e->end;
+        for (int k = 0; k < 2; k++) {
+            char tmp[17];
+            int t = 0;
+            unsigned long long x = v[k];
+            if (x == 0) { tmp[t++] = '0'; }
+            else {
+                while (x && t < 16) { tmp[t++] = hexd[x & 0xf]; x >>= 4; }
+            }
+            while (t > 0) head[hn++] = tmp[--t];
+            if (k == 0) head[hn++] = '-';
+        }
+        head[hn] = 0;
+    }
+    if (hn <= 0) return w;
+
+    /* 原行里第一个空格之前的地址字段长度即需要替换的范围 */
+    while (i < e->raw_len && e->raw[i] != ' ' && e->raw[i] != '\n') i++;
+    if (w + (size_t)hn + (e->raw_len - i) + 2 > cap) return w;
+    memcpy(out + w, head, (size_t)hn);
+    w += (size_t)hn;
+    if (i < e->raw_len) {
+        memcpy(out + w, e->raw + i, e->raw_len - i);
+        w += e->raw_len - i;
+    }
+    out[w++] = '\n';
+    return w;
 }
 
 static int maps_make_clean_fd(void) {
@@ -347,14 +553,13 @@ static int maps_make_clean_fd(void) {
     {
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        if (g_maps_ttl_fd >= 0 &&
+        if (g_maps_ttl_buf && g_maps_ttl_len &&
             (now.tv_sec - g_maps_ttl_sec) * 1000L +
             (now.tv_nsec - g_maps_ttl_nsec) / 1000000L < MAPS_TTL_MS) {
-            int dup_fd = (int)syscall(SYS_dup, g_maps_ttl_fd);
-            if (dup_fd >= 0) {
-                syscall(SYS_lseek, dup_fd, 0, SEEK_SET);
+            int f = maps_memfd_of(g_maps_ttl_buf, g_maps_ttl_len);
+            if (f >= 0) {
                 g_maps_ttl_hits++;
-                return dup_fd;
+                return f;
             }
         }
     }
@@ -399,16 +604,18 @@ static int maps_make_clean_fd(void) {
          * 因此这里只做一件事：把相邻同文件的可执行段的**结束地址**往后延，
          * 其余字段原样保留并原样输出。
          */
-        unsigned long long prev_s = 0, prev_e = 0, prev_off = 0;
+        unsigned long long prev_e = 0;
         char prev_perm[8] = {0}, prev_path[AHB_PATH_MAX] = {0};
+        struct maps_ent prev;
         int have_prev = 0;
+        memset(&prev, 0, sizeof(prev));
 
         line = raw;
         while (line && *line) {
             char *nl = strchr(line, '\n');
             size_t len = nl ? (size_t)(nl - line + 1) : strlen(line);
 
-            if (maps_line_is_trace(line)) {
+            if (maps_line_is_trace_len(line, nl ? (size_t)(nl - line) : strlen(line))) {
                 dropped++;
                 if (!nl) break;
                 line = nl + 1;
@@ -416,59 +623,43 @@ static int maps_make_clean_fd(void) {
             }
 
             {
-                unsigned long long cs = 0, ce = 0, co = 0, cinode = 0;
-                char cperm[8] = {0}, cdev[16] = {0}, cpath[AHB_PATH_MAX] = {0};
-                int ok = sscanf(line, "%llx-%llx %7s %llx %15s %llu %319[^\n]",
-                                &cs, &ce, cperm, &co, cdev, &cinode, cpath);
-
-                /*
-                 * 显式丢弃匿名可执行段。
-                 *
-                 * 不能只依赖 maps_line_is_trace()：实测过滤产物里
-                 * 仍出现 "30f938e000-30f938f000 rw-p 0 00:00 0
-                 * 30f938f000-30f9537000 r-xp 00000000 00:00 0" ——
-                 * 匿名 r-x 行没被丢掉，而是被拼进了上一行末尾，
-                 * 检测器按行解析时仍把它当成一条独立段，数出 3 个判 RISK。
-                 *
-                 * 这里按字段直接判：权限是 r-x 且路径字段为空 = 匿名可执行段。
-                 * 与 sscanf 返回值无关，不依赖任何"抑制赋值"的语义。
-                 */
-                if (ok >= 4 && cperm[0] == 'r' && cperm[1] == '-' &&
-                    cperm[2] == 'x' && cpath[0] == '\0') {
-                    dropped++;
-                    if (!nl) break;
-                    line = nl + 1;
-                    continue;
-                }
-
-                if (ok >= 7 && have_prev &&
-                    strncmp(cperm, "r-x", 3) == 0 &&
-                    strcmp(prev_perm, cperm) == 0 &&
-                    strcmp(prev_path, cpath) == 0 &&
-                    cs == prev_e) {
-                    /* 相邻同文件可执行段：只把上一段的结束地址往后延 */
-                    prev_e = ce;
-                    if (!nl) break;
-                    line = nl + 1;
-                    continue;
-                }
-
-                if (have_prev) {
-                    char obuf[1024];
-                    int on = snprintf(obuf, sizeof(obuf),
-                                      "%llx-%llx %s %llx %s %llu %s\n",
-                                      prev_s, prev_e, prev_perm, prev_off,
-                                      "00:00", (unsigned long long)0, prev_path);
-                    if (on > 0 && w + (size_t)on < cap) {
-                        memcpy(out + w, obuf, (size_t)on);
-                        w += (size_t)on;
+                struct maps_ent ce;
+                if (maps_parse_line(line, nl ? (size_t)(nl - line) : strlen(line), &ce)) {
+                    /*
+                     * 显式丢弃匿名可执行段。
+                     *
+                     * 检测器把"无路径的 r-x 段"当作注入跳板来数。
+                     * 判定必须只看本行：权限是 r-x 且路径为空。
+                     */
+                    if (ce.perm[0] == 'r' && ce.perm[1] == '-' &&
+                        ce.perm[2] == 'x' && ce.path[0] == '\0') {
+                        dropped++;
+                        if (!nl) break;
+                        line = nl + 1;
+                        continue;
                     }
-                }
 
-                if (ok >= 7) {
-                    prev_s = cs; prev_e = ce; prev_off = co;
-                    strncpy(prev_perm, cperm, sizeof(prev_perm) - 1);
-                    strncpy(prev_path, cpath, sizeof(prev_path) - 1);
+                    if (have_prev &&
+                        strncmp(ce.perm, "r-x", 3) == 0 &&
+                        strcmp(prev_perm, ce.perm) == 0 &&
+                        strcmp(prev_path, ce.path) == 0 &&
+                        ce.start == prev_e) {
+                        /* 相邻同文件可执行段：只把上一段的结束地址往后延 */
+                        prev_e = ce.end;
+                        if (!nl) break;
+                        line = nl + 1;
+                        continue;
+                    }
+
+                    if (have_prev) {
+                        prev.end = prev_e;      /* 合并过的结束地址要同步 */
+                        w = maps_emit_line(out, w, cap, &prev);
+                    }
+
+                    prev = ce;
+                    prev_e = ce.end;
+                    strncpy(prev_perm, ce.perm, sizeof(prev_perm) - 1);
+                    strncpy(prev_path, ce.path, sizeof(prev_path) - 1);
                     have_prev = 1;
                 } else {
                     /* 解析失败就原样输出，绝不做任何加工 */
@@ -480,14 +671,8 @@ static int maps_make_clean_fd(void) {
             line = nl + 1;
         }
         if (have_prev) {
-            char obuf[1024];
-            int on = snprintf(obuf, sizeof(obuf), "%llx-%llx %s %llx %s %llu %s\n",
-                              prev_s, prev_e, prev_perm, prev_off,
-                              "00:00", (unsigned long long)0, prev_path);
-            if (on > 0 && w + (size_t)on < cap) {
-                memcpy(out + w, obuf, (size_t)on);
-                w += (size_t)on;
-            }
+            prev.end = prev_e;
+            w = maps_emit_line(out, w, cap, &prev);
         }
     }
     g_maps_filtered++;
@@ -545,38 +730,19 @@ static int maps_make_clean_fd(void) {
     }
     syscall(SYS_lseek, (int)fd, 0, SEEK_SET);
 
-    /* 刷新时间窗口缓存 */
+    /* 记录时间戳 + 保存内容副本供窗口内复用 */
     {
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        if (g_maps_ttl_fd >= 0) syscall(SYS_close, g_maps_ttl_fd);
-        g_maps_ttl_fd = (int)syscall(SYS_dup, (int)fd);
-        g_maps_ttl_sec = now.tv_sec;
-        g_maps_ttl_nsec = now.tv_nsec;
-    }
-
-    /* 入缓存（复用最旧的一格），调用方拿 dup 的句柄 */
-    if (g_maps_pending) {
-        int slot = g_maps_cache_n;
-        if (slot >= MAPS_CACHE_MAX) {
-            slot = 0;
-            for (int i = 1; i < MAPS_CACHE_MAX; i++) {
-                if (g_maps_cache[i].sig < g_maps_cache[slot].sig) slot = i;
-            }
-            if (g_maps_cache[slot].fd >= 0) syscall(SYS_close, g_maps_cache[slot].fd);
-        } else {
-            g_maps_cache_n++;
-        }
-        g_maps_cache[slot].sig = g_maps_pending_sig;
-        g_maps_cache[slot].fd  = (int)fd;
-        g_maps_pending = 0;
-
+        if (g_maps_ttl_buf) { free(g_maps_ttl_buf); g_maps_ttl_buf = NULL; g_maps_ttl_len = 0; }
         {
-            int dup_fd = (int)syscall(SYS_dup, (int)fd);
-            if (dup_fd >= 0) {
-                syscall(SYS_lseek, dup_fd, 0, SEEK_SET);
-                free(raw); free(out);
-                return dup_fd;
+            char *cp = (char *)malloc(w ? w : 1);
+            if (cp) {
+                memcpy(cp, out, w);
+                g_maps_ttl_buf = cp;
+                g_maps_ttl_len = w;
+                g_maps_ttl_sec = now.tv_sec;
+                g_maps_ttl_nsec = now.tv_nsec;
             }
         }
     }
@@ -660,6 +826,7 @@ static int maps_phdr_trampoline(struct dl_phdr_info *info, size_t sz, void *data
 }
 
 static int maps_dl_iterate_wrap(dl_phdr_cb cb, void *data) {
+    g_c_dlphdr++;
     maps_phdr_ctx ctx;
     if (!g_real_dl_iterate) {
         g_real_dl_iterate = (dl_iterate_fn)dlsym(RTLD_NEXT, "dl_iterate_phdr");
@@ -711,6 +878,9 @@ static void maps_lazy_rescan(void) {
 }
 
 static int maps_open_wrap(const char *path, int flags, mode_t mode) {
+    struct timespec _ts0, _ts1;
+    clock_gettime(CLOCK_MONOTONIC, &_ts0);
+    g_c_open++;
     maps_resolve_reals();
     g_maps_open_calls++;
     maps_lazy_rescan();
@@ -723,14 +893,32 @@ static int maps_open_wrap(const char *path, int flags, mode_t mode) {
         }
     }
     if (maps_path_is_self(path)) {
+        struct timespec _s0, _s1;
+        clock_gettime(CLOCK_MONOTONIC, &_s0);
         int fd = maps_make_clean_fd();
-        if (fd >= 0) return fd;
+        clock_gettime(CLOCK_MONOTONIC, &_s1);
+        g_c_self++;
+        g_t_self += (unsigned long)((_s1.tv_sec - _s0.tv_sec) * 1000000L
+                                    + (_s1.tv_nsec - _s0.tv_nsec) / 1000L);
+        if (fd >= 0) {
+            clock_gettime(CLOCK_MONOTONIC, &_ts1);
+            g_t_open += (unsigned long)((_ts1.tv_sec - _ts0.tv_sec) * 1000000L
+                                        + (_ts1.tv_nsec - _ts0.tv_nsec) / 1000L);
+            return fd;
+        }
     }
-    if (g_real_open) return g_real_open(path, flags, mode);
+    if (g_real_open) {
+        int r = g_real_open(path, flags, mode);
+        clock_gettime(CLOCK_MONOTONIC, &_ts1);
+        g_t_open += (unsigned long)((_ts1.tv_sec - _ts0.tv_sec) * 1000000L
+                                    + (_ts1.tv_nsec - _ts0.tv_nsec) / 1000L);
+        return r;
+    }
     return (int)syscall(SYS_openat, AT_FDCWD, path, flags, mode);
 }
 
 static int maps_openat_wrap(int dirfd, const char *path, int flags, mode_t mode) {
+    g_c_openat++;
     maps_resolve_reals();
     g_maps_open_calls++;
     if (maps_path_is_self(path)) {
@@ -742,6 +930,7 @@ static int maps_openat_wrap(int dirfd, const char *path, int flags, mode_t mode)
 }
 
 static void *maps_fopen_wrap(const char *path, const char *mode) {
+    g_c_fopen++;
     maps_resolve_reals();
     g_maps_open_calls++;
     maps_lazy_rescan();
@@ -766,6 +955,7 @@ static void *maps_fopen_wrap(const char *path, const char *mode) {
 
 /* __open_2：flags 为常量的 open，clang 的默认落点 */
 static int maps_open_2_wrap(const char *path, int flags) {
+    g_c_open2++;
     maps_resolve_reals();
     g_maps_open_calls++;
     if (maps_path_is_self(path)) {
@@ -777,6 +967,7 @@ static int maps_open_2_wrap(const char *path, int flags) {
 }
 
 static int maps_open64_wrap(const char *path, int flags, mode_t mode) {
+    g_c_open64++;
     maps_resolve_reals();
     g_maps_open_calls++;
     if (maps_path_is_self(path)) {
@@ -788,6 +979,7 @@ static int maps_open64_wrap(const char *path, int flags, mode_t mode) {
 }
 
 static int maps_openat_2_wrap(int dirfd, const char *path, int flags) {
+    g_c_openat2++;
     maps_resolve_reals();
     g_maps_open_calls++;
     if (maps_path_is_self(path)) {
@@ -799,6 +991,7 @@ static int maps_openat_2_wrap(int dirfd, const char *path, int flags) {
 }
 
 static int maps_open64_2_wrap(const char *path, int flags) {
+    g_c_open642++;
     maps_resolve_reals();
     g_maps_open_calls++;
     if (maps_path_is_self(path)) {
@@ -811,6 +1004,7 @@ static int maps_open64_2_wrap(const char *path, int flags) {
 
 /* opendir("/proc/self") 本身不含 maps，但目录项会暴露；只拦 maps 路径 */
 static struct __dirstream *maps_opendir_wrap(const char *path) {
+    g_c_opendir++;
     maps_resolve_reals();
     if (g_real_opendir) return g_real_opendir(path);
     return NULL;
@@ -822,6 +1016,7 @@ static struct __dirstream *maps_opendir_wrap(const char *path) {
  * 命中 maps 时改用已过滤的临时文件。
  */
 static void *maps_popen_wrap(const char *cmd, const char *mode) {
+    g_c_popen++;
     maps_resolve_reals();
     if (cmd && strstr(cmd, "/proc/self/maps")) {
         g_maps_open_calls++;
@@ -1074,6 +1269,7 @@ typedef long (*syscall6_fn)(long, long, long, long, long, long, long);
 
 static long maps_syscall_wrap(long number, long a1, long a2, long a3,
                               long a4, long a5, long a6) {
+    g_c_sys++;
     maps_ensure_raw_syscall();
     #ifdef SYS_open
     if (number == SYS_openat || number == SYS_open) {
@@ -1114,13 +1310,19 @@ static uintptr_t ahb_repl_for(const char *name) {
     if (strcmp(name, "popen") == 0)           return (uintptr_t)maps_popen_wrap;
     if (!g_disable_phdr_hide && strcmp(name, "dl_iterate_phdr") == 0)
                                               return (uintptr_t)maps_dl_iterate_wrap;
-    if (strcmp(name, "exit") == 0)            return (uintptr_t)ep_exit;
-    if (strcmp(name, "_exit") == 0)           return (uintptr_t)ep__exit;
-    if (strcmp(name, "kill") == 0)            return (uintptr_t)ep_kill;
-    if (strcmp(name, "raise") == 0)           return (uintptr_t)ep_raise;
-    if (strcmp(name, "abort") == 0)           return (uintptr_t)ep_abort;
-    if (strcmp(name, "tgkill") == 0)          return (uintptr_t)ep_tgkill;
-    if (strcmp(name, "exit_group") == 0)      return (uintptr_t)ep_exit_group;
+    /*
+     * 退出探针（exit/_exit/kill/raise/abort/tgkill/exit_group）不再接管。
+     *
+     * 它们是早期为了回答"到底哪一步检查把它杀了"临时接的调试设施，
+     * 对隐藏痕迹没有任何作用 —— 检测器不会因为 exit 被改过就放行。
+     *
+     * 反而是实际事故来源：hunter 的 hunter_server_twin 进程退出时走到
+     * ep__exit，tombstone 栈顶正是 ep__exit+92 的 SIGSEGV。退出路径上
+     * 进程状态已在拆解，这时再 open/write 写日志、再进 dlsym 解析符号
+     * 都很危险。
+     *
+     * 只为记日志、却能在宿主退出时崩掉的东西，收益为负。全部撤掉。
+     */
     if (strcmp(name, "syscall") == 0)         return (uintptr_t)maps_syscall_wrap;
     /*
      * 把 process_vm_readv 也纳入重定位驱动接管。

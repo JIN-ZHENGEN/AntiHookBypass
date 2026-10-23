@@ -101,7 +101,28 @@ static const char *ahb_logpath(void) {
     return g_logpath;
 }
 
+/*
+ * 运行时日志开关：/data/local/tmp/ahb_verbose 存在才写诊断日志。
+ *
+ * 为什么必须有这个开关：HEAD 版这里是每次都写，一次检测下来 4000+ 行，
+ * 每行一次 write 系统调用。在热路径上它会被放大成可测量的延迟，
+ * 而诊断时又必须能开到最大。编译期宏做不到"现场切换不重编"，
+ * 所以用文件存在性做开关，每 64 次才 stat 一次，探测本身不成热点。
+ */
+static volatile int g_verbose = -1;
+static int ahb_verbose_on(void) {
+    int v = g_verbose;
+    if (v >= 0) return v;
+    static unsigned long probes = 0;
+    if ((++probes & 0x3f) != 0) return 0;
+    struct stat st;
+    v = (stat("/data/local/tmp/ahb_verbose", &st) == 0) ? 1 : 0;
+    g_verbose = v;
+    return v;
+}
+
 static void ahb_filelog(const char *fmt, ...) {
+    if (!ahb_verbose_on()) return;
     const char *path = ahb_logpath();
     if (!path) return;
     char buf[512];
@@ -190,6 +211,56 @@ struct clv_slot {
     volatile int ready;
 };
 static struct clv_slot g_clv[CLV_MAX_HEADS];
+
+/*
+ * ===== 地址索引表（把热路径从 O(n·m) 降到 O(1)）=====
+ *
+ * 动机是一条实测数据：一次检测里 process_vm_readv 包装被调用 12835 次，
+ * 而每次调用都要走两步全表扫描：
+ *   clv_find()            -> 遍历最多 64 个 slot
+ *   clv_is_chain_member() -> 再遍历每个 slot 的最多 CLV_MAX_CHAIN 个节点
+ * 合计最坏 64 + 64×64 次比较，乘以 12835 次调用就是千万级内存读。
+ * 改成开放寻址哈希表后，登记时同时插入 head 与全部节点地址，
+ * 查询时一次哈希命中。表容量取 2 的幂并留足余量，装载因子在 0.5 以内。
+ * 视图只增不减，因此不需要删除与墓碑。
+ */
+#define CLV_IDX_CAP 4096u
+static uintptr_t g_idx_key[CLV_IDX_CAP];   /* 0 表示空槽（0 不是合法用户指针） */
+static int       g_idx_kind[CLV_IDX_CAP];  /* 1=head, 2=node */
+
+static inline unsigned clv_hash(uintptr_t a) {
+    /* Fibonacci 散列：乘法比取模便宜，对地址这种高位相似的值分布均匀 */
+    return (unsigned)((a * 0x9E3779B97F4A7C15ULL) >> 40) & (CLV_IDX_CAP - 1);
+}
+
+static void clv_idx_put(uintptr_t a, int kind) {
+    if (!a) return;
+    unsigned h = clv_hash(a);
+    for (unsigned i = 0; i < CLV_IDX_CAP; i++) {
+        unsigned k = (h + i) & (CLV_IDX_CAP - 1);
+        if (g_idx_key[k] == a) {
+            if (kind == 1) g_idx_kind[k] = 1;
+            return;
+        }
+        if (g_idx_key[k] == 0) {
+            g_idx_key[k] = a;
+            g_idx_kind[k] = kind;
+            return;
+        }
+    }
+}
+
+/* 返回 1=head, 2=node, 0=未登记 */
+static int clv_idx_get(uintptr_t a) {
+    if (!a) return 0;
+    unsigned h = clv_hash(a);
+    for (unsigned i = 0; i < CLV_IDX_CAP; i++) {
+        unsigned k = (h + i) & (CLV_IDX_CAP - 1);
+        if (g_idx_key[k] == a) return g_idx_kind[k];
+        if (g_idx_key[k] == 0) return 0;
+    }
+    return 0;
+}
 
 /*
  * ===== 合成链表（决定性手段）=====
@@ -315,6 +386,12 @@ static void clv_start_fast_patch(void);
 
 
 static unsigned long g_guard_ticks = 0;
+
+static inline unsigned long ahb_now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long)ts.tv_sec * 1000000UL + (unsigned long)(ts.tv_nsec / 1000);
+}
 static int l3_trim_when_settled(void);
 
 static HookFunType g_hook = NULL;
@@ -715,6 +792,17 @@ static pthread_t    g_guard_thread;
  * 也会被下一次复查收敛。间隔取 250ms：足够跟上模块延迟加载，
  * 又不至于让 /proc/self/maps 的读取成为负担。
  */
+/*
+ * 早期补扫窗口。
+ *
+ * 原来是 40 轮（10 秒），每轮都做全量 maps 补扫。真正需要补扫的时机
+ * 只有"目标 .so 在 JNI_OnLoad 之后 dlopen"与"其它模块之后注入新库"，
+ * 两者都发生在最初两秒内，所以窗口收到 10 轮（2.5 秒）；
+ * 再加一层提前退出：连续 3 轮无新增接管就认为已稳定，停止扫描。
+ */
+#define GUARD_EARLY_TICKS 10
+static int g_maps_idle = 0;
+
 static void *guard_loop(void *arg) {
     int ops = (int)(intptr_t)arg;
     LOGI("L4 guard_loop 启动 interval=250ms ops=%#x", ops);
@@ -771,7 +859,7 @@ static void *guard_loop(void *arg) {
          * done 集合，扫描一轮里几乎不再重复解析已处理过的库。
          * 且只在早期（前 40 轮，约 10 秒）执行。
          */
-        if ((ops & NATIVE_OP_CL) != 0 && g_enable_maps_hide && g_guard_ticks < 40) {
+        if ((ops & NATIVE_OP_CL) != 0 && g_enable_maps_hide && g_guard_ticks < GUARD_EARLY_TICKS) {
             clv_patch_got();
         }
         /*
@@ -784,7 +872,7 @@ static void *guard_loop(void *arg) {
          * 只在早期窗口（前 40 轮，约 10 秒）做，且已有登记时也照做 ——
          * clv_build 内部对重复 head 会直接返回，不会重复占槽。
          */
-        if ((ops & NATIVE_OP_CL) != 0 && g_guard_ticks < 40 && (g_guard_ticks % 2) == 0) {
+        if ((ops & NATIVE_OP_CL) != 0 && g_guard_ticks < GUARD_EARLY_TICKS && (g_guard_ticks % 2) == 0) {
             int before = g_clv_n;
             clv_install_now();
             if (g_clv_n != before) {
@@ -801,10 +889,12 @@ static void *guard_loop(void *arg) {
          *
          * 因此限定前 40 轮（约 10 秒），并且每轮只在真的新接管到东西时才打印。
          */
-        if ((ops & NATIVE_OP_CL) != 0 && !g_clv_in_wrap && g_guard_ticks < 40) {
+        if ((ops & NATIVE_OP_CL) != 0 && !g_clv_in_wrap && g_guard_ticks < GUARD_EARLY_TICKS && g_maps_idle < 3) {
             static int maps_hb = 0;
             int n = maps_patch_got_all();
             maps_hb++;
+            /* 连续无新增 -> 库加载已稳定，提前停扫 */
+            if (n > 0) g_maps_idle = 0; else g_maps_idle++;
             if (n > 0) {
                 LOGI("MAPS: 本轮新增接管 %d 处，累计 %d 处",
                      n, g_maps_got_patched);
@@ -824,7 +914,7 @@ static void *guard_loop(void *arg) {
          * 没必要让宿主每秒醒四次。
          */
         struct timespec ts;
-        if (g_guard_ticks < 40) {
+        if (g_guard_ticks < GUARD_EARLY_TICKS) {
             ts.tv_sec = 0;
             ts.tv_nsec = 250L * 1000L * 1000L;
         } else {
@@ -854,6 +944,19 @@ static int start_guard(int ops) {
 /* ================================================================== */
 
 static int collect_libart_range(uintptr_t *art_start, uintptr_t *art_end) {
+    /*
+     * 结果缓存：libart 的映射区间在一个进程生命周期内不会变，
+     * 而这里每次都要 fopen + 逐行解析整个 /proc/self/maps。
+     * 实测 clv_install_now 被调用 65 次、累计 1.73 秒，平均每次 26ms，
+     * 就是这段地图解析吃掉的。缓存后只付 1 次成本。
+     */
+    static uintptr_t c_s = 0, c_e = 0;
+    static int c_ok = 0;
+    if (c_ok) {
+        *art_start = c_s;
+        *art_end = c_e;
+        return 1;
+    }
     FILE *fp = fopen("/proc/self/maps", "r");
     if (!fp) return 0;
 
@@ -877,6 +980,9 @@ static int collect_libart_range(uintptr_t *art_start, uintptr_t *art_end) {
     if (e_max == 0) return 0;
     *art_start = s_min;
     *art_end = e_max;
+    c_s = s_min;
+    c_e = e_max;
+    c_ok = 1;
     return 1;
 }
 
@@ -980,6 +1086,11 @@ static int looks_like_class_loaders(uintptr_t head, size_t step) {
  * 建合成视图。只依赖真实链表头，不改它。
  */
 static struct clv_slot *clv_find(uintptr_t head) {
+    /*
+     * 快路径：哈希表里没有这个地址，就一定不是任何 slot 的 head，
+     * 直接返回 NULL，不用再扫 slot 数组。
+     */
+    if (clv_idx_get(head) != 1) return NULL;
     for (int i = 0; i < g_clv_n; i++)
         if (g_clv[i].head == head && g_clv[i].ready) return &g_clv[i];
     return NULL;
@@ -994,15 +1105,7 @@ static struct clv_slot *clv_find(uintptr_t head) {
  * 这正是"三轮坏一轮"的直接原因。
  */
 static int clv_is_chain_member(uintptr_t addr) {
-    int i, k;
-    for (i = 0; i < g_clv_n; i++) {
-        if (!g_clv[i].ready) continue;
-        if (g_clv[i].head == addr) return 1;
-        for (k = 0; k < g_clv[i].keep; k++) {
-            if (g_clv[i].node_addr[k] == addr) return 1;
-        }
-    }
-    return 0;
+    return clv_idx_get(addr) != 0;
 }
 
 /*
@@ -1182,6 +1285,8 @@ static void clv_build(uintptr_t head) {
     sl = &g_clv[g_clv_n];
     sl->head = head;
     sl->cand = g_clv_cur_cand;
+    /* 同步进哈希索引：热路径靠它 O(1) 判重 */
+    clv_idx_put(head, 1);
     /*
      * 合成闭环必须在**slot 索引确定之后**构造。
      *
@@ -1258,6 +1363,7 @@ static void clv_build(uintptr_t head) {
                cur >= USER_PTR_MIN && cur < USER_PTR_MAX) {
             uintptr_t nxt = 0;
             sl->node_addr[n] = cur;
+            clv_idx_put(cur, 2);
             n++;
             if (!read_ptr_untagged(cur + 8, &nxt)) break;
             cur = UNTAG_PTR(nxt);
@@ -1850,10 +1956,22 @@ static ssize_t clv_pvr(pid_t pid, const struct iovec *local, unsigned long liovc
      * 扫描本身是"扫 Runtime 的 0..0x500 指针 + 找闭环"，开销很小。
      */
     {
+        /*
+         * 补扫节流。
+         *
+         * 原来是"前 64 次读取各补扫一次"，实测是检测期最大的模块内开销：
+         * clv_install_now 每次要约 26ms，64 次就是 1.7 秒。
+         * 改成按时间节流：每 250ms 最多一次。Runtime 里新成形的闭环
+         * 是毫秒级过程，250ms 的粒度绰绰有余。
+         */
+        static unsigned long last_us = 0;
         static int rescans = 0;
         uintptr_t ra0 = (riovcnt >= 1) ? (uintptr_t)remote[0].iov_base : 0;
-        if (ra0 != 0 && rescans < 64) {
+        unsigned long now_us = ahb_now_us();
+        if (ra0 != 0 && rescans < 24 &&
+            (last_us == 0 || now_us - last_us >= 250000UL)) {
             rescans++;
+            last_us = now_us;
             int before = g_clv_n;
             clv_install_now();
             if (g_clv_n != before) {
@@ -2299,70 +2417,6 @@ static void clv_install_now(void) {
      * 所以第一步必须先按官方偏移取到真正的链表头，再对它做视图。
      * 按偏移取是确定性的，不依赖运气，也就不会再有"三轮坏一轮"。
      */
-    /*
-     * 诊断：把 runtime+0..0x500 里所有"vptr 落在 libart"的候选全列出来，
-     * 并报每个候选内部找到的闭环。目的是确定检测器到底数的是哪一条 ——
-     * 它报 29~33，而我们只登记出 16/17 和 21，说明双方选的候选不同。
-     */
-    {
-        static int dumped = 0;
-        uintptr_t art_s = 0, art_e = 0;
-        if (!dumped && collect_libart_range(&art_s, &art_e)) {
-            dumped = 1;
-            for (size_t o = 0; o < 0x500; o += step) {
-                uintptr_t cd = 0, vp = 0;
-                int loops = 0;
-                uintptr_t lh = 0;
-                int lc = 0;
-                if (!read_ptr_untagged(runtime + o, &cd)) continue;
-                if (cd < USER_PTR_MIN || cd >= USER_PTR_MAX) continue;
-                if (!read_ptr_untagged(cd, &vp)) continue;
-                if (vp < art_s || vp >= art_e) continue;
-                for (size_t lo = 0; lo < 0x500; lo += step) {
-                    uintptr_t hh = UNTAG_PTR(cd + lo);
-                    uintptr_t x = 0, y = 0, xn = 0, yp = 0;
-                    if (!read_ptr_untagged(hh, &x) || !read_ptr_untagged(hh + step, &y)) continue;
-                    if (x < USER_PTR_MIN || y < USER_PTR_MIN) continue;
-                    if (x == hh || y == hh) continue;
-                    if (!read_ptr_untagged(x + step, &xn) || !read_ptr_untagged(y, &yp)) continue;
-                    if (UNTAG_PTR(xn) != hh || UNTAG_PTR(yp) != hh) continue;
-                    {
-                        int d1 = walk_dll(y, hh, step), d2 = walk_dll(x, hh, 0);
-                        int dc = (d1 > d2) ? d1 : d2;
-                        if (dc < 2) continue;
-                        loops++;
-                        if (dc > lc) { lc = dc; lh = hh; }
-                    }
-                }
-                ahb_filelog("VIEW CAND off=%#lx cand=%#lx loops=%d maxcount=%d head=%#lx",
-                            (unsigned long)o, (unsigned long)cd, loops, lc, (unsigned long)lh);
-                /* 全量列出该候选内每个闭环的 (list_off, head, count) */
-                if (loops > 0) {
-                    for (size_t lo2 = 0; lo2 < 0x500; lo2 += step) {
-                        uintptr_t hh2 = UNTAG_PTR(cd + lo2);
-                        uintptr_t x2 = 0, y2 = 0, xn2 = 0, yp2 = 0;
-                        if (!read_ptr_untagged(hh2, &x2) || !read_ptr_untagged(hh2 + step, &y2)) continue;
-                        if (x2 < USER_PTR_MIN || y2 < USER_PTR_MIN) continue;
-                        if (x2 == hh2 || y2 == hh2) continue;
-                        if (!read_ptr_untagged(x2 + step, &xn2) || !read_ptr_untagged(y2, &yp2)) continue;
-                        if (UNTAG_PTR(xn2) != hh2 || UNTAG_PTR(yp2) != hh2) continue;
-                        {
-                            int e1 = walk_dll(y2, hh2, step), e2 = walk_dll(x2, hh2, 0);
-                            int ec = (e1 > e2) ? e1 : e2;
-                            if (ec >= 2)
-                                ahb_filelog("VIEW LOOP cand=%#lx off=%#lx head=%#lx count=%d cl=%d",
-                                            (unsigned long)cd, (unsigned long)lo2,
-                                            (unsigned long)hh2, ec,
-                                            looks_like_class_loaders(hh2, step));
-                        }
-                    }
-                }
-            }
-            ahb_filelog("VIEW CAND done runtime=%#lx art=%#lx-%#lx",
-                        (unsigned long)runtime, (unsigned long)art_s, (unsigned long)art_e);
-        }
-    }
-
     {
         uintptr_t cl = 0;
         if (read_ptr_untagged(runtime + 0x2c0, &cl) && cl >= USER_PTR_MIN && cl < USER_PTR_MAX) {
@@ -2420,27 +2474,6 @@ static void clv_install_now(void) {
                     ahb_filelog("VIEW direct cl=%#lx head=%#lx a=%#lx b=%#lx",
                                 (unsigned long)cl, (unsigned long)h,
                                 (unsigned long)UNTAG_PTR(a), (unsigned long)UNTAG_PTR(b));
-                    /* 诊断：扫 ClassLinker 全部偏移，列出所有闭环 */
-                    {
-                        int nl = 0;
-                        for (size_t lo = 0; lo < 0x500; lo += step) {
-                            uintptr_t hh = UNTAG_PTR(cl + lo);
-                            uintptr_t x = 0, y = 0, xn = 0, yp = 0;
-                            if (!read_ptr_untagged(hh, &x) || !read_ptr_untagged(hh + step, &y)) continue;
-                            if (x < USER_PTR_MIN || y < USER_PTR_MIN) continue;
-                            if (x == hh || y == hh) continue;
-                            if (!read_ptr_untagged(x + step, &xn) || !read_ptr_untagged(y, &yp)) continue;
-                            if (UNTAG_PTR(xn) != hh || UNTAG_PTR(yp) != hh) continue;
-                            int d1 = walk_dll(y, hh, step), d2 = walk_dll(x, hh, 0);
-                            int dc = (d1 > d2) ? d1 : d2;
-                            if (dc < 2) continue;
-                            nl++;
-                            if (nl <= 6)
-                                ahb_filelog("VIEW CLLOOP off=%#lx head=%#lx count=%d",
-                                            (unsigned long)lo, (unsigned long)hh, dc);
-                        }
-                        ahb_filelog("VIEW CLLOOP total=%d cl=%#lx", nl, (unsigned long)cl);
-                    }
                     g_clv_cur_cand = cl;
                     g_clv_cur_cl = cl;
                     /*
@@ -2616,7 +2649,15 @@ static void *clv_fast_patch_thread(void *arg) {
      * （约 0.6 秒）；命中 pvr/syscall 后再多等 20 次确认稳定即退出。
      * 之后由 guard 的 40 轮上限兜底，不会漏。
      */
-    for (int i = 0; i < 1500; i++) {          /* 最长约 3 秒，命中即退 */
+    /*
+     * 轮询粒度 60ms，不再 2ms。
+     *
+     * 这是"检测期变慢"的主要来源之一：原来是 1500 轮 × 2ms 的紧循环，
+     * 每轮都做一次完整重定位扫描（单次约 4ms），累计约 6 秒纯 CPU，
+     * 全程与检测器抢同一批核心。而这条线程要等的只是"目标 .so 被 dlopen"，
+     * 那是几百毫秒内一次性完成的事件。60ms 一次能把总开销降到约 0.25 秒。
+     */
+    for (int i = 0; i < 60; i++) {
         int before = g_clv_got_patched;
         clv_patch_got();
         if (g_clv_got_patched > before) {
@@ -2625,9 +2666,9 @@ static void *clv_fast_patch_thread(void *arg) {
         }
         if (g_clv_got_patched >= 2) {
             idle++;
-            if (idle > 5) break;              /* 命中后再确认 5 次即退出 */
+            if (idle > 2) break;              /* 命中后再确认 3 次即退出 */
         }
-        struct timespec ts = {0, 2 * 1000 * 1000};   /* 2ms */
+        struct timespec ts = {0, 60 * 1000 * 1000};
         nanosleep(&ts, NULL);
     }
     LOGI("FASTPATCH: 结束，累计接管 %d 处", g_clv_got_patched);
