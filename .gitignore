@@ -13,3 +13,4 @@ __pycache__/
 # 历史故障快照里的旧签名密钥与安装包：不入公共仓库
 review/**/*.jks
 review/**/*.apk
+build/*.apk
