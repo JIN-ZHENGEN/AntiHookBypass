@@ -96,14 +96,38 @@ static int maps_line_is_trace(const char *line) {
         if (strstr(line, *m)) return 1;
     }
 
-    /* 匿名可执行段：形如 "7f..-7f.. r-xp 00000000 00:00 0" */
+    /*
+     * 匿名可执行段：形如 "7f..-7f.. r-xp 00000000 00:00 0"（行尾没有路径）。
+     *
+     * 这里不能用 sscanf 的 "抑制赋值不计入返回值" 来判空。
+     * 实测踩坑：原写法
+     *     n = sscanf(line, "%llx-%llx %15s %*s %*s %*s %7s", ...);
+     *     if (n == 3 && ...) return 1;
+     * 想靠 "n == 3 表示没有路径字段" 判匿名段，但在 Bionic 上
+     * 带 %*s 的调用返回 6 而不是 3 —— 匿名可执行段一条都没被丢掉。
+     * 后果很直接：过滤后的 maps 里仍留着
+     *     "30f938f000-30f9537000 r-xp 00000000 00:00 0"
+     * 检测器的 native_anon_exec 项照样数出 3 个匿名可执行段判 RISK，
+     * 而其它项全绿 —— 表现成"过滤明明跑了却没生效"。
+     *
+     * 改成自己走 token：跳过起止地址、权限、偏移、dev、inode 五个字段，
+     * 若已到行尾则这一行没有路径，就是匿名段。
+     */
     {
         unsigned long long s = 0, e = 0;
-        char perm[16] = {0}, path[8] = {0};
-        int n = sscanf(line, "%llx-%llx %15s %*s %*s %*s %7s", &s, &e, perm, path);
-        if (n >= 3 && strncmp(perm, "r-x", 3) == 0) {
-            /* n == 3 表示后面没有路径字段，即匿名段 */
-            if (n == 3) return 1;
+        char perm[8] = {0};
+        if (sscanf(line, "%llx-%llx %7s", &s, &e, perm) == 3 &&
+            strncmp(perm, "r-x", 3) == 0) {
+            const char *p = line;
+            int tokens = 0;
+            while (tokens < 5 && *p) {
+                while (*p == ' ') p++;
+                if (!*p) break;
+                while (*p && *p != ' ' && *p != '\n') p++;
+                tokens++;
+            }
+            while (*p == ' ') p++;
+            if (*p == '\0' || *p == '\n') return 1;
         }
     }
     return 0;

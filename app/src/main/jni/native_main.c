@@ -182,6 +182,7 @@ static volatile int g_l3_done = 0;
  */
 struct clv_slot {
     uintptr_t head;
+    uintptr_t cand;        /* head 所属的候选对象（head = cand + list_off） */
     unsigned char headbuf[0x40];
     uintptr_t     node_addr[CLV_MAX_CHAIN]; /* 真实节点地址 */
     unsigned char nodebuf[CLV_MAX_CHAIN][0x10]; /* 每个真实节点要返回的 prev/next */
@@ -242,6 +243,7 @@ static syscall_fn g_real_syscall = NULL;
 static long g_syscall_pvr(long number, void *a1, void *a2, void *a3, void *a4, void *a5, void *a6);
 static void clv_patch_got(void);
 static void clv_build(uintptr_t head);
+static uintptr_t g_clv_cur_cand;
 static void clv_install_now(void);
 static void clv_start_fast_patch(void);
 
@@ -862,7 +864,12 @@ static int write_raw_ptr(uintptr_t addr, uintptr_t val) {
     /* ClassLoader 与其节点都是堆对象，本就可写；这一步是防御性放开页保护 */
     if (mprotect((void *)page, pg, PROT_READ | PROT_WRITE) != 0) return 0;
     *(volatile uintptr_t *)addr = val;
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    /* 用内联汇编屏障，避免任何 libatomic 依赖 */
+#if defined(__aarch64__)
+    __asm__ __volatile__("dmb ish" ::: "memory");
+#else
+    __sync_synchronize();
+#endif
     return 1;
 }
 
@@ -994,8 +1001,22 @@ static void clv_build(uintptr_t head) {
 
     sl = &g_clv[g_clv_n];
     sl->head = head;
+    sl->cand = g_clv_cur_cand;
+    /*
+     * headbuf 必须用**真实 head 的原始 0x40 字节打底**，不能 memset 成 0。
+     *
+     * 踩坑经过：早期这里 memset 清零，然后只写回 prev/next 两个字段。
+     * 结果是链表头里的其它字段（尤其是 std::list 的 __size_）在我们
+     * 视图里全变成 0。检测器走完闭环后还要做结构校验，
+     * 一看到"节点数 4 但 size 是 0"就判结构非法，
+     * 该项直接从 RISK 变成 INFO("链表结构校验失败") —— 不是安全。
+     *
+     * 打底真值 + 只改必要的三个字段，视图才是自洽的。
+     */
     memset(sl->headbuf, 0, sizeof(sl->headbuf));
     memset(sl->node_addr, 0, sizeof(sl->node_addr));
+    if (!safe_read_mem(head, sl->headbuf, sizeof(sl->headbuf)))
+        memset(sl->headbuf, 0, sizeof(sl->headbuf));
 
     /*
      * 直接在**真实节点**上做视图改写，不再合成假节点。
@@ -1097,12 +1118,61 @@ static void clv_build(uintptr_t head) {
         {
             uintptr_t prev = sl->node_addr[(n < CLV_KEEP) ? (n - 1) : (CLV_KEEP - 1)];
             uintptr_t next = sl->node_addr[0];
-            memcpy(sl->headbuf + 0x00, &prev, 8);
+            /*
+             * head 与候选对象重合时（list_off == 0），headbuf 的前 8 字节
+             * 就是这个对象的 vptr。检测器第一步就靠它判断"这是不是一个
+             * ART 对象"，被我们改写成节点地址就再也不是合法 vptr，
+             * 候选直接被跳过。所以这种情况必须原样保留真值。
+             */
+            if (sl->head != sl->cand) {
+                memcpy(sl->headbuf + 0x00, &prev, 8);
+            }
             memcpy(sl->headbuf + 0x08, &next, 8);
-            ahb_filelog("VIEW built head=%#lx n=%d headnext=%#lx node0=%#lx node3next=%#lx",
-                        (unsigned long)head, n, (unsigned long)next,
-                        (unsigned long)sl->node_addr[0],
-                        (unsigned long)(sl->keep > CLV_KEEP ? 0 : 0));
+            /*
+             * __size_ 必须和闭环节点数一致。
+             *
+             * 这是 ClassLoader 项反复翻红/变 INFO 的最后一个原因。
+             * libc++ 的 std::list 头是 {__prev_, __next_, __size_}，
+             * 前 16 字节是首尾指针，+0x10 是元素个数。
+             *
+             * 实测表现：
+             *   - headbuf 整体清零  -> 走链数出 4，但 size=0，
+             *     检测器判"链表结构校验失败"，该项变 INFO（不是 SAFE）
+             *   - headbuf 保留真值  -> size=31，检测器直接报"检测到 31 个"，
+             *     变 RISK
+             * 两种都说明它同时看"走链结果"和"size 字段"，两者必须自洽。
+             *
+             * 所以这里把 size 一起改写成我们的闭环节点数。
+             */
+            {
+                uintptr_t sz = CLV_KEEP;
+                memcpy(sl->headbuf + 0x10, &sz, 8);
+            }
+            {
+                uintptr_t h280=0, h2c0=0, h280p=0, h280n=0;
+                safe_read_mem(sl->cand + 0x280, &h280, 8);
+                safe_read_mem(sl->cand + 0x2c0, &h2c0, 8);
+                h280 = UNTAG_PTR(h280);
+                if (h280) {
+                    safe_read_mem(h280, &h280p, 8);
+                    safe_read_mem(h280 + 8, &h280n, 8);
+                }
+                ahb_filelog("VIEW offs cand=%#lx +280=%#lx prev=%#lx next=%#lx +2c0=%#lx",
+                            (unsigned long)sl->cand, (unsigned long)h280,
+                            (unsigned long)UNTAG_PTR(h280p), (unsigned long)UNTAG_PTR(h280n),
+                            (unsigned long)UNTAG_PTR(h2c0));
+            }
+            {
+                uintptr_t p0=0,p1=0,p2=0,p3=0;
+                memcpy(&p0, sl->headbuf+0x00, 8);
+                memcpy(&p1, sl->headbuf+0x08, 8);
+                memcpy(&p2, sl->headbuf+0x10, 8);
+                memcpy(&p3, sl->headbuf+0x18, 8);
+                ahb_filelog("VIEW built head=%#lx n=%d view={%#lx,%#lx,%#lx,%#lx} cand=%#lx",
+                            (unsigned long)head, n, (unsigned long)p0,
+                            (unsigned long)p1, (unsigned long)p2, (unsigned long)p3,
+                            (unsigned long)sl->cand);
+            }
         }
     }
 
@@ -1175,6 +1245,103 @@ static ssize_t clv_pvr(pid_t pid, const struct iovec *local, unsigned long liovc
             (ra & 7) == 0 &&
             !clv_find(ra) && !clv_is_chain_member(ra)) {
             g_clv_need_build = ra;
+        }
+    }
+
+    /*
+     * 合成候选覆盖必须最先执行，且不能被 g_clv_n / g_clv_in_wrap 挡住。
+     *
+     * 实测教训：这段原先放在 for 循环里、g_clv_in_wrap=1 之后，
+     * 结果是它一次都没跑到（g_clv_n 为 0 时包装在更早处就 return 了），
+     * 表现为"合成候选建好了却完全没生效"。
+     */
+    /* 决定性诊断：记录前 30 次包装调用的远端地址与 fake 分支状态 */
+    {
+        static int dbg = 0;
+        if (dbg < 30) {
+            dbg++;
+            ahb_filelog("VIEW call ra=%#lx n=%lu fake_ready=%d rt=%#lx",
+                        (unsigned long)((riovcnt >= 1) ? (uintptr_t)remote[0].iov_base : 0),
+                        (unsigned long)n, g_fake_ready,
+                        (unsigned long)g_scan_runtime);
+        }
+    }
+    if (g_fake_ready && g_scan_runtime) {
+        static volatile int in_fake = 0;
+        if (!in_fake) {
+            in_fake = 1;
+            for (unsigned long i = 0; i < riovcnt && i < liovcnt; i++) {
+                size_t rlen = remote[i].iov_len;
+                /*
+                 * 必须先去 TBI 标签再比较。
+                 *
+                 * 实测诊断（VIEW call ra=0xb400006ffcd0cb70）：检测器传进来的
+                 * remote iov_base 带 top-byte 标签 0xb4，而 runtime / fake_cl
+                 * 都是无标签地址。直接用 rstart <= rt 比较永远为假，
+                 * 覆盖分支一次都不会执行 —— 这就是"合成候选建好了却没生效"的根因。
+                 *
+                 * 去标签只影响我们的区间计算；写回 local 时仍按原始 rstart 算偏移，
+                 * 因为调用方给的两个缓冲区是按原始地址对应的。
+                 */
+                uintptr_t rstart = (uintptr_t)remote[i].iov_base;
+                uintptr_t rstart_u = UNTAG_PTR(rstart);
+                uintptr_t lstart = (uintptr_t)local[i].iov_base;
+                uintptr_t rt = g_scan_runtime;
+                uintptr_t fcl = g_fake_cl_addr;
+                uintptr_t rend = rstart_u + rlen;
+                rstart = rstart_u;
+                /* runtime+0 -> fake_cl */
+                if (rstart <= rt && rend >= rt + 8) {
+                    uintptr_t v = fcl;
+                    memcpy((void *)(lstart + (rt - rstart)), &v, 8);
+                }
+                /*
+                 * 不清零 runtime+8..0x500。
+                 *
+                 * 曾经把这一段全返回 0，想让检测器"扫不到真候选"。
+                 * 实测反而更糟：它连真实的 ClassLinker 候选也读不到，
+                 * 最后报 "候选内未发现闭环链表 / vtable候选=2 闭环链表=0"，
+                 * 状态变成 INFO —— 既不是安全也不是风险，但也不是我们要的 SAFE。
+                 *
+                 * 正确做法是只伪造 runtime+0：检测器的候选扫描是
+                 * "cl_off 从 0 开始，第一个满足闭环条件就 return"，
+                 * 所以 cl_off=0 命中我们合成的候选后它立即返回，
+                 * 根本不会去读后面那些槽。保持它们为真值反而更安全 ——
+                 * 万一合成候选因故没命中，它仍能走正常路径而不是彻底失灵。
+                 */
+                /* fake_cl 本体 */
+                {
+                    uintptr_t a = (rstart > fcl) ? rstart : fcl;
+                    uintptr_t b = (rend < fcl + FAKE_CL_SIZE) ? rend : (fcl + FAKE_CL_SIZE);
+                    if (a < b) memcpy((void *)(lstart + (a - rstart)), g_fake_cl + (a - fcl), (size_t)(b - a));
+                }
+                /* 合成节点 */
+                {
+                    int q;
+                    for (q = 0; q < FAKE_CL_NODES; q++) {
+                        uintptr_t na = (uintptr_t)g_fake_nodes[q];
+                        uintptr_t a = (rstart > na) ? rstart : na;
+                        uintptr_t b = (rend < na + 0x10) ? rend : (na + 0x10);
+                        if (a < b) {
+                            memcpy((void *)(lstart + (a - rstart)),
+                                   (void *)(na + (a - na)), (size_t)(b - a));
+                        }
+                    }
+                }
+                g_clv_hits++;
+            }
+            in_fake = 0;
+            /*
+             * 这里**不能** return。
+             *
+             * 踩过坑：早期为了"合成候选命中就不再走真链"在这里直接 return n，
+             * 结果把后面基于真实链的伪造整段跳过 —— 而合成候选依赖
+             * "检测器从 runtime+0 开始扫并且第一个就命中我们"，一旦它
+             * 从别的偏移进入，就彻底没人兜底，表现为 count=31~33 翻红。
+             *
+             * 两者是互补关系不是替代关系：合成候选负责"抢先命中"，
+             * 真链视图负责"没抢到时兜底"。所以继续往下走。
+             */
         }
     }
 
@@ -1260,6 +1427,41 @@ static ssize_t clv_pvr(pid_t pid, const struct iovec *local, unsigned long liovc
                             (unsigned long)g_scan_runtime,
                             (unsigned long)g_fake_cl_addr,
                             (unsigned long)rstart); }
+            /* 计数：确认 runtime 区间与 fake_cl 的读到底有没有被覆盖 */
+            {
+                static unsigned long nrt = 0, ncl = 0, nnd = 0;
+                uintptr_t rt2 = g_scan_runtime;
+                uintptr_t fcl2 = g_fake_cl_addr;
+                if (rstart >= rt2 - 8 && rstart < rt2 + 0x600) {
+                    nrt++;
+                    if (nrt <= 3) ahb_filelog("VIEW cov runtime hit rs=%#lx n=%lu",
+                                              (unsigned long)rstart, nrt);
+                }
+                if (rstart >= fcl2 - 8 && rstart < fcl2 + FAKE_CL_SIZE + 8) {
+                    ncl++;
+                    if (ncl <= 3) ahb_filelog("VIEW cov fakecl hit rs=%#lx n=%lu",
+                                              (unsigned long)rstart, ncl);
+                }
+                if ((uintptr_t)g_fake_nodes[0] != 0 &&
+                    rstart >= (uintptr_t)g_fake_nodes[0] - 8 &&
+                    rstart < (uintptr_t)g_fake_nodes[FAKE_CL_NODES-1] + 0x48) {
+                    nnd++;
+                    if (nnd <= 3) ahb_filelog("VIEW cov node hit rs=%#lx n=%lu",
+                                              (unsigned long)rstart, nnd);
+                }
+            }
+            /*
+             * 决定性修复：远端地址带 TBI 标签，必须先去标签再和
+             * 我们自己的地址（runtime / head / node_addr，全部无标签）比较。
+             *
+             * 实测证据：日志里检测器读的目标地址形如 0xb400006ffcd0cb70，
+             * 高字节 0xb4 是 arm64 的 top-byte-ignore 标记。
+             * 而 sl->head / sl->node_addr 是纯地址 0x6ffcd0cb70。
+             * 直接比较永远是假 —— 1310 次读取只命中 10 次，
+             * 于是整条链的伪造形同虚设，检测器照样走真链数出 31。
+             */
+            rstart = UNTAG_PTR(rstart);
+            rend = rstart + rlen;
             uintptr_t rt = g_scan_runtime;
             /* runtime+0 那 8 字节 -> g_fake_cl 地址 */
             {
@@ -1360,7 +1562,29 @@ static ssize_t clv_pvr(pid_t pid, const struct iovec *local, unsigned long liovc
                     memcpy((void *)(lstart + (ovs - rstart)),
                            sl->nodebuf[q] + (ovs - na), (size_t)(ove - ovs));
                     g_clv_hits++;
+                    {
+                        static int dbg3 = 0;
+                        if (dbg3 < 24) {
+                            dbg3++;
+                            uintptr_t nv = 0, pv = 0;
+                            memcpy(&pv, sl->nodebuf[q] + 0, 8);
+                            memcpy(&nv, sl->nodebuf[q] + 8, 8);
+                            ahb_filelog("VIEW cov3 rs=%#lx q=%d k=%d prev=%#lx next=%#lx",
+                                        (unsigned long)rstart, q, k,
+                                        (unsigned long)pv, (unsigned long)nv);
+                        }
+                    }
                 }
+            }
+        }
+        {
+            static int dbg2 = 0;
+            if (dbg2 < 40) {
+                dbg2++;
+                ahb_filelog("VIEW cov2 rs=%#lx n=%zu hits=%lu n0=%#lx",
+                            (unsigned long)rstart, rlen,
+                            g_clv_hits,
+                            (unsigned long)((g_clv_n > 0) ? g_clv[0].node_addr[0] : 0));
             }
         }
         remaining -= (ssize_t)rlen;
@@ -1423,9 +1647,27 @@ static void clv_patch_got(void) {
      */
     if (g_enable_maps_hide) {
         /* 视图接管必须即时生效：跳过去抖，直接精确扫一遍 */
-        g_maps_no_debounce = 1;
+        /*
+         * 视图接管必须即时生效：跳过去抖，直接精确扫一遍。
+         *
+         * 用一个独立的原子锁把"置位 → 扫描 → 复位"整段保护起来。
+         * 实测踩坑：这个全局开关被抢跑线程与守护线程同时改写，
+         * 会出现 A 置 1、B 置 0 的交错；更糟的是它与 maps_patch_got_all
+         * 内部的表重建没有共同保护，曾出现半截表项被另一线程遍历，
+         * 用错的 base 解析 ELF 后 SIGSEGV（崩在 maps_patch_got_all）。
+         */
+        /*
+         * 不要再套一层原子锁。
+         *
+         * 踩过两次同一个坑：__atomic_* 与 __sync_* 在 clang + Bionic 下会引用
+         * __aarch64_cas4_acq_rel / __aarch64_swp4_acq_rel 这些 libatomic 符号，
+         * 而 Bionic 不导出它们 —— dlopen 直接失败，整个模块装不上
+         * （日志："cannot locate symbol __aarch64_cas4_acq_rel"）。
+         *
+         * maps_patch_got_all 内部已经有内联汇编实现的自旋锁（maps_try_lock），
+         * 并发安全由它保证。这里直接调用即可。
+         */
         maps_patch_got_all();
-        g_maps_no_debounce = 0;
     }
 }
 
@@ -1497,6 +1739,69 @@ static void clv_install_now(void) {
 
     const size_t step = sizeof(uintptr_t);
     int found = 0;
+
+    /*
+     * ===== 确定性路径：直接按检测器公布的偏移取链表头 =====
+     *
+     * 检测器自己的 detail 里写着它的解析链：
+     *     [Runtime+0x2c0 -> ClassLinker, +0x280 -> class_loaders_]
+     * 也就是说它读 head 的方式是：
+     *     cl     = *(Runtime + 0x2c0)
+     *     head   = *(cl + 0x280)
+     *
+     * 之前我们做的是「在 Runtime+0..0x500 与候选+0..0x500 里暴力搜闭环」，
+     * 搜到哪条就伪造哪条。实测证明这是错的：搜出来的 head 与
+     * 检测器真正用的 head 完全是不同地址。
+     * 日志对照（同一进程内）：
+     *     我们登记的 head = 0x6ffcd1bda0
+     *     cl+0x280 实际值 = 0x6ffcc1c828   ← 检测器走的是这个
+     * 伪造节点虽然命中了，但检测器从它自己的 head 出发，
+     * 走到我们没伪造的那一段就回到真链，照样数出 31。
+     *
+     * 所以第一步必须先按官方偏移取到真正的链表头，再对它做视图。
+     * 按偏移取是确定性的，不依赖运气，也就不会再有"三轮坏一轮"。
+     */
+    {
+        uintptr_t cl = 0;
+        if (read_ptr_untagged(runtime + 0x2c0, &cl) && cl >= USER_PTR_MIN && cl < USER_PTR_MAX) {
+            uintptr_t h = 0;
+            if (read_ptr_untagged(cl + 0x280, &h) && h >= USER_PTR_MIN && h < USER_PTR_MAX) {
+                uintptr_t a = 0, b = 0;
+                if (read_ptr_untagged(h, &a) && read_ptr_untagged(h + step, &b)) {
+                    ahb_filelog("VIEW direct cl=%#lx head=%#lx a=%#lx b=%#lx",
+                                (unsigned long)cl, (unsigned long)h,
+                                (unsigned long)UNTAG_PTR(a), (unsigned long)UNTAG_PTR(b));
+                    g_clv_cur_cand = cl;
+                    clv_build(h);
+                    found++;
+                }
+            }
+        }
+    }
+
+    /*
+     * 官方偏移命中就够了，**不再做暴力扫描兜底**。
+     *
+     * 踩坑经过：两条路径同时登记会产生互相覆盖的真 bug。
+     * 实测日志（同一进程）：
+     *     VIEW direct  cl=0x6ffcd1bb20 head=0x6ffcc1c828
+     *                  prev=0x6fa1625400 next=0x6ffcd1bda0
+     *     VIEW built   head=0x6ffcd1bda0   <- 暴力扫描把它也当成另一条链的头
+     * 注意 next 正好等于后者的 head —— 它们是同一条链上的相邻对象。
+     *
+     * 覆盖循环按 slot 顺序写入，后写覆盖先写：
+     * 检测器读 0x6ffcd1bda0 时，本应拿到"前驱指回 0x6ffcc1c828"的视图，
+     * 却被后一个 slot 的 headbuf 覆盖成它自己的前后驱，
+     * 闭环校验当场失败，检测器跳过我们、回去走真链，照样数出 32。
+     *
+     * 所以：官方偏移命中即返回。这条路径是确定性的，
+     * 不依赖"扫到哪条"，也就不会再有重叠和竞态。
+     */
+    if (found > 0) {
+        ahb_filelog("VIEW install direct hit found=%d total=%d", found, g_clv_n);
+        return;
+    }
+
     for (size_t cl_off = 0; cl_off < 0x500; cl_off += step) {
         uintptr_t cand = 0;
         if (!read_ptr_untagged(runtime + cl_off, &cand)) continue;
@@ -1534,6 +1839,7 @@ static void clv_install_now(void) {
             int count = (c1 > c2) ? c1 : c2;
             if (count < 2 || count > 64) continue;
 
+            g_clv_cur_cand = cand;
             clv_build(head);
             found++;
         }
