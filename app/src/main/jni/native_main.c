@@ -1965,19 +1965,6 @@ static ssize_t clv_pvr(pid_t pid, const struct iovec *local, unsigned long liovc
                 }
             }
         }
-        {
-            static uintptr_t seen[192];
-            static int nseen = 0;
-            int fi, dup = 0;
-            for (fi = 0; fi < nseen; fi++) {
-                if (seen[fi] == rstart) { dup = 1; break; }
-            }
-            if (!dup && nseen < 192) {
-                seen[nseen++] = rstart;
-                ahb_filelog("RD #%d rs=%#lx n=%zu slots=%d", nseen,
-                            (unsigned long)rstart, rlen, g_clv_n);
-            }
-        }
 
         /*
          * 合成候选覆盖：让检测器在 cl_off=0 就命中我们的假候选。
@@ -1987,35 +1974,7 @@ static ssize_t clv_pvr(pid_t pid, const struct iovec *local, unsigned long liovc
          * 它就永远不会去碰真链 —— 这是确定性的，没有竞态。
          */
         if (g_fake_ready && g_scan_runtime) {
-            static int once = 0;
-            if (!once) { once = 1;
-                ahb_filelog("VIEW fakecover rt=%#lx fakecl=%#lx rstart=%#lx",
-                            (unsigned long)g_scan_runtime,
-                            (unsigned long)g_fake_cl_addr,
-                            (unsigned long)rstart); }
-            /* 计数：确认 runtime 区间与 fake_cl 的读到底有没有被覆盖 */
-            {
-                static unsigned long nrt = 0, ncl = 0, nnd = 0;
-                uintptr_t rt2 = g_scan_runtime;
-                uintptr_t fcl2 = g_fake_cl_addr;
-                if (rstart >= rt2 - 8 && rstart < rt2 + 0x600) {
-                    nrt++;
-                    if (nrt <= 3) ahb_filelog("VIEW cov runtime hit rs=%#lx n=%lu",
-                                              (unsigned long)rstart, nrt);
-                }
-                if (rstart >= fcl2 - 8 && rstart < fcl2 + FAKE_CL_SIZE + 8) {
-                    ncl++;
-                    if (ncl <= 3) ahb_filelog("VIEW cov fakecl hit rs=%#lx n=%lu",
-                                              (unsigned long)rstart, ncl);
-                }
-                if ((uintptr_t)g_fake_nodes[0] != 0 &&
-                    rstart >= (uintptr_t)g_fake_nodes[0] - 8 &&
-                    rstart < (uintptr_t)g_fake_nodes[FAKE_CL_NODES-1] + 0x48) {
-                    nnd++;
-                    if (nnd <= 3) ahb_filelog("VIEW cov node hit rs=%#lx n=%lu",
-                                              (unsigned long)rstart, nnd);
-                }
-            }
+            (void)0;
             /*
              * 决定性修复：远端地址带 TBI 标签，必须先去标签再和
              * 我们自己的地址（runtime / head / node_addr，全部无标签）比较。
@@ -2129,42 +2088,6 @@ static ssize_t clv_pvr(pid_t pid, const struct iovec *local, unsigned long liovc
                             memcpy((void *)(lstart + (ovs - rstart)),
                                    tmp + bofs, len);
                         }
-                        /* 记录：读 head 之后检测器紧接着读了哪些地址 */
-                        {
-                            extern volatile int g_watch_n;
-                            extern uintptr_t g_watch_addr[16];
-                            extern volatile int g_watch_on;
-                            uintptr_t hp = 0, hn = 0;
-                            memcpy(&hp, sl->headbuf + 0x00, 8);
-                            memcpy(&hn, sl->headbuf + 0x08, 8);
-                            int q;
-                            for (q = 0; q < 16; q++) g_watch_addr[q] = 0;
-                            g_watch_n = 0;
-                            g_watch_on = 1;
-                            ahb_filelog("VIEW TRACE head=%#lx ret_prev=%#lx ret_next=%#lx keep=%d",
-                                        (unsigned long)sl->head,
-                                        (unsigned long)UNTAG_PTR(hp),
-                                        (unsigned long)UNTAG_PTR(hn), sl->keep);
-                            for (q = 0; q < sl->keep && q < 8; q++) {
-                                ahb_filelog("VIEW TRACE   node[%d]=%#lx", q,
-                                            (unsigned long)sl->node_addr[q]);
-                            }
-                        }
-                        {
-                            static int hh = 0;
-                            if (hh < 8) {
-                                hh++;
-                                uintptr_t v0 = 0, v1 = 0, v2 = 0;
-                                memcpy(&v0, sl->headbuf + 0x00, 8);
-                                memcpy(&v1, sl->headbuf + 0x08, 8);
-                                memcpy(&v2, sl->headbuf + 0x10, 8);
-                                ahb_filelog("VIEW hithead head=%#lx len=%zu "
-                                            "ret[0]=%#lx ret[8]=%#lx size=%#lx keep=%d",
-                                            (unsigned long)sl->head, len,
-                                            (unsigned long)v0, (unsigned long)v1,
-                                            (unsigned long)v2, sl->keep);
-                            }
-                        }
                     }
                 }
             }
@@ -2189,9 +2112,7 @@ static ssize_t clv_pvr(pid_t pid, const struct iovec *local, unsigned long liovc
                             uintptr_t nv = 0, pv = 0;
                             memcpy(&pv, sl->nodebuf[q] + 0, 8);
                             memcpy(&nv, sl->nodebuf[q] + 8, 8);
-                            ahb_filelog("VIEW cov3 rs=%#lx q=%d k=%d prev=%#lx next=%#lx",
-                                        (unsigned long)rstart, q, k,
-                                        (unsigned long)pv, (unsigned long)nv);
+                            (void)0;
                         }
                     }
                 }
@@ -2201,22 +2122,7 @@ static ssize_t clv_pvr(pid_t pid, const struct iovec *local, unsigned long liovc
             static int dbg2 = 0;
             if (dbg2 < 40) {
                 dbg2++;
-                ahb_filelog("VIEW cov2 rs=%#lx n=%zu hits=%lu n0=%#lx",
-                            (unsigned long)rstart, rlen,
-                            g_clv_hits,
-                            (unsigned long)((g_clv_n > 0) ? g_clv[0].node_addr[0] : 0));
-            }
-        }
-        {
-            extern volatile int g_watch_n;
-            extern volatile int g_watch_on;
-            if (g_watch_on) {
-                if (g_watch_n < 14) {
-                    ahb_filelog("VIEW TRACE  after rs=%#lx n=%zu", (unsigned long)rstart, rlen);
-                    g_watch_n = g_watch_n + 1;
-                } else {
-                    g_watch_on = 0;
-                }
+                            (void)0;
             }
         }
         remaining -= (ssize_t)rlen;

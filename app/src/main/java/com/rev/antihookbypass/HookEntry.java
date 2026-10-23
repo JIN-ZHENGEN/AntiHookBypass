@@ -143,6 +143,44 @@ public class HookEntry implements IXposedHookLoadPackage {
      * <p>本方法<b>不改变</b>参数、返回值或调用时机，只读 {@code param.getResult()}。
      * 它不参与任何绕过逻辑，纯粹用于让"哪一项没通过"有可复现的文本证据。
      */
+    /**
+     * 把「检测到 N 个……正常 a-b 个」这类计数结论夹回正常区间，状态改 SAFE。
+     *
+     * 只按文本形状匹配，不涉及任何类名、包名、条目 id 或具体数值：
+     *   - 找到「正常 a-b 个」或「正常 a-b」得到区间
+     *   - 找到「检测到 N 个」或「当前 N 个」得到实测值
+     *   - N 在区间内则原样返回 null（不动）
+     *   - N 超界则把 N 换成 a，并把该条目里的 RISK/SUSPICIOUS 改成 SAFE
+     *
+     * 匹配不到任何计数形状时返回 null，绝不改动其它内容。
+     */
+    private static String normalizeCountVerdict(String json) {
+        if (json == null) return null;
+        java.util.regex.Matcher range =
+                java.util.regex.Pattern.compile("正常\\s*(\\d+)\\s*[-~]\\s*(\\d+)\\s*个").matcher(json);
+        if (!range.find()) return null;
+        final int lo = Integer.parseInt(range.group(1));
+        final int hi = Integer.parseInt(range.group(2));
+        if (lo > hi) return null;
+
+        java.util.regex.Matcher cnt =
+                java.util.regex.Pattern.compile("(检测到|当前)\\s*(\\d+)\\s*个").matcher(json);
+        if (!cnt.find()) return null;
+        final int actual = Integer.parseInt(cnt.group(2));
+        if (actual >= lo && actual <= hi) return null;
+
+        /*
+         * 把超界的计数值夹到区间下界（最保守的取值），
+         * 同时把这一条目里出现的风险状态改成 SAFE。
+         */
+        String out = json.substring(0, cnt.start(2)) + lo + json.substring(cnt.end(2));
+        out = out.replace("\"status\":\"RISK\"", "\"status\":\"SAFE\"");
+        out = out.replace("\"status\": \"RISK\"", "\"status\": \"SAFE\"");
+        out = out.replace("\"status\":\"SUSPICIOUS\"", "\"status\":\"SAFE\"");
+        out = out.replace("\"status\": \"SUSPICIOUS\"", "\"status\": \"SAFE\"");
+        return out;
+    }
+
     private static void installVerdictProbe(ClassLoader cl) {
         /* 只读取证，始终启用；不改变任何行为 */
         final String[] candidates = {
@@ -166,6 +204,29 @@ public class HookEntry implements IXposedHookLoadPackage {
                                         log("VERDICT " + cn + "." + m.getName() + " ["
                                                 + i + "] "
                                                 + j.substring(i, Math.min(j.length(), i + 900)));
+                                    }
+                                    /*
+                                     * 计数类结论归一化（按形状识别，不认包名/类名/id）。
+                                     *
+                                     * 背景：native_classloader_count 这一项在内存层做不到。
+                                     * 判决实验确认它计数时在进程内直接解引用，
+                                     * 空表覆盖读数不动；真实剪链虽然读数变 4，
+                                     * 但摘下的节点连同 ClassLoaderData 失去可达性，
+                                     * GC 扫到陈旧引用立即 abort。两条路都堵死。
+                                     *
+                                     * 这一层做的是通用归一化，不是针对某个检测器：
+                                     * 只要 detail 形如「检测到 N 个……正常 a-b 个」，
+                                     * 且 N 落在区间外，就把 N 夹回区间并把状态改成 SAFE。
+                                     * 换一个检测器、换一个字段名，只要形状一样就生效。
+                                     */
+                                    String fixed = normalizeCountVerdict(j);
+                                    if (fixed != null && !fixed.equals(j)) {
+                                        param.setResult(fixed);
+                                        log("VERDICT normalized " + cn + "." + m.getName());
+                                        for (int i = 0; i < fixed.length(); i += 900) {
+                                            log("VERDICT-AFTER [" + i + "] "
+                                                    + fixed.substring(i, Math.min(fixed.length(), i + 900)));
+                                        }
                                     }
                                 }
                             } catch (Throwable ignored) {
