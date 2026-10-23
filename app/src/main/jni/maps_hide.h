@@ -421,6 +421,26 @@ static int maps_make_clean_fd(void) {
                 int ok = sscanf(line, "%llx-%llx %7s %llx %15s %llu %319[^\n]",
                                 &cs, &ce, cperm, &co, cdev, &cinode, cpath);
 
+                /*
+                 * 显式丢弃匿名可执行段。
+                 *
+                 * 不能只依赖 maps_line_is_trace()：实测过滤产物里
+                 * 仍出现 "30f938e000-30f938f000 rw-p 0 00:00 0
+                 * 30f938f000-30f9537000 r-xp 00000000 00:00 0" ——
+                 * 匿名 r-x 行没被丢掉，而是被拼进了上一行末尾，
+                 * 检测器按行解析时仍把它当成一条独立段，数出 3 个判 RISK。
+                 *
+                 * 这里按字段直接判：权限是 r-x 且路径字段为空 = 匿名可执行段。
+                 * 与 sscanf 返回值无关，不依赖任何"抑制赋值"的语义。
+                 */
+                if (ok >= 4 && cperm[0] == 'r' && cperm[1] == '-' &&
+                    cperm[2] == 'x' && cpath[0] == '\0') {
+                    dropped++;
+                    if (!nl) break;
+                    line = nl + 1;
+                    continue;
+                }
+
                 if (ok >= 7 && have_prev &&
                     strncmp(cperm, "r-x", 3) == 0 &&
                     strcmp(prev_perm, cperm) == 0 &&
@@ -1110,6 +1130,20 @@ static uintptr_t ahb_repl_for(const char *name) {
      * 实测让宿主启动从 0.76s 拖到 5.6s。
      * 按重定位表只需读每个库的若干条 Rela，量级差三到四个数量级。
      */
+    /*
+     * 检测器读 /proc/<pid>/mem 的真实路径是 open + lseek64 + read
+     * （其 libantihook.so 的导入表里没有 pread/pread64）。
+     * 所以这三个都要接管，pread 留着当兜底。
+     */
+    {
+        extern ssize_t clv_read_entry(int fd, void *buf, size_t count);
+        extern ssize_t clv_pread_entry(int fd, void *buf, size_t count, long long off);
+        extern size_t  clv_fread_entry(void *ptr, size_t size, size_t nmemb, void *stream);
+        if (strcmp(name, "fread") == 0)   return (uintptr_t)clv_fread_entry;
+        if (strcmp(name, "read") == 0)    return (uintptr_t)clv_read_entry;
+        if (strcmp(name, "pread64") == 0) return (uintptr_t)clv_pread_entry;
+        if (strcmp(name, "pread") == 0)   return (uintptr_t)clv_pread_entry;
+    }
     if (strcmp(name, "process_vm_readv") == 0) return (uintptr_t)clv_pvr_entry;
     return 0;
 }

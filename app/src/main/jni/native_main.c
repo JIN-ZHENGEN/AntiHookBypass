@@ -170,7 +170,7 @@ static volatile int g_l3_done = 0;
  * 的就是裁剪后的结果。这对任何用同样手法自检的应用同样有效（通杀），
  * 且不碰代码段、不影响其他模块的 hook。
  */
-#define CLV_KEEP 4
+#define CLV_KEEP 2
 #define CLV_MAX_CHAIN 64
 #define CLV_MAX_HEADS 64
 
@@ -190,6 +190,60 @@ struct clv_slot {
     volatile int ready;
 };
 static struct clv_slot g_clv[CLV_MAX_HEADS];
+
+/*
+ * ===== 合成链表（决定性手段）=====
+ *
+ * 为什么必须做到这一步：
+ *
+ * 逐层排查下来确认——检测器读**链表头**时走 process_vm_readv，
+ * 所以我们的伪造字节它收下了（日志 VIEW hithead 能证明它拿到了
+ * ret[0]/ret[8]/size 三个我们写进去的值）；
+ * 但它读完 head->next 之后，去读**节点**时是直接解引用真实内存，
+ * 不走任何 libc 读取函数（日志里从头到尾没有读节点的记录）。
+ *
+ * 后果：我们给它的 head->next 指向真实节点，那个节点的 next 又是真值，
+ * 于是它顺着真实链路一路数完，读数永远是真实长度（31/32/33 波动）。
+ * 无论把 head 做成空表、4 节点闭环还是别的，都不影响它数节点。
+ *
+ * 解法：把 head->next / head->prev 指向**我们自己分配的、真实的内存**，
+ * 在那块内存里摆一个闭环。因为那是真实内存，它直接解引用拿到的就是
+ * 我们写的值 —— 不需要任何拦截。
+ *
+ * 约束：这条链按"两个方向长度相加"被统计（32 = 16 + 16 可证），
+ * 所以节点数取 2，两个方向各 2 步，合计 4，落在它认定正常的 2~5 区间。
+ */
+#define SYN_NODE_N 2
+
+/*
+ * 合成节点按 slot 分开存，不能共用一组。
+ *
+ * 实测 runtime 里有两条闭环会被检测器读：
+ *   哨兵 cl+0x280 = 0x...bda0
+ *   首元素 *(cl+0x280) = 0x...c828（这个也在读取记录里反复出现）
+ * 共用一组节点会让两条链的 prev/next 互相覆盖，闭环当场断掉。
+ */
+static uintptr_t g_syn_pool[CLV_MAX_HEADS][SYN_NODE_N][2];
+static int       g_syn_used[CLV_MAX_HEADS];
+
+/*
+ * 构造合成闭环。head 是真实哨兵/首元素地址，节点指向本模块 .bss。
+ *
+ * 为什么指向本模块内存就够了：检测器读完 head 之后，是**直接解引用**
+ * 拿节点内容的（这也是它绕过我们所有 libc 拦截的原因）。
+ * 只要 next 指向的是真实存在的内存，它解引用就能读到我们写的值。
+ */
+static void clv_build_synthetic(uintptr_t head, int idx) {
+    int i;
+    if (head == 0 || idx < 0 || idx >= CLV_MAX_HEADS) return;
+    for (i = 0; i < SYN_NODE_N; i++) {
+        uintptr_t prev = (i == 0) ? head : (uintptr_t)&g_syn_pool[idx][i - 1][0];
+        uintptr_t next = (i == SYN_NODE_N - 1) ? head : (uintptr_t)&g_syn_pool[idx][i + 1][0];
+        g_syn_pool[idx][i][0] = prev;
+        g_syn_pool[idx][i][1] = next;
+    }
+    g_syn_used[idx] = 1;
+}
 static volatile int g_clv_n = 0;
 static volatile int g_clv_in_wrap = 0;
 static volatile unsigned long g_clv_calls = 0;
@@ -200,6 +254,10 @@ static uintptr_t g_dbg_addr[64];
 static volatile int g_dbg_i = 0;
 static volatile int g_clv_rescanned = 0;
 static uintptr_t g_clv_need_build = 0;
+volatile int g_clv_empty_probe = 0;
+volatile int g_watch_on = 0;
+volatile int g_watch_n = 0;
+uintptr_t g_watch_addr[16];
 
 /*
  * ============ 合成 ClassLinker 候选（确定性方案）============
@@ -242,8 +300,15 @@ typedef long (*syscall_fn)(long, ...);
 static syscall_fn g_real_syscall = NULL;
 static long g_syscall_pvr(long number, void *a1, void *a2, void *a3, void *a4, void *a5, void *a6);
 static void clv_patch_got(void);
+size_t clv_fread_entry(void *ptr, size_t size, size_t nmemb, void *stream);
+ssize_t clv_read_entry(int fd, void *buf, size_t count);
+static void clv_apply_view(uintptr_t rstart, void *buf, size_t rlen);
 static void clv_build(uintptr_t head);
+static void clv_build_synthetic(uintptr_t head, int idx);
+static int clv_trim_real(uintptr_t head);
+static uintptr_t g_clv_cur_first;
 static uintptr_t g_clv_cur_cand;
+static uintptr_t g_clv_cur_cl;
 static void clv_install_now(void);
 static void clv_start_fast_patch(void);
 
@@ -986,6 +1051,80 @@ static void clv_build_fake(uintptr_t real_vptr) {
                 (unsigned long)g_fake_cl_addr, (unsigned long)head);
 }
 
+/*
+ * ===== 真实修剪 class_loaders_ 链表 =====
+ *
+ * 为什么最后只能动真内存：
+ *
+ * 我们把 process_vm_readv / pread / read / fread 全接了一遍，又把链表头
+ * 伪造成 2 节点闭环（日志 VIEW hithead 可证检测器确实收到了我们写的
+ * ret[0]/ret[8]/size），读数却从 29 到 33 一动不动。
+ * 唯一解释：它计数时在**本进程内直接解引用**内存，不经过任何 libc 读取函数。
+ * 想改它的读数，只能改真实链表。
+ *
+ * 与历史上两次崩溃的区别（这是敢动手的前提）：
+ *
+ * 以前剪链崩了两次，根因是**剪错了链**。当时把 head 取成 *(cl+0x280)，
+ * 那是链表首元素；而 Runtime 里同时存在另一条 21 节点的闭环
+ * （cand+0x50，节点 +0x10 不带 jobject 标签，是 Class 对象链）。
+ * 剪 Class 对象链会直接毁掉类元数据 -> GC abort。
+ * 现在 head 取 cl+0x280（内嵌 std::list 哨兵），并由
+ * looks_like_class_loaders() 逐个节点确认 +0x10 是带 TopByte 标签的
+ * jobject，两条链不会混淆。
+ *
+ * 保留 5 个而不是 4 个：检测器判"正常 2~5"，取上界留最大余量给
+ * 系统自身需要的 ClassLoader。
+ *
+ * 写回必须保留原始 TopByte 标签。踩过的坑：写去标签值会让
+ * GetClassLoaders 的 `curr != head` 永不成立，把哨兵当元素解引用 -> SIGSEGV。
+ */
+#define CLV_TRIM_KEEP 5
+
+static int clv_trim_real(uintptr_t head) {
+    uintptr_t raw_last = 0, raw_first = 0;
+    uintptr_t nodes[64], raws[64];
+    int n = 0, i;
+    uintptr_t size_raw = 0;
+
+    if (!safe_read_mem(head + 0x00, &raw_last, 8)) return 0;
+    if (!safe_read_mem(head + 0x08, &raw_first, 8)) return 0;
+    if (!safe_read_mem(head + 0x10, &size_raw, 8)) return 0;
+    if (size_raw <= CLV_TRIM_KEEP) return 0;      /* 已经够短，不动 */
+
+    {
+        uintptr_t cur_raw = raw_first;
+        for (i = 0; i < 64; i++) {
+            uintptr_t nx_raw = 0;
+            uintptr_t cu = UNTAG_PTR(cur_raw);
+            if (cu == head || cu == 0) break;
+            if (!safe_read_mem(cu + 0x08, &nx_raw, 8)) break;
+            nodes[n] = cu;
+            raws[n] = cur_raw;
+            n++;
+            if (UNTAG_PTR(nx_raw) == head) break;
+            cur_raw = nx_raw;
+        }
+    }
+    if (n <= CLV_TRIM_KEEP) return 0;
+
+    {
+        /*
+         * 第 CLV_TRIM_KEEP-1 个节点的 next 指回哨兵；
+         * 哨兵的 prev 指回它；__size_ 同步。
+         */
+        uintptr_t cut = nodes[CLV_TRIM_KEEP - 1];
+        uintptr_t head_plain = head;
+        uintptr_t keep = (uintptr_t)CLV_TRIM_KEEP;
+        uintptr_t last_tagged = raws[CLV_TRIM_KEEP - 1];
+        if (!safe_write_mem(cut + 0x08, &head_plain, 8)) return 0;
+        if (!safe_write_mem(head + 0x00, &last_tagged, 8)) return 0;
+        if (!safe_write_mem(head + 0x10, &keep, 8)) return 0;
+        ahb_filelog("VIEW trim head=%#lx was=%d now=%d cut=%#lx",
+                    (unsigned long)head, n, CLV_TRIM_KEEP, (unsigned long)cut);
+    }
+    return 1;
+}
+
 static void clv_build(uintptr_t head) {
     if (head == 0) return;
     /*
@@ -995,6 +1134,22 @@ static void clv_build(uintptr_t head) {
      * 无限递归，栈溢出。实测表现是崩在 maps_patch_got_all 附近。
      */
     if (g_clv_in_wrap) return;
+    /*
+     * 合成节点绝不能再当成"链头"登记。
+     *
+     * 踩坑（这一步卡了最久）：合成闭环建好后，检测器顺着
+     * head->next 读到合成节点 0x...c5a8，而"读到即登记"那条逻辑
+     * 把这个地址也当成候选链头登记了一遍，还给它编了 64 个节点。
+     * 于是检测器读 0x...c5a8 时，覆盖循环返回的是那个 slot 的
+     * nodebuf（真实链视图），而不是我们写的合成 prev/next ——
+     * 合成闭环当场被自己人破坏，读数回到真实值。
+     * 日志特征：VIEW hithead head=0x6f9c4fc5a8 ... keep=64
+     *          （0x6f9c4fc5a8 正是 g_syn_pool 内部地址）
+     */
+    if ((uintptr_t)head >= (uintptr_t)&g_syn_pool[0][0][0] &&
+        (uintptr_t)head <  (uintptr_t)&g_syn_pool[CLV_MAX_HEADS][0][0]) {
+        return;
+    }
     struct clv_slot *sl = clv_find(head);
     if (sl) return;
     if (g_clv_n >= CLV_MAX_HEADS) return;
@@ -1002,6 +1157,22 @@ static void clv_build(uintptr_t head) {
     sl = &g_clv[g_clv_n];
     sl->head = head;
     sl->cand = g_clv_cur_cand;
+    /*
+     * 合成闭环必须在**slot 索引确定之后**构造。
+     *
+     * 踩坑：一开始放在函数开头，用 g_clv_n 当索引。
+     * 但那时还没走 clv_find / 边界检查，g_clv_n 可能因为
+     * 已存在同名 head 而根本不会前进，于是合成节点写进了
+     * 别人的 slot：日志里同一个 head 出现 idx=1 又出现 idx=3，
+     * 而 headbuf 写入时看的是本 slot 的 g_syn_used[k]（k 正确），
+     * 两边对不上，合成永远不生效、读数永远是真实值 32。
+     */
+    if (g_clv_cur_cl != 0 &&
+        (head == g_clv_cur_cl + 0x280 || head == g_clv_cur_first)) {
+        clv_build_synthetic(head, g_clv_n);
+        ahb_filelog("VIEW synth head=%#lx idx=%d first=%#lx",
+                    (unsigned long)head, g_clv_n, (unsigned long)g_clv_cur_first);
+    }
     /*
      * headbuf 必须用**真实 head 的原始 0x40 字节打底**，不能 memset 成 0。
      *
@@ -1124,10 +1295,30 @@ static void clv_build(uintptr_t head) {
              * ART 对象"，被我们改写成节点地址就再也不是合法 vptr，
              * 候选直接被跳过。所以这种情况必须原样保留真值。
              */
-            if (sl->head != sl->cand) {
-                memcpy(sl->headbuf + 0x00, &prev, 8);
+            /*
+             * 指向合成闭环，而不是真实节点。
+             *
+             * 关键区别就在这里：真实节点地址上的 next 是真实值，
+             * 检测器顺着走会走完整条真链；合成节点是本模块的静态数组，
+             * 内容完全由我们决定，它直接解引用也只读到我们的闭环。
+             *
+             * head 本身是 ART 的内嵌哨兵，必须保留原样（不能改它的地址），
+             * 只有在它上面覆盖 prev/next/size 三个字段。
+             */
+            if (g_syn_used[(int)(sl - g_clv)]) {
+                int si = (int)(sl - g_clv);
+                uintptr_t sp = (uintptr_t)&g_syn_pool[si][SYN_NODE_N - 1][0];
+                uintptr_t sn = (uintptr_t)&g_syn_pool[si][0][0];
+                uintptr_t ssz = (uintptr_t)SYN_NODE_N;
+                memcpy(sl->headbuf + 0x00, &sp, 8);
+                memcpy(sl->headbuf + 0x08, &sn, 8);
+                memcpy(sl->headbuf + 0x10, &ssz, 8);
+            } else {
+                if (sl->head != sl->cand) {
+                    memcpy(sl->headbuf + 0x00, &prev, 8);
+                }
+                memcpy(sl->headbuf + 0x08, &next, 8);
             }
-            memcpy(sl->headbuf + 0x08, &next, 8);
             /*
              * __size_ 必须和闭环节点数一致。
              *
@@ -1147,6 +1338,20 @@ static void clv_build(uintptr_t head) {
             {
                 uintptr_t sz = CLV_KEEP;
                 memcpy(sl->headbuf + 0x10, &sz, 8);
+                /*
+                 * 【临时决定性实验】把头做成空表：prev=next=head, size=0。
+                 * 任何从 head 出发的遍历都会立刻回到 head，计数必为 0。
+                 * 用来判定检测器到底是不是走 process_vm_readv 拿这几个字节：
+                 *   - 若读数变 0/正常  -> 确实走我们的路径，问题在别处
+                 *   - 若仍报 33        -> 它用了我们没接管的读取方式
+                 */
+                if (g_clv_empty_probe) {
+                    uintptr_t self = sl->head;
+                    memcpy(sl->headbuf + 0x00, &self, 8);
+                    memcpy(sl->headbuf + 0x08, &self, 8);
+                    uintptr_t zero = 0;
+                    memcpy(sl->headbuf + 0x10, &zero, 8);
+                }
             }
             {
                 uintptr_t h280=0, h2c0=0, h280p=0, h280n=0;
@@ -1188,10 +1393,264 @@ static void clv_build(uintptr_t head) {
  * process_vm_readv 包装：只有当读的是真实链表头那 0x40 字节时，才用合成内容覆盖。
  * 其它地址一律原样交给真实函数。
  */
+/*
+ * 把视图覆盖应用到一段刚读到的内存上（pread 与 process_vm_readv 共用的实现）。
+ * 只做 memcpy，不读内存，因此不会递归。
+ */
+static void clv_apply_view(uintptr_t rstart, void *buf, size_t rlen) {
+    uintptr_t rend;
+    rstart = UNTAG_PTR(rstart);   /* 同上：带 TBItag 的地址要先剥掉 */
+    rend = rstart + rlen;
+    int k, q;
+    for (k = 0; k < g_clv_n; k++) {
+        struct clv_slot *sl = &g_clv[k];
+        if (!sl->ready) continue;
+        {
+            uintptr_t ovs = (rstart > sl->head) ? rstart : sl->head;
+            uintptr_t ove = (rend < sl->head + 0x40) ? rend : (sl->head + 0x40);
+            if (ovs < ove) {
+                size_t src_off = (size_t)(ovs - sl->head);
+                size_t len = (size_t)(ove - ovs);
+                if (src_off + len <= 0x40) {
+                    memcpy((char *)buf + (ovs - rstart), sl->headbuf + src_off, len);
+                    g_clv_hits++;
+                }
+            }
+        }
+        for (q = 0; q < sl->keep; q++) {
+            uintptr_t na = sl->node_addr[q];
+            uintptr_t ovs, ove;
+            if (!na) continue;
+            ovs = (rstart > na) ? rstart : na;
+            ove = (rend < na + 0x10) ? rend : (na + 0x10);
+            if (ovs >= ove) continue;
+            memcpy((char *)buf + (ovs - rstart),
+                   sl->nodebuf[q] + (ovs - na), (size_t)(ove - ovs));
+            g_clv_hits++;
+        }
+    }
+}
+
 /* 供 maps_hide.h 的重定位驱动接管引用 */
 static ssize_t clv_pvr_entry(pid_t pid, const struct iovec *local, unsigned long liovcnt,
                              const struct iovec *remote, unsigned long riovcnt,
                              unsigned long flags);
+
+/*
+ * ===== pread64 通道 =====
+ *
+ * 为什么必须接这条路：检测器读内存在两条路上走。
+ *   - 一部分检查（CRC 之类）用 process_vm_readv
+ *   - ClassLoader 计数走的是 /proc/<pid>/mem + pread
+ * 实测证据：
+ *   进程里能看到 fd 101 -> /proc/27834/mem；
+ *   而且我把链表头伪造成**空表**（prev=next=head, size=0）之后再跑，
+ *   计数依然是 33 —— 说明它根本没读我们伪造的那份字节。
+ *
+ * 所以把同一套视图挂到 pread 上：offset 就是目标地址。
+ */
+/*
+ * ===== read 通道（检测器真正走的那条）=====
+ *
+ * 为什么绕了这么大圈：直接看检测器 libantihook.so 的导入表，
+ * 它没有导入 pread / pread64，导入的是
+ *     open, lseek64, read, mmap, process_vm_readv
+ * 它读 /proc/<pid>/mem 的方式是 open + lseek64(定位) + read。
+ * 我先挂的 pread 包装一次都不会被调用（日志里一条 PREAD 都没有），
+ * 现象看着像"接管失效"，其实是它根本不走那条路。
+ *
+ * 这里只接 read 一个，理由：
+ *   - open/openat 已由 maps_hide.h 那边的重定位驱动统一接管，
+ *     重复接管会撞名（实测编译报 redefinition）
+ *   - 不需要记 lseek：read 会把文件偏移向前推进 n，
+ *     所以"本次读的起始地址" = lseek64(fd,0,SEEK_CUR) - n
+ *   - fd 是不是 /proc/<pid>/mem，用 readlink 惰性判一次并缓存
+ *
+ * read 是极热路径（日志、fgets/fread 全在走），
+ * 所以顺序必须是"先查缓存表，命中才做事"，绝不反过来。
+ */
+#define AHB_MAX_FD 1024
+/* 0=未判定 1=mem 2=不是 */
+static unsigned char g_fd_kind[AHB_MAX_FD];
+
+typedef long long (*lseek64_fn)(int, long long, int);
+typedef ssize_t   (*read_fn)(int, void *, size_t);
+typedef ssize_t   (*readlink_fn)(const char *, char *, size_t);
+
+static lseek64_fn   g_real_lseek64_r = NULL;
+static read_fn      g_real_read      = NULL;
+static readlink_fn  g_real_readlink  = NULL;
+
+static int clv_fd_is_mem(int fd) {
+    char p[64], t[256];
+    ssize_t n;
+    if (fd >= 0 && fd < AHB_MAX_FD && g_fd_kind[fd]) return g_fd_kind[fd] == 1;
+    if (!g_real_readlink) g_real_readlink = (readlink_fn)dlsym(RTLD_DEFAULT, "readlink");
+    snprintf(p, sizeof(p), "/proc/self/fd/%d", fd);
+    n = g_real_readlink ? g_real_readlink(p, t, sizeof(t) - 1) : -1;
+    if (n > 0) {
+        size_t L;
+        t[n] = 0;
+        L = (size_t)n;
+        /*
+         * 必须精确判"以 /mem 结尾"。
+         *
+         * 踩坑：一开始用 strstr(t, "/mem")，结果 Android 上大量
+         * memfd 的链接名形如 "/memfd:jit-cache (deleted)"、
+         * "/memfd:dalvik-main space" —— 全都含 "/mem" 子串，
+         * 于是普通内存文件被误判成 /proc/<pid>/mem，
+         * 日志里冒出 base=0 n=1458 这种根本不是按地址读的记录。
+         */
+        if (L >= 4 && strcmp(t + L - 4, "/mem") == 0) {
+            if (fd >= 0 && fd < AHB_MAX_FD) g_fd_kind[fd] = 1;
+            ahb_filelog("READMEM fd=%d is mem (%s)", fd, t);
+            return 1;
+        }
+    }
+    if (fd >= 0 && fd < AHB_MAX_FD) g_fd_kind[fd] = 2;
+    return 0;
+}
+
+/*
+ * ===== fread 通道 =====
+ *
+ * 最终确认的真实路径：检测器用 fopen("/proc/<pid>/mem") + fread 读内存。
+ *
+ * 证据链：
+ *   1) 它的导入表里没有 pread/pread64，有 fopen/fread/fgets/fdopen
+ *   2) 进程里确实存在 fd -> /proc/<pid>/mem
+ *   3) 但那个 fd 没有出现在 maps 里（不是 mmap），也没有触发 read 包装
+ *   4) GOT 补丁确实打进了 libantihook.so（patched=8），所以不是没接上，
+ *      而是 fread 内部直接走 libc 私有 fd，压根不经过 PLT 上的 read
+ *
+ * 所以必须在 fread 这一层接。起始地址怎么算：
+ *     base = ftello(stream) - 本次字节数
+ * ftello 返回的是"应用视角的逻辑位置"，已经把 stdio 缓冲区算进去了，
+ * 所以读完之后减掉本次长度，就是这次读的内存地址。
+ * 这样不需要自己跟踪缓冲，也不会因为内部预读而偏移。
+ */
+typedef size_t    (*fread_fn)(void *, size_t, size_t, void *);
+typedef long long (*ftello_fn)(void *);
+typedef int       (*fileno_fn)(void *);
+
+static fread_fn   g_real_fread  = NULL;
+static ftello_fn  g_real_ftello = NULL;
+static fileno_fn  g_real_fileno = NULL;
+
+size_t clv_fread_entry(void *ptr, size_t size, size_t nmemb, void *stream) {
+    size_t n;
+    size_t bytes;
+    int fd;
+    if (!g_real_fread) g_real_fread = (fread_fn)dlsym(RTLD_DEFAULT, "fread");
+    if (!g_real_fread) return 0;
+    n = g_real_fread(ptr, size, nmemb, stream);
+    if (n == 0) return n;
+    bytes = n * size;
+    if (bytes < 8) return n;
+    if (g_clv_n <= 0 || g_clv_in_wrap) return n;
+    if (!g_real_fileno) g_real_fileno = (fileno_fn)dlsym(RTLD_DEFAULT, "fileno");
+    if (!g_real_fileno) return n;
+    fd = g_real_fileno(stream);
+    if (fd < 0 || fd >= AHB_MAX_FD) return n;
+    if (g_fd_kind[fd] == 2) return n;
+    if (!clv_fd_is_mem(fd)) return n;
+    {
+        static unsigned long fc = 0, fh = 0, diag = 0;
+        unsigned long h0 = g_clv_hits;
+        long long pos;
+        if (!g_real_ftello) g_real_ftello = (ftello_fn)dlsym(RTLD_DEFAULT, "ftello");
+        if (!g_real_ftello) return n;
+        pos = g_real_ftello(stream);
+        if (pos < 0) return n;
+        fc++;
+        clv_apply_view((uintptr_t)(pos - (long long)bytes), ptr, bytes);
+        if (g_clv_hits != h0) fh++;
+        if (diag < 20) {
+            diag++;
+            ahb_filelog("READMEM fread#%lu base=%#lx n=%zu hit=%lu slots=%d",
+                        fc, (unsigned long)(pos - (long long)bytes), bytes, fh, g_clv_n);
+        }
+    }
+    return n;
+}
+
+ssize_t clv_read_entry(int fd, void *buf, size_t count) {
+    ssize_t n;
+    if (!g_real_read) g_real_read = (read_fn)dlsym(RTLD_DEFAULT, "read");
+    if (!g_real_read) return -1;
+    n = g_real_read(fd, buf, count);
+    if (n < 8) return n;
+    if (g_clv_n <= 0 || g_clv_in_wrap) return n;
+    if (fd < 0 || fd >= AHB_MAX_FD) return n;
+    if (g_fd_kind[fd] == 2) return n;
+    if (!clv_fd_is_mem(fd)) return n;
+    {
+        static unsigned long rc = 0, rh = 0, diag = 0;
+        unsigned long h0 = g_clv_hits;
+        long long cur;
+        uintptr_t base;
+        if (!g_real_lseek64_r) g_real_lseek64_r = (lseek64_fn)dlsym(RTLD_DEFAULT, "lseek64");
+        if (!g_real_lseek64_r) return n;
+        cur = g_real_lseek64_r(fd, 0, SEEK_CUR);
+        if (cur < 0) return n;
+        base = (uintptr_t)(cur - (long long)n);
+        rc++;
+        clv_apply_view(base, buf, (size_t)n);
+        if (g_clv_hits != h0) rh++;
+        if (diag < 20) {
+            diag++;
+            ahb_filelog("READMEM #%lu base=%#lx n=%zu hit=%lu slots=%d",
+                        rc, (unsigned long)base, (size_t)n, rh, g_clv_n);
+        }
+    }
+    return n;
+}
+
+typedef ssize_t (*pread64_fn)(int, void *, size_t, long long);
+static pread64_fn g_real_pread64 = NULL;
+static pread64_fn g_real_pread = NULL;
+
+static ssize_t clv_pread(int fd, void *buf, size_t count, long long off);
+ssize_t clv_pread_entry(int fd, void *buf, size_t count, long long off) {
+    static unsigned long ec = 0;
+    ec++;
+    if (ec <= 5) ahb_filelog("PREAD ENTER #%lu fd=%d off=%#lx n=%zu", ec, fd, (unsigned long)off, count);
+    return clv_pread(fd, buf, count, off);
+}
+
+static ssize_t clv_pread(int fd, void *buf, size_t count, long long off) {
+    /*
+     * 懒解析：不要指望某处一次性初始化能跑到。
+     * 实测把解析放在 clv_install_now 的 if(!g_real_pvr) 分支里，
+     * 那个分支因为已有其它路径设过 g_real_pvr 而整段跳过，
+     * 结果 g_real_pread64 永远是 NULL，pread 通道静默失效、
+     * 日志里一条 PREAD 都没有，看起来像"接管没生效"。
+     */
+    if (!g_real_pread64 && !g_real_pread) {
+        g_real_pread64 = (pread64_fn)dlsym(RTLD_DEFAULT, "pread64");
+        g_real_pread   = (pread64_fn)dlsym(RTLD_DEFAULT, "pread");
+        ahb_filelog("PREAD resolve pread64=%p pread=%p", (void *)g_real_pread64, (void *)g_real_pread);
+    }
+    pread64_fn fn = g_real_pread64 ? g_real_pread64 : g_real_pread;
+    ssize_t n;
+    if (!fn) return pread(fd, buf, count, (off_t)off);
+    n = fn(fd, buf, count, off);
+    if (n <= 0 || g_clv_in_wrap) return n;
+    if (n < 8) return n;
+    {
+        static unsigned long pc = 0, ph = 0, diag = 0;
+        unsigned long h0 = g_clv_hits;
+        pc++;
+        clv_apply_view((uintptr_t)off, buf, (size_t)n);
+        if (g_clv_hits != h0) ph++;
+        if (diag < 30) {
+            diag++;
+            ahb_filelog("PREAD call#%lu off=%#lx n=%zu hits=%lu slots=%d",
+                        pc, (unsigned long)(uintptr_t)off, (size_t)n, ph, g_clv_n);
+        }
+    }
+    return n;
+}
 
 static ssize_t clv_pvr(pid_t pid, const struct iovec *local, unsigned long liovcnt,
                        const struct iovec *remote, unsigned long riovcnt,
@@ -1409,9 +1868,91 @@ static ssize_t clv_pvr(pid_t pid, const struct iovec *local, unsigned long liovc
     for (unsigned long i = 0; i < riovcnt && i < liovcnt && remaining > 0; i++) {
         size_t rlen = remote[i].iov_len;
         if (rlen > (size_t)remaining) rlen = (size_t)remaining;
-        uintptr_t rstart = (uintptr_t)remote[i].iov_base;
+        /*
+         * 必须去 TBI 标签再比较。
+         *
+         * 踩坑：检测器读内存时有的路径传带标签指针（0xb400006ffcd0cb70），
+         * 有的不传（0x6ffcc1c828）。而我们登记 head / node_addr 时
+         * 统一用去标签值。直接比就变成
+         *     0xb400006ffcd0cb70 > 0x6ffcd1bda0  恒真
+         * 于是偏移算出天文数字、src_off 越界被丢弃，
+         * 只剩下恰好没带标签的那几次能命中 —— 日志里 hits 一直很小、
+         * 看着像"覆盖逻辑写错了"，其实只是标签没剥。
+         *
+         * lstart 是本地缓冲，不能去标签，保持原值。
+         */
+        uintptr_t rstart = UNTAG_PTR((uintptr_t)remote[i].iov_base);
         uintptr_t rend = rstart + rlen;
+
         uintptr_t lstart = (uintptr_t)local[i].iov_base;
+
+        /*
+         * 全量去重记录每一个被读的地址。
+         *
+         * 目的：确认检测器计数时究竟读了哪些位置。
+         * 已经知道它读链表头时确实经过我们（VIEW hithead 里
+         * 它拿到的就是我们写的合成 prev/next/size），
+         * 但读数始终 32 不动，说明计数用的是别处的读取。
+         * 把地址全列出来就能定位。
+         */
+        /*
+         * ===== 读到即建视图（关键时序修复）=====
+         *
+         * 这是整件事最后一个、也是决定性的缺口。
+         *
+         * 实测证据（同一次运行）：
+         *   RD #1 rs=0x6ffcd1bda0 n=64    <- 检测器第一次读哨兵
+         *   RD #2 rs=0x6fa1625020 n=16    <- 接着读的是**真实** prev
+         * 而我们给它的 prev 是 0x6f2635d4f0（模块内存里的合成节点）。
+         * 它读到的却是 0x6fa1625020 —— 说明 RD #1 那次返回的是真值，
+         * 不是我们伪造的值。
+         *
+         * 原因：视图是在 clv_install_now() 里登记的，而那个函数在
+         * JNI_OnLoad 才跑。检测器的 native 扫描发生在
+         * "库已加载、但我们的扫描还没登记完"这个窗口里，
+         * 它第一次读链表头就落在这个窗口 —— 拿到真值，一次数完。
+         * 后面我们再怎么覆盖，它已经不需要再读了。
+         *
+         * 所以必须在**这次读取之内**把视图建好，然后重新覆盖返回值。
+         * 顺序：先补登记 → 再 apply_view，这样第一次读就能命中。
+         *
+         * 成本控制：只对"看起来像链表头"的读取尝试
+         * （长度 >= 16、地址在 ART 堆内、8 字节对齐），
+         * 且每个地址只尝试一次（clv_build 内部有 clv_find 去重）。
+         */
+        if (g_clv_n < CLV_MAX_HEADS && rlen >= 16 && (rstart & 7) == 0 &&
+            rstart >= g_art_heap_lo && rstart < g_art_heap_hi &&
+            !clv_find(rstart)) {
+            uintptr_t x = 0, y = 0, xn = 0, yp = 0;
+            if (read_ptr_untagged(rstart, &x) && read_ptr_untagged(rstart + 8, &y) &&
+                x >= USER_PTR_MIN && y >= USER_PTR_MIN && x != rstart && y != rstart &&
+                read_ptr_untagged(x + 8, &xn) && read_ptr_untagged(y, &yp) &&
+                UNTAG_PTR(xn) == rstart && UNTAG_PTR(yp) == rstart) {
+                int e1 = walk_dll(y, rstart, 8), e2 = walk_dll(x, rstart, 0);
+                int ec = (e1 > e2) ? e1 : e2;
+                if (ec >= 2 && ec <= 200) {
+                    clv_build(rstart);
+                    if (g_clv_n > 0 && rstart == g_clv[g_clv_n - 1].head) {
+                        g_clv[g_clv_n - 1].cand = g_clv_cur_cand;
+                    }
+                    ahb_filelog("VIEW late head=%#lx count=%d slots=%d",
+                                (unsigned long)rstart, ec, g_clv_n);
+                }
+            }
+        }
+        {
+            static uintptr_t seen[192];
+            static int nseen = 0;
+            int fi, dup = 0;
+            for (fi = 0; fi < nseen; fi++) {
+                if (seen[fi] == rstart) { dup = 1; break; }
+            }
+            if (!dup && nseen < 192) {
+                seen[nseen++] = rstart;
+                ahb_filelog("RD #%d rs=%#lx n=%zu slots=%d", nseen,
+                            (unsigned long)rstart, rlen, g_clv_n);
+            }
+        }
 
         /*
          * 合成候选覆盖：让检测器在 cl_off=0 就命中我们的假候选。
@@ -1540,10 +2081,64 @@ static ssize_t clv_pvr(pid_t pid, const struct iovec *local, unsigned long liovc
                         memcpy((void *)(lstart + (ovs - rstart)),
                                sl->headbuf + src_off, len);
                         g_clv_hits++;
-                        if (g_clv_hits <= 12) {
-                            ahb_filelog("VIEW hithead head=%#lx roff=%zu len=%zu",
+                        /*
+                         * 判决性探针：在**真正生效的覆盖块**里把返回内容
+                         * 改成空表（prev=next=head, size=0）。
+                         *
+                         * 必须写在这里，不能写在旁边那些诊断分支里 ——
+                         * 之前那次探针就放在一个从不执行的分支内，
+                         * 于是"读数没变"被误读成"检测器不走读路径"，
+                         * 白白绕了一大圈。
+                         *
+                         * 判读：读数变 0/正常 -> 覆盖生效，问题在别处；
+                         *       读数仍 32     -> 它确实直接解引用真实内存。
+                         */
+                        if (g_clv_empty_probe) {
+                            uintptr_t self = sl->head;
+                            size_t bofs = (size_t)(ovs - sl->head);
+                            unsigned char tmp[0x40];
+                            memcpy(tmp, sl->headbuf, 0x40);
+                            memcpy(tmp + 0x00, &self, 8);
+                            memcpy(tmp + 0x08, &self, 8);
+                            memset(tmp + 0x10, 0, 8);
+                            memcpy((void *)(lstart + (ovs - rstart)),
+                                   tmp + bofs, len);
+                        }
+                        /* 记录：读 head 之后检测器紧接着读了哪些地址 */
+                        {
+                            extern volatile int g_watch_n;
+                            extern uintptr_t g_watch_addr[16];
+                            extern volatile int g_watch_on;
+                            uintptr_t hp = 0, hn = 0;
+                            memcpy(&hp, sl->headbuf + 0x00, 8);
+                            memcpy(&hn, sl->headbuf + 0x08, 8);
+                            int q;
+                            for (q = 0; q < 16; q++) g_watch_addr[q] = 0;
+                            g_watch_n = 0;
+                            g_watch_on = 1;
+                            ahb_filelog("VIEW TRACE head=%#lx ret_prev=%#lx ret_next=%#lx keep=%d",
                                         (unsigned long)sl->head,
-                                        (size_t)(ovs - rstart), len);
+                                        (unsigned long)UNTAG_PTR(hp),
+                                        (unsigned long)UNTAG_PTR(hn), sl->keep);
+                            for (q = 0; q < sl->keep && q < 8; q++) {
+                                ahb_filelog("VIEW TRACE   node[%d]=%#lx", q,
+                                            (unsigned long)sl->node_addr[q]);
+                            }
+                        }
+                        {
+                            static int hh = 0;
+                            if (hh < 8) {
+                                hh++;
+                                uintptr_t v0 = 0, v1 = 0, v2 = 0;
+                                memcpy(&v0, sl->headbuf + 0x00, 8);
+                                memcpy(&v1, sl->headbuf + 0x08, 8);
+                                memcpy(&v2, sl->headbuf + 0x10, 8);
+                                ahb_filelog("VIEW hithead head=%#lx len=%zu "
+                                            "ret[0]=%#lx ret[8]=%#lx size=%#lx keep=%d",
+                                            (unsigned long)sl->head, len,
+                                            (unsigned long)v0, (unsigned long)v1,
+                                            (unsigned long)v2, sl->keep);
+                            }
                         }
                     }
                 }
@@ -1564,7 +2159,7 @@ static ssize_t clv_pvr(pid_t pid, const struct iovec *local, unsigned long liovc
                     g_clv_hits++;
                     {
                         static int dbg3 = 0;
-                        if (dbg3 < 24) {
+                        if (dbg3 < 200) {
                             dbg3++;
                             uintptr_t nv = 0, pv = 0;
                             memcpy(&pv, sl->nodebuf[q] + 0, 8);
@@ -1585,6 +2180,18 @@ static ssize_t clv_pvr(pid_t pid, const struct iovec *local, unsigned long liovc
                             (unsigned long)rstart, rlen,
                             g_clv_hits,
                             (unsigned long)((g_clv_n > 0) ? g_clv[0].node_addr[0] : 0));
+            }
+        }
+        {
+            extern volatile int g_watch_n;
+            extern volatile int g_watch_on;
+            if (g_watch_on) {
+                if (g_watch_n < 14) {
+                    ahb_filelog("VIEW TRACE  after rs=%#lx n=%zu", (unsigned long)rstart, rlen);
+                    g_watch_n = g_watch_n + 1;
+                } else {
+                    g_watch_on = 0;
+                }
             }
         }
         remaining -= (ssize_t)rlen;
@@ -1761,18 +2368,168 @@ static void clv_install_now(void) {
      * 所以第一步必须先按官方偏移取到真正的链表头，再对它做视图。
      * 按偏移取是确定性的，不依赖运气，也就不会再有"三轮坏一轮"。
      */
+    /*
+     * 诊断：把 runtime+0..0x500 里所有"vptr 落在 libart"的候选全列出来，
+     * 并报每个候选内部找到的闭环。目的是确定检测器到底数的是哪一条 ——
+     * 它报 29~33，而我们只登记出 16/17 和 21，说明双方选的候选不同。
+     */
+    {
+        static int dumped = 0;
+        uintptr_t art_s = 0, art_e = 0;
+        if (!dumped && collect_libart_range(&art_s, &art_e)) {
+            dumped = 1;
+            for (size_t o = 0; o < 0x500; o += step) {
+                uintptr_t cd = 0, vp = 0;
+                int loops = 0;
+                uintptr_t lh = 0;
+                int lc = 0;
+                if (!read_ptr_untagged(runtime + o, &cd)) continue;
+                if (cd < USER_PTR_MIN || cd >= USER_PTR_MAX) continue;
+                if (!read_ptr_untagged(cd, &vp)) continue;
+                if (vp < art_s || vp >= art_e) continue;
+                for (size_t lo = 0; lo < 0x500; lo += step) {
+                    uintptr_t hh = UNTAG_PTR(cd + lo);
+                    uintptr_t x = 0, y = 0, xn = 0, yp = 0;
+                    if (!read_ptr_untagged(hh, &x) || !read_ptr_untagged(hh + step, &y)) continue;
+                    if (x < USER_PTR_MIN || y < USER_PTR_MIN) continue;
+                    if (x == hh || y == hh) continue;
+                    if (!read_ptr_untagged(x + step, &xn) || !read_ptr_untagged(y, &yp)) continue;
+                    if (UNTAG_PTR(xn) != hh || UNTAG_PTR(yp) != hh) continue;
+                    {
+                        int d1 = walk_dll(y, hh, step), d2 = walk_dll(x, hh, 0);
+                        int dc = (d1 > d2) ? d1 : d2;
+                        if (dc < 2) continue;
+                        loops++;
+                        if (dc > lc) { lc = dc; lh = hh; }
+                    }
+                }
+                ahb_filelog("VIEW CAND off=%#lx cand=%#lx loops=%d maxcount=%d head=%#lx",
+                            (unsigned long)o, (unsigned long)cd, loops, lc, (unsigned long)lh);
+                /* 全量列出该候选内每个闭环的 (list_off, head, count) */
+                if (loops > 0) {
+                    for (size_t lo2 = 0; lo2 < 0x500; lo2 += step) {
+                        uintptr_t hh2 = UNTAG_PTR(cd + lo2);
+                        uintptr_t x2 = 0, y2 = 0, xn2 = 0, yp2 = 0;
+                        if (!read_ptr_untagged(hh2, &x2) || !read_ptr_untagged(hh2 + step, &y2)) continue;
+                        if (x2 < USER_PTR_MIN || y2 < USER_PTR_MIN) continue;
+                        if (x2 == hh2 || y2 == hh2) continue;
+                        if (!read_ptr_untagged(x2 + step, &xn2) || !read_ptr_untagged(y2, &yp2)) continue;
+                        if (UNTAG_PTR(xn2) != hh2 || UNTAG_PTR(yp2) != hh2) continue;
+                        {
+                            int e1 = walk_dll(y2, hh2, step), e2 = walk_dll(x2, hh2, 0);
+                            int ec = (e1 > e2) ? e1 : e2;
+                            if (ec >= 2)
+                                ahb_filelog("VIEW LOOP cand=%#lx off=%#lx head=%#lx count=%d cl=%d",
+                                            (unsigned long)cd, (unsigned long)lo2,
+                                            (unsigned long)hh2, ec,
+                                            looks_like_class_loaders(hh2, step));
+                        }
+                    }
+                }
+            }
+            ahb_filelog("VIEW CAND done runtime=%#lx art=%#lx-%#lx",
+                        (unsigned long)runtime, (unsigned long)art_s, (unsigned long)art_e);
+        }
+    }
+
     {
         uintptr_t cl = 0;
         if (read_ptr_untagged(runtime + 0x2c0, &cl) && cl >= USER_PTR_MIN && cl < USER_PTR_MAX) {
-            uintptr_t h = 0;
-            if (read_ptr_untagged(cl + 0x280, &h) && h >= USER_PTR_MIN && h < USER_PTR_MAX) {
+            /*
+             * 链表头 addr = ClassLinker + 0x280，**不是** *(ClassLinker+0x280)。
+             *
+             * 这是整件事里藏得最深的一个坑。std::list 的成员是内嵌的
+             * __list_node_base，所以 class_loaders_ 这个成员的**地址**
+             * 就是哨兵节点（链表头）的地址，它的前两个字段才是首尾指针。
+             *
+             * 原来写成 head = *(cl + 0x280)，拿到的是哨兵的第一个字段
+             * （某个真实元素地址），再把那个元素当成头去伪造。
+             * 检测器从真正的头 cl+0x280 出发，我们伪造的地址根本不在它的
+             * 路径上 —— 它照样走真链数出 17~32，视图完全白做。
+             *
+             * 日志对照（同一进程、同一 cl）：
+             *     错误 head = *(cl+0x280) = 0x6ffcc1c828
+             *     正确 head = cl+0x280    = 0x6ffcd1bda0   (实测 count=17)
+             */
+            /*
+             * head = *(cl + 0x280)。
+             *
+             * 注意这里是**取值**不是取地址。实测依据：
+             * 用这个写法跑出过 "当前 4 个 ClassLoader，处于正常范围" 的 SAFE，
+             * 说明检测器正是把 *(cl+0x280) 当链表头指针用。
+             * 后来我一度改成 head = cl+0x280（当成内嵌哨兵），
+             * 该项立刻退回 33 —— 证明原写法是对的。
+             */
+            /*
+             * head = cl + 0x280 —— 取**地址**，不取值。
+             *
+             * 这是整件事最后、也是最关键的一个错误。std::list 的成员是
+             * 内嵌的 __list_node_base，所以 class_loaders_ 这个成员的地址
+             * 就是哨兵节点的地址；它的前两个字段才是首尾指针。
+             *
+             * 实测证据（同一次运行、同一 cl）：
+             *   VIEW LOOP cand=0x6ffcd1bb20 off=0x280
+             *             head=0x6ffcd1bda0 count=16 cl=1
+             *             ^^^^^^^^^^^^^^ 这个是哨兵，cl=1 表示它是 class_loaders_
+             *   而 *(cl+0x280) = 0x6ffcc1c828，那是链表的**第一个元素**。
+             *
+             * 之前写成 head = *(cl+0x280)，把第一个元素当成头去伪造。
+             * 检测器从真哨兵 cl+0x280 出发，压根走不到我们伪造的地址，
+             * 所以无论把那个假头做成空表、4 节点闭环还是别的，读数都不变 ——
+             * 这就是为什么"空表探针"下去它照样报 32。
+             *
+             * 另外从 32 = 16 + 16 可以确认：它是把两个方向的长度**相加**。
+             * 所以保留节点数按 sum 计算，keep=2 时 sum=4，落在正常 2~5 区间。
+             */
+            uintptr_t h = cl + 0x280;
+            {
                 uintptr_t a = 0, b = 0;
-                if (read_ptr_untagged(h, &a) && read_ptr_untagged(h + step, &b)) {
+                if (read_ptr_untagged(h, &a) && read_ptr_untagged(h + step, &b) &&
+                    a >= USER_PTR_MIN && b >= USER_PTR_MIN && a != h && b != h) {
                     ahb_filelog("VIEW direct cl=%#lx head=%#lx a=%#lx b=%#lx",
                                 (unsigned long)cl, (unsigned long)h,
                                 (unsigned long)UNTAG_PTR(a), (unsigned long)UNTAG_PTR(b));
+                    /* 诊断：扫 ClassLinker 全部偏移，列出所有闭环 */
+                    {
+                        int nl = 0;
+                        for (size_t lo = 0; lo < 0x500; lo += step) {
+                            uintptr_t hh = UNTAG_PTR(cl + lo);
+                            uintptr_t x = 0, y = 0, xn = 0, yp = 0;
+                            if (!read_ptr_untagged(hh, &x) || !read_ptr_untagged(hh + step, &y)) continue;
+                            if (x < USER_PTR_MIN || y < USER_PTR_MIN) continue;
+                            if (x == hh || y == hh) continue;
+                            if (!read_ptr_untagged(x + step, &xn) || !read_ptr_untagged(y, &yp)) continue;
+                            if (UNTAG_PTR(xn) != hh || UNTAG_PTR(yp) != hh) continue;
+                            int d1 = walk_dll(y, hh, step), d2 = walk_dll(x, hh, 0);
+                            int dc = (d1 > d2) ? d1 : d2;
+                            if (dc < 2) continue;
+                            nl++;
+                            if (nl <= 6)
+                                ahb_filelog("VIEW CLLOOP off=%#lx head=%#lx count=%d",
+                                            (unsigned long)lo, (unsigned long)hh, dc);
+                        }
+                        ahb_filelog("VIEW CLLOOP total=%d cl=%#lx", nl, (unsigned long)cl);
+                    }
                     g_clv_cur_cand = cl;
+                    g_clv_cur_cl = cl;
+                    /*
+                     * 先记住链表首元素再编链。
+                     *
+                     * 检测器有两个入口会读：哨兵 cl+0x280，
+                     * 以及首元素 *(cl+0x280)。两个都必须合成闭环，
+                     * 否则它会走没合成的那条，读数纹丝不动。
+                     */
+                    {
+                        uintptr_t f0 = 0;
+                        if (read_ptr_untagged(h, &f0)) g_clv_cur_first = UNTAG_PTR(f0);
+                    }
+                    /*
+                     * 先修剪真实链表，再建读视图。
+                     * 顺序很重要：视图是"别人读时给什么"，修剪是"内存里到底有几个"。
+                     * 检测器只在进程内直接解引用，所以真正起作用的是后者。
+                     */
                     clv_build(h);
+                    if (g_clv_cur_first && g_clv_cur_first != h) clv_build(g_clv_cur_first);
                     found++;
                 }
             }
@@ -1797,10 +2554,7 @@ static void clv_install_now(void) {
      * 所以：官方偏移命中即返回。这条路径是确定性的，
      * 不依赖"扫到哪条"，也就不会再有重叠和竞态。
      */
-    if (found > 0) {
-        ahb_filelog("VIEW install direct hit found=%d total=%d", found, g_clv_n);
-        return;
-    }
+    ahb_filelog("VIEW install direct found=%d total=%d", found, g_clv_n);
 
     for (size_t cl_off = 0; cl_off < 0x500; cl_off += step) {
         uintptr_t cand = 0;
@@ -1809,10 +2563,15 @@ static void clv_install_now(void) {
 
         uintptr_t vptr = 0;
         if (!read_ptr_untagged(cand, &vptr)) continue;
-        /* 用第一个真实 vptr 建合成候选：让检测器在 cl_off=0 就命中 */
-        if (!g_fake_ready && vptr >= art_start && vptr < art_end) {
-            clv_build_fake(vptr);
-        }
+        /*
+         * 不再构建合成候选。
+         *
+         * 它靠 spoof "runtime+0 -> 假 ClassLinker" 让检测器在 cl_off=0 命中。
+         * 实测结果是该项从 RISK 变成 INFO("链表结构校验失败") —— 不是 SAFE，
+         * 而且它与下面基于真链的视图会互相干扰（同一批地址两套内容）。
+         * 真链视图修好后这条路不再需要。
+         */
+        (void)art_start; (void)art_end;
         /*
          * 不要求 vptr 落在 libart 段内。
          *
@@ -1839,6 +2598,18 @@ static void clv_install_now(void) {
             int count = (c1 > c2) ? c1 : c2;
             if (count < 2 || count > 64) continue;
 
+            /*
+             * 冲突跳过：该地址已经是某条已登记链的成员，就不要再当头登记。
+             *
+             * 踩坑：cl+0x280 那条链的 next 恰好也是暴力扫描命中的"头"，
+             * 它们本就是同一条链上的相邻对象。两条 slot 都会覆盖这段地址，
+             * 后写的把先写的盖掉，闭环校验当场失败，检测器退回真链数出 32。
+             * 日志对照：
+             *     VIEW direct head=0x6ffcc1c828 next=0x6ffcd1bda0
+             *     VIEW built  head=0x6ffcd1bda0      <- 同一个对象被登记两次
+             */
+            if (clv_is_chain_member(head)) continue;
+
             g_clv_cur_cand = cand;
             clv_build(head);
             found++;
@@ -1847,6 +2618,9 @@ static void clv_install_now(void) {
 
     if (!g_real_pvr) {
         g_real_pvr = (pvr_fn)dlsym(RTLD_DEFAULT, "process_vm_readv");
+        g_real_pread64 = (pread64_fn)dlsym(RTLD_DEFAULT, "pread64");
+        g_real_pread   = (pread64_fn)dlsym(RTLD_DEFAULT, "pread");
+        ahb_filelog("VIEW pread resolve pread64=%p pread=%p", (void *)g_real_pread64, (void *)g_real_pread);
     }
     if (!g_real_syscall) {
         g_real_syscall = (syscall_fn)dlsym(RTLD_DEFAULT, "syscall");
@@ -2199,7 +2973,20 @@ static int l3_trim_when_settled(void) {
                     rep_h = g_clv_hits;
                 }
             }
-            clv_build(head);
+            /*
+             * 这条旧路径（nativeSanitizeRuntime）扫到的 head 可能是
+             * 另一条已登记链的**中间节点**，登记它会覆盖那条链的节点视图。
+             *
+             * 实测：链 A head=0x6ffcc1c828 的 next=0x6ffcd1bda0，
+             * 这里又把 0x6ffcd1bda0 当成独立头登记。
+             * 覆盖循环按 slot 顺序写，后写覆盖先写 ——
+             * 检测器读 0x6ffcd1bda0 时本应拿到"前驱指回链 A 头"的视图，
+             * 却被第二份 headbuf 覆盖成它自己的前后驱，
+             * 链 A 的闭环当场断裂，检测器退回真链数出 32。
+             */
+            if (!clv_is_chain_member(head)) {
+                clv_build(head);
+            }
             clv_patch_got();
             LOGI("L3 view: head=%#lx 真实 count=%d -> 视图 %d 节点 (ART 未写入)",
                  (unsigned long)head, count, CLV_KEEP);
