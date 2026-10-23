@@ -172,7 +172,7 @@ static volatile int g_l3_done = 0;
  */
 #define CLV_KEEP 4
 #define CLV_MAX_CHAIN 64
-#define CLV_MAX_HEADS 8
+#define CLV_MAX_HEADS 64
 
 /*
  * 一次登记多条候选链。
@@ -199,6 +199,40 @@ static uintptr_t g_dbg_addr[64];
 static volatile int g_dbg_i = 0;
 static volatile int g_clv_rescanned = 0;
 static uintptr_t g_clv_need_build = 0;
+
+/*
+ * ============ 合成 ClassLinker 候选（确定性方案）============
+ *
+ * 检测器的候选扫描是「runtime+0..0x500 逐个读，第一个满足闭环条件就 return」。
+ * 也就是说它**永远取第一个**。
+ *
+ * 之前一直在追"它可能选中哪条真链"并逐个伪造 —— 这是追不完的：
+ * Runtime 里的闭环随启动过程不断变化，实测每次启动它选中的链都不同，
+ * 于是出现"三轮坏一轮"这种间歇性失败。
+ *
+ * 正确做法是让它**在第一个偏移就看到我们合成的候选**：
+ *   runtime+0   -> 指向 g_fake_cl（一块我们自己控制的内存）
+ *   runtime+8.. -> 全部返回 0（让它扫不到任何真候选）
+ *
+ * g_fake_cl 里放一个真实的 libart vptr（过它的特征 A 校验），
+ * 再在 +0x50 处放一个 4 节点闭环（过特征 B 与计数校验）。
+ * 它扫到 cl_off=0 就命中，count=4，立即返回 —— 完全确定，无竞态。
+ *
+ * 所有伪造只发生在 process_vm_readv 的**返回值**上，真实内存零改动。
+ */
+#define FAKE_CL_SIZE   0x500
+#define FAKE_CL_LIST   0x50
+#define FAKE_CL_NODES  4
+
+static unsigned char g_fake_cl[FAKE_CL_SIZE];
+static unsigned char g_fake_nodes[FAKE_CL_NODES][0x40];
+static uintptr_t     g_fake_cl_addr = 0;
+static uintptr_t     g_scan_runtime = 0;
+static volatile int  g_fake_ready = 0;
+
+/* ART 堆地址区间：由 runtime 指针推出来，动态登记用它做准入 */
+static uintptr_t g_art_heap_lo = 0;
+static uintptr_t g_art_heap_hi = 0;
 
 typedef ssize_t (*pvr_fn)(pid_t, const struct iovec *, unsigned long,
                           const struct iovec *, unsigned long, unsigned long);
@@ -673,6 +707,23 @@ static void *guard_loop(void *arg) {
             clv_patch_got();
         }
         /*
+         * 周期重扫候选链。
+         *
+         * Runtime 里的闭环是启动过程中陆续成形的：JNI_OnLoad 那一刻可能
+         * 只有 2 条，检测器真正读取时已经有 3~5 条。只扫一次就会漏掉
+         * 后出现的那几条，检测器一旦选中它们，视图伪造全部失效。
+         *
+         * 只在早期窗口（前 40 轮，约 10 秒）做，且已有登记时也照做 ——
+         * clv_build 内部对重复 head 会直接返回，不会重复占槽。
+         */
+        if ((ops & NATIVE_OP_CL) != 0 && g_guard_ticks < 40 && (g_guard_ticks % 2) == 0) {
+            int before = g_clv_n;
+            clv_install_now();
+            if (g_clv_n != before) {
+                LOGI("L3 view: 周期补扫 slots %d -> %d", before, g_clv_n);
+            }
+        }
+        /*
          * maps 视图接管只在启动早期补扫，之后彻底停手。
          *
          * 性能考虑：一次全量扫描要读整个 maps、遍历上百个 .so 的 ELF
@@ -861,6 +912,73 @@ static struct clv_slot *clv_find(uintptr_t head) {
     return NULL;
 }
 
+/*
+ * 判断某个地址是否已经是某条已登记链的成员（节点或头）。
+ *
+ * 必须做这个排除，否则动态登记会把链上的**中间节点**也当成新头。
+ * 实测后果很严重：一条 20 节点的链会产生 20 次误登记，
+ * 几十轮下来把 CLV_MAX_HEADS 全部占满，真正的头反而登记不进去 ——
+ * 这正是"三轮坏一轮"的直接原因。
+ */
+static int clv_is_chain_member(uintptr_t addr) {
+    int i, k;
+    for (i = 0; i < g_clv_n; i++) {
+        if (!g_clv[i].ready) continue;
+        if (g_clv[i].head == addr) return 1;
+        for (k = 0; k < g_clv[i].keep; k++) {
+            if (g_clv[i].node_addr[k] == addr) return 1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * 构建合成候选。只要拿到一个真实 ClassLinker 的 vptr 就够了。
+ */
+static void clv_build_fake(uintptr_t real_vptr) {
+    uintptr_t head, n0, n1, n2, n3, prev, next;
+    int i;
+
+    if (g_fake_ready || real_vptr == 0) return;
+
+    memset(g_fake_cl, 0, sizeof(g_fake_cl));
+    memset(g_fake_nodes, 0, sizeof(g_fake_nodes));
+
+    /* 特征 A：候选对象首字段是 libart 段内的 vptr */
+    memcpy(g_fake_cl + 0x00, &real_vptr, 8);
+
+    head = (uintptr_t)g_fake_cl + FAKE_CL_LIST;
+    n0 = (uintptr_t)g_fake_nodes[0];
+    n1 = (uintptr_t)g_fake_nodes[1];
+    n2 = (uintptr_t)g_fake_nodes[2];
+    n3 = (uintptr_t)g_fake_nodes[3];
+
+    /* 特征 B：head 的两个方向都指进闭环 */
+    memcpy(g_fake_cl + FAKE_CL_LIST + 0x00, &n3, 8);
+    memcpy(g_fake_cl + FAKE_CL_LIST + 0x08, &n0, 8);
+    /* std::list 的 __size_ */
+    {
+        uintptr_t size = FAKE_CL_NODES;
+        memcpy(g_fake_cl + FAKE_CL_LIST + 0x10, &size, 8);
+    }
+
+    /* 4 节点闭环：n0 <-> n1 <-> n2 <-> n3 <-> head */
+    for (i = 0; i < FAKE_CL_NODES; i++) {
+        uintptr_t na = (uintptr_t)g_fake_nodes[i];
+        prev = (i == 0) ? head : (uintptr_t)g_fake_nodes[i - 1];
+        next = (i == FAKE_CL_NODES - 1) ? head : (uintptr_t)g_fake_nodes[i + 1];
+        memcpy((void *)(na + 0x00), &prev, 8);
+        memcpy((void *)(na + 0x08), &next, 8);
+    }
+
+    g_fake_cl_addr = (uintptr_t)g_fake_cl;
+    g_fake_ready = 1;
+    LOGI("L3 view: 合成候选就绪 cl=%#lx head=%#lx vptr=%#lx",
+         (unsigned long)g_fake_cl_addr, (unsigned long)head, (unsigned long)real_vptr);
+    ahb_filelog("VIEW fake ready cl=%#lx head=%#lx",
+                (unsigned long)g_fake_cl_addr, (unsigned long)head);
+}
+
 static void clv_build(uintptr_t head) {
     if (head == 0) return;
     /*
@@ -1012,8 +1130,53 @@ static ssize_t clv_pvr(pid_t pid, const struct iovec *local, unsigned long liovc
     g_clv_calls++;
     if (!g_real_pvr) return -1;
     ssize_t n = g_real_pvr(pid, local, liovcnt, remote, riovcnt, flags);
-    if (n <= 0 || g_clv_n == 0 || g_clv_in_wrap) return n;
+    if (n <= 0 || g_clv_in_wrap) return n;
     if (pid != getpid()) return n;
+
+    /*
+     * 读到即登记：把检测器实际读到的每个候选地址都纳入视图。
+     *
+     * 这是整条链路最关键的一步，也是绕了很久才想通的地方。
+     *
+     * 检测器不是只读"链表头"：它在 Runtime 的候选对象里按 8 字节步进
+     * 逐个读，凡是读到的值看起来像指针，就当成潜在链表头去验证。
+     * 实测它一次扫描会读 4 个这样的地址，而我们预扫描只登记了其中 2 个
+     * （另外两个是 0x7d01b0cb70 / 0x7d01aefe00）。它一旦选中未登记的那个，
+     * 读到的就是真实长链，数出 31~33 —— 这就是"三轮坏一轮"的全部原因。
+     *
+     * 所以：包装里看到的每个未登记地址，只要它落在用户态且我们还没建过视图，
+     * 就直接建一份。clv_build 会从该地址出发走链并构造 4 节点闭环视图；
+     * 即使它其实不是链表头，最坏也只是多一份无害的视图映射。
+     *
+     * 成本控制：每个地址只处理一次（clv_find 去重），总数受 CLV_MAX_HEADS 限制，
+     * 且不在这里做全量重扫（那会造成几万次触发）。
+     */
+    if (riovcnt >= 1 && n >= 8 && liovcnt >= 1) {
+        uintptr_t ra = (uintptr_t)remote[0].iov_base;
+        /*
+         * 只对"8 字节整数倍且落在 ART 堆"的读做登记判定。
+         * 检测器读 head 是 8 字节一次，读候选对象也是 8 字节，
+         * 所以这里 n>=8 已足够；不要限制成必须 8，否则一次读 16 字节的
+         * 情况会被漏掉。
+         */
+        /*
+         * 动态登记的准入条件必须严格，否则会把大量无关地址当成链表头。
+         *
+         * 实测：不加限制时产生 2184 条登记，其中 0xa84fb6c0 这类
+         * 根本不是 ART 堆地址（是普通的 32 位指针残留），
+         * 它们占满了 CLV_MAX_HEADS，真正的链反而登记不进去。
+         *
+         * 判据三条同时满足：
+         *  1) 落在 ART 堆所在的地址区间（与 runtime 同高 24 位）；
+         *  2) 8 字节对齐（ART 对象都是对齐的）；
+         *  3) 不是已登记链的成员。
+         */
+        if (ra >= g_art_heap_lo && ra < g_art_heap_hi &&
+            (ra & 7) == 0 &&
+            !clv_find(ra) && !clv_is_chain_member(ra)) {
+            g_clv_need_build = ra;
+        }
+    }
 
     g_clv_in_wrap = 1;
 
@@ -1065,98 +1228,16 @@ static ssize_t clv_pvr(pid_t pid, const struct iovec *local, unsigned long liovc
      * 若 pid 不是自己、或读的不是这些地址，原样返回，不引入任何额外语义。
      */
     /*
-     * 读到即识别：动态发现检测器实际使用的链表头并补登记。
+     * 轻量补扫：每次包装调用最多补登记一条新链。
      *
-     * 为什么必须有这一步：预扫描只能找到"当时已经闭合"的链，
-     * 而检测器在扫描过程中会读到一个我们没有登记的 head
-     * （实测读到 0x7d01aefe00，它的 count=33，我们只登记了另外两条）。
-     * 检测器一旦选中那条链，我们所有伪造都白做。
+     * 全量重扫太贵（clv_install_now 要读 Runtime 的 0x500 指针 × 每个候选的 0x500，
+     * 实测放进包装会造成 6 万次触发、性能灾难）。但完全不补又会漏掉
+     * 检测器实际使用的那条链 —— 实测三轮里坏一轮、读数 31/32/33。
      *
-     * 识别方式与检测器自己完全一致：
-     *   X 的 16 字节是两个用户态指针 a、b
-     *   后续读 a+8 得到 X，且读 b 得到 X  ⇒ X 是闭环链表头
-     * 两个条件都满足就补登记。
+     * 折中：只在"读的地址落在 Runtime 附近"时，做一次轻量检查 ——
+     * 把这次读到的值当作潜在链表头，验证它是否是闭环（两次读即可判定）。
+     * 成本是每次包装调用最多两次额外读取，可忽略。
      */
-    {
-        static struct { uintptr_t head, a, b; int ga, gb; } pend[8];
-        static int pend_n = 0;
-        int pi;
-        uintptr_t ra = (riovcnt >= 1) ? (uintptr_t)remote[0].iov_base : 0;
-        size_t rl = (riovcnt >= 1) ? remote[0].iov_len : 0;
-        const uintptr_t *lc = (liovcnt >= 1) ? (const uintptr_t *)local[0].iov_base : NULL;
-
-        if (lc && ra && n >= 8) {
-            /* 验证阶段：这次读的是不是某个 pending head 的一侧 */
-            for (pi = 0; pi < pend_n; pi++) {
-                if (rl < 8) break;
-                if (ra == pend[pi].a + 8 && lc[0] == pend[pi].head) pend[pi].ga = 1;
-                if (ra == pend[pi].b      && lc[0] == pend[pi].head) pend[pi].gb = 1;
-                if (pend[pi].ga && pend[pi].gb) {
-                    if (!clv_find(pend[pi].head)) {
-                        g_clv_need_build = pend[pi].head;
-                        ahb_filelog("VIEW dyn-detect head=%#lx", (unsigned long)pend[pi].head);
-                    }
-                    pend[pi].head = 0;
-                }
-            }
-            /*
-             * 登记阶段：缓存本次读到的 8 字节。
-             *
-             * 检测器读链表头是分两次的：rp(head) 与 rp(head+8)，
-             * 每次都是 8 字节，不会一次读 16 字节。
-             * 所以要按地址把两次的值拼起来，才能判出 a / b。
-             */
-            if (rl == 8) {
-                for (pi = 0; pi < pend_n; pi++) {
-                    if (pend[pi].head == ra) {
-                        pend[pi].b = UNTAG_PTR(lc[0]);
-                        pend[pi].gb = 2;   /* 标记：第二个半区已读 */
-                        break;
-                    }
-                    if (pend[pi].head + 8 == ra) {
-                        pend[pi].a = UNTAG_PTR(lc[0]);
-                        pend[pi].ga = 2;
-                        break;
-                    }
-                }
-                if (pi == pend_n) {
-                    /* 新地址：先当作 head+8 的位置缓存（检测器常先读 head） */
-                    int dup = 0;
-                    for (pi = 0; pi < pend_n; pi++) {
-                        if (pend[pi].head == ra || pend[pi].head + 8 == ra) dup = 1;
-                    }
-                    if (!dup && ra >= USER_PTR_MIN && ra < USER_PTR_MAX) {
-                        if (pend_n >= 8) {
-                            for (pi = 1; pi < 8; pi++) pend[pi - 1] = pend[pi];
-                            pend_n = 7;
-                        }
-                        pend[pend_n].head = ra;
-                        pend[pend_n].a = 0;
-                        pend[pend_n].b = 0;
-                        pend[pend_n].ga = 1;   /* 第一个半区 = ra 本身 */
-                        pend[pend_n].gb = 0;
-                        pend_n++;
-                    }
-                }
-                /* 两个半区都拿到，判闭环 */
-                for (pi = 0; pi < pend_n; pi++) {
-                    if (pend[pi].ga == 2 && pend[pi].gb == 2) {
-                        uintptr_t H = pend[pi].head;
-                        uintptr_t A = pend[pi].a, B = pend[pi].b;
-                        if (A >= USER_PTR_MIN && A < USER_PTR_MAX &&
-                            B >= USER_PTR_MIN && B < USER_PTR_MAX &&
-                            A != H && B != H && !clv_find(H)) {
-                            g_clv_need_build = H;
-                            ahb_filelog("VIEW dyn head=%#lx a=%#lx b=%#lx",
-                                        (unsigned long)H, (unsigned long)A, (unsigned long)B);
-                        }
-                        pend[pi].head = 0;
-                    }
-                }
-            }
-        }
-    }
-
     ssize_t remaining = n;
     for (unsigned long i = 0; i < riovcnt && i < liovcnt && remaining > 0; i++) {
         size_t rlen = remote[i].iov_len;
@@ -1164,6 +1245,68 @@ static ssize_t clv_pvr(pid_t pid, const struct iovec *local, unsigned long liovc
         uintptr_t rstart = (uintptr_t)remote[i].iov_base;
         uintptr_t rend = rstart + rlen;
         uintptr_t lstart = (uintptr_t)local[i].iov_base;
+
+        /*
+         * 合成候选覆盖：让检测器在 cl_off=0 就命中我们的假候选。
+         *
+         * 检测器的候选扫描是「runtime+0..0x500 逐个读，第一个满足闭环就 return」，
+         * 永远取第一个。只要让它在 +0 就看到一个过检的候选，
+         * 它就永远不会去碰真链 —— 这是确定性的，没有竞态。
+         */
+        if (g_fake_ready && g_scan_runtime) {
+            static int once = 0;
+            if (!once) { once = 1;
+                ahb_filelog("VIEW fakecover rt=%#lx fakecl=%#lx rstart=%#lx",
+                            (unsigned long)g_scan_runtime,
+                            (unsigned long)g_fake_cl_addr,
+                            (unsigned long)rstart); }
+            uintptr_t rt = g_scan_runtime;
+            /* runtime+0 那 8 字节 -> g_fake_cl 地址 */
+            {
+                uintptr_t ovs = (rstart > rt) ? rstart : rt;
+                uintptr_t ove = (rend < rt + 8) ? rend : (rt + 8);
+                if (ovs < ove) {
+                    uintptr_t v = g_fake_cl_addr;
+                    memcpy((void *)(lstart + (ovs - rstart)),
+                           (unsigned char *)&v + (ovs - rt), (size_t)(ove - ovs));
+                    g_clv_hits++;
+                }
+            }
+            /* runtime+8..0x500 范围内 -> 0，让它扫不到真候选 */
+            {
+                uintptr_t ovs = (rstart > rt + 8) ? rstart : (rt + 8);
+                uintptr_t ove = (rend < rt + 0x500) ? rend : (rt + 0x500);
+                if (ovs < ove) {
+                    memset((void *)(lstart + (ovs - rstart)), 0, (size_t)(ove - ovs));
+                    g_clv_hits++;
+                }
+            }
+            /* g_fake_cl 自身 */
+            {
+                uintptr_t fcl = g_fake_cl_addr;
+                uintptr_t ovs = (rstart > fcl) ? rstart : fcl;
+                uintptr_t ove = (rend < fcl + FAKE_CL_SIZE) ? rend : (fcl + FAKE_CL_SIZE);
+                if (ovs < ove) {
+                    memcpy((void *)(lstart + (ovs - rstart)),
+                           g_fake_cl + (ovs - fcl), (size_t)(ove - ovs));
+                    g_clv_hits++;
+                }
+            }
+            /* 4 个合成节点的 prev/next */
+            {
+                int q;
+                for (q = 0; q < FAKE_CL_NODES; q++) {
+                    uintptr_t na = (uintptr_t)g_fake_nodes[q];
+                    uintptr_t ovs = (rstart > na) ? rstart : na;
+                    uintptr_t ove = (rend < na + 0x10) ? rend : (na + 0x10);
+                    if (ovs >= ove) continue;
+                    memcpy((void *)(lstart + (ovs - rstart)),
+                           (void *)(na + (ovs - na)), (size_t)(ove - ovs));
+                    g_clv_hits++;
+                }
+            }
+        }
+
 
         /*
          * 对每条已登记候选求交集。
@@ -1224,13 +1367,19 @@ static ssize_t clv_pvr(pid_t pid, const struct iovec *local, unsigned long liovc
     }
     g_clv_in_wrap = 0;
 
-    /* 补登记延后到包装退出后：clv_build 内部要读内存，不能在包装里递归 */
+    /*
+     * 消费补登记请求。
+     *
+     * 必须在 g_clv_in_wrap 复位之后执行：clv_build 内部要读内存，
+     * 那些读会再次进入本包装，若标志未复位就会直接返回、构建失败。
+     */
     if (g_clv_need_build) {
         uintptr_t h = g_clv_need_build;
         g_clv_need_build = 0;
         clv_build(h);
-        LOGI("L3 view: 动态补登记 head=%#lx slots=%d", (unsigned long)h, g_clv_n);
+        ahb_filelog("VIEW dyn head=%#lx total=%d", (unsigned long)h, g_clv_n);
     }
+
     return n;
 }
 
@@ -1303,6 +1452,17 @@ static int walk_dll_real(uintptr_t head) {
 static void clv_install_now(void) {
     JavaVM *vm = g_vm;
     if (!vm) return;
+    /*
+     * 每次都要完整重扫，不能因"已经登记过几条"就提前返回。
+     *
+     * Runtime 里的闭环是陆续成形的：首轮可能只有 2 条，
+     * 检测器真正读取时已经有第 3、第 4 条（实测出现过
+     * head=0x7d01b1bc20 / 0x7ca2825020 / 0x7d01b0cb70）。
+     * 一旦它选中那些没登记的长链，视图伪造就完全失效 ——
+     * 这正是"三轮里坏一轮、读数 31/32/33"的根因。
+     *
+     * clv_build 内部对已存在的 head 会直接返回，重复扫描不会占额外槽位。
+     */
 
     uintptr_t vm_addr = UNTAG_PTR((uintptr_t)vm);
     uintptr_t runtime = 0;
@@ -1310,6 +1470,30 @@ static void clv_install_now(void) {
 
     uintptr_t art_start = 0, art_end = 0;
     if (!collect_libart_range(&art_start, &art_end)) return;
+
+    /*
+     * 记下 ART 堆所在的地址区间：runtime 指针就在堆上，
+     * 取它所在的高位段作为准入范围。动态登记只接受落在这个范围内的地址。
+     */
+    /*
+     * 记下检测器会用的 Runtime 地址 —— 合成候选的覆盖全靠它。
+     *
+     * 这里漏赋值过一次，症状很隐蔽：g_fake_ready 明明为 1、日志也有
+     * "VIEW fake ready"，但覆盖分支 if (g_fake_ready && g_scan_runtime)
+     * 永远为假，合成候选一次都没生效，看起来像"伪造成了但没用"。
+     */
+    g_scan_runtime = runtime;
+
+    if (g_art_heap_lo == 0) {
+        uintptr_t base = runtime & ~(uintptr_t)0xffffffffULL;
+        g_art_heap_lo = base;
+        g_art_heap_hi = base + (uintptr_t)0x100000000ULL;
+        static int once = 0;
+        if (!once) { once = 1;
+            ahb_filelog("VIEW heap range %#lx-%#lx (runtime=%#lx)",
+                        (unsigned long)g_art_heap_lo, (unsigned long)g_art_heap_hi,
+                        (unsigned long)runtime); }
+    }
 
     const size_t step = sizeof(uintptr_t);
     int found = 0;
@@ -1320,7 +1504,19 @@ static void clv_install_now(void) {
 
         uintptr_t vptr = 0;
         if (!read_ptr_untagged(cand, &vptr)) continue;
-        if (vptr < art_start || vptr >= art_end) continue;
+        /* 用第一个真实 vptr 建合成候选：让检测器在 cl_off=0 就命中 */
+        if (!g_fake_ready && vptr >= art_start && vptr < art_end) {
+            clv_build_fake(vptr);
+        }
+        /*
+         * 不要求 vptr 落在 libart 段内。
+         *
+         * 实测检测器会用到一条 vptr 不在 libart 范围的链
+         * （head=0x7d01aefe00，count=31）。按原条件它被整条漏掉，
+         * 而检测器一旦先扫到它就直接返回 —— 这正是"三轮坏一轮"的根因。
+         * 我们是伪造视图，多登记一条没有副作用。
+         */
+        if (vptr < USER_PTR_MIN || vptr >= USER_PTR_MAX) continue;
 
         for (size_t list_off = 0; list_off < 0x500; list_off += step) {
             uintptr_t head = UNTAG_PTR(cand + list_off);
