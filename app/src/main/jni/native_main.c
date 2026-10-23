@@ -306,6 +306,7 @@ static void clv_apply_view(uintptr_t rstart, void *buf, size_t rlen);
 static void clv_build(uintptr_t head);
 static void clv_build_synthetic(uintptr_t head, int idx);
 static int clv_trim_real(uintptr_t head);
+static int clv_set_size_only(uintptr_t head, uintptr_t n);
 static uintptr_t g_clv_cur_first;
 static uintptr_t g_clv_cur_cand;
 static uintptr_t g_clv_cur_cl;
@@ -1123,6 +1124,30 @@ static int clv_trim_real(uintptr_t head) {
                     (unsigned long)head, n, CLV_TRIM_KEEP, (unsigned long)cut);
     }
     return 1;
+}
+
+/*
+ * ===== 只改 __size_ 字段（GC 安全）=====
+ *
+ * 判决性实验得出的两条事实：
+ *   1. 空表覆盖（prev=next=head、size=0）读数仍 32 —— 它不经过 libc 读内存。
+ *   2. 真实剪链读数确实变 4 —— 它读的是真实内存里的东西。
+ *
+ * 关键区分：真实内存里有两个可能的数据源
+ *   A. 沿着 prev/next 遍历节点计数
+ *   B. 直接读哨兵 +0x10 的 __size_ 字段
+ *
+ * 早前剪链时把 A 和 B 一起改了，读数变 4，但摘下的节点连同
+ * ClassLoaderData 失去可达性，GC 扫到陈旧引用即 abort。
+ *
+ * 如果数据源是 B，那么**只改 __size_、完全不动链接**就够了：
+ * 链表结构完整，GC 照常能走完全部节点，ClassLoaderData 全部可达，
+ * 没有任何悬空引用；而检测器读到的计数是我们写的那个小值。
+ *
+ * 这个实验只写 8 个字节，且不破坏任何链接，风险极低。
+ */
+static int clv_set_size_only(uintptr_t head, uintptr_t n) {
+    return safe_write_mem(head + 0x10, &n, 8);
 }
 
 static void clv_build(uintptr_t head) {
