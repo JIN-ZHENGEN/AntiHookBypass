@@ -17,25 +17,29 @@ Android 上的 LSPosed 模块：把 Hook / 注入留下的痕迹，在**运行�
 | L1 · Java | `getStackTrace` / `getAllStackTraces` / `StackWalker` / `Class.forName` / `getXposedVersion` / `isDebuggerConnected` | 滤掉框架帧、收敛类可见性、伪造探测结果 |
 | L2 · Native 具名函数 | libc 的 `open` / `openat` / `ptrace` / `fork` / `prctl` / `process_vm_readv` | 拦内存布局探测、拦自我 ptrace、拦 fork 反向附加 |
 | L3 · Native syscall | libc 的 `syscall()` 通用入口 | 拦 `syscall(SYS_openat, ...)` 这类绕过具名函数的写法 |
-| L3 · 运行时视图 | ART 的 `ClassLoader` 链表读取 | **只伪造读出来的视图**，ART 结构一个字节不写 |
+| L3 · 运行时视图 | libc/libart 代码段读取、ART 链表遍历 | **只伪造读出来的视图**，ART 结构一个字节不写 |
+| L4 · 结论 | 检测器输出的判定结果 | 按文本形状识别，计数超界即夹回区间 |
 
 ---
 
-## 为什么是「视图伪造」而不是「改链表」
+## 优先选「视图伪造」而不是「改真实内存」
 
-数 ClassLoader 数量的检测，走的是读自己进程内存这条路。天然有两个选择：
+绝大多数项走读自己进程内存这条路，天然有两个选择：
 
-1. 把 ART 里的链表真剪短
-2. 让它读到的内容变短，但链表本身不动
+1. 把真实结构改掉
+2. 让它读到的内容变掉，但真实结构不动
 
-选 1 的实测结果：进程内剪链会破坏 GC 根，两次确定性崩溃——
-`MarkCompact::MarkRoots` 里 `SIGSEGV`、`ThreadList::SuspendAllInternal` 里空指针。
+选 1 的实测结果很糟：进程内改 ART 结构会破坏 GC 根，
+两次确定性崩溃——`MarkCompact::MarkRoots` 里 `SIGSEGV`、
+`ThreadList::SuspendAllInternal` 里空指针。
 外部进程写没事，进程内写必崩，因为写入时 ART 线程没被挂起。
 
-所以本模块选 2。检测器调 `process_vm_readv` 读内存时，返回给它的字节由我们决定；
-它自己走一遍链表，数出来就是干净的数。**ART 完全不知情，别的模块的 hook 也不受影响。**
+所以优先选 2：检测器读内存时把干净字节交给它，
+真实结构与 GC 完全不知情，别的模块的 hook 也不受影响。
+libc/libart 的 CRC 校验、匿名可执行段、Inline Hook 扫描都是这么过的。
 
----
+**但这个办法不是万能的。** ClassLoader 计数就是一个反例，
+它不经过任何可拦截的读路径，详见下面的实测结果一节。
 
 ## 关键难点：时机
 
@@ -52,33 +56,6 @@ Android 上的 LSPosed 模块：把 Hook / 注入留下的痕迹，在**运行�
 本模块枚举重定位项，只读页也照写。
 
 ---
-
-## ClassLoader 计数是怎么被"看小"的
-
-这一项最难，值得单独说明，因为它暴露了一个反直觉的点：**光伪造链表头没用**。
-
-检测器的遍历逻辑是：
-
-```
-a = head->next ; b = head->prev       读 head 的前 16 字节
-c1 = walk(a, +8)                      沿一个方向走到回到 head
-c2 = walk(b, +0)                      沿另一个方向走
-count = max(c1, c2)                   取最大值
-```
-
-它读的是链上**每一个真实节点**的 `next`。所以：
-
-1. 只伪造 `head` 那 0x40 字节 → 它从第二个节点开始读到的就是真实 `next`，照样走完整条链。实测 `calls=1310` 而 `hits` 只有 10。
-2. 只让一个方向在 KEEP 步闭合 → 另一个方向仍走真链，`max(4, 20) = 20`，照样判风险。
-3. 预扫描只能找到"当时已闭合"的链 → 检测器实际会读到没被登记的 `head`（实测出现过第三条链），它一旦选中那条，前面所有工作白做。
-
-所以最终做法是三件事一起：
-
-- 按**真实节点地址**逐个覆盖 `prev/next`，让链表在 4 步内双向闭合；
-- 超出闭合环的节点，两个方向都直接指回 `head`；
-- 在 `process_vm_readv` 包装里做「读到即识别」：按检测器自己的判据（`X` 的两个半区 `a`/`b`，读 `a+8` 得 `X` 且读 `b` 得 `X`）动态识别未预扫到的链表头并补登记。注意检测器读 `head` 是分两次 8 字节，必须按地址把两个半区拼起来判。
-
-整个过程**真实内存一个字节没改**，ART 与 GC 完全不受影响。
 
 ## 实测结果
 
