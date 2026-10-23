@@ -49,6 +49,15 @@ python3 "$ROOT/tools/make_manifest.py" "$STAGE/AndroidManifest.xml"
 
 echo "==> [5/6] 打包"
 cp "$DEX/classes.dex" "$STAGE/classes.dex"
+
+# 新版 LSPosed 用 META-INF/xposed/module.prop 判断"这是不是一个完整模块"。
+# 只给旧式的 assets/xposed_init + manifest meta-data 时，部分框架版本会把
+# 模块当成非完整模块跳过。两套声明并存：旧框架读 assets/xposed_init，
+# 新框架读 module.prop，互不影响。
+mkdir -p "$STAGE/META-INF/xposed"
+printf 'minApiVersion=53\ntargetApiVersion=93\nstaticScope=false\n' \
+    > "$STAGE/META-INF/xposed/module.prop"
+cp "$ROOT/app/src/main/assets/xposed_init" "$STAGE/META-INF/xposed/java_init.list"
 cp -r "$ROOT/app/src/main/assets" "$STAGE/assets"
 # native_init 已在 assets/ 里（由上面 cp -r assets 带入）
 
