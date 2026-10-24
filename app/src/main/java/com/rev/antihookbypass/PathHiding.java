@@ -60,12 +60,24 @@ final class PathHiding {
          * （IllegalArgumentException: Do not allow hooking inner methods），
          * 所以能拦的正路就是这里。
          */
+        /*
+         * 顺序很重要：先原地改写，再装钩子。
+         *
+         * 钩子（尤其 Field.get）会改写反射读到的值。
+         * 如果先装钩子，scrub 自己读字段时拿到的是被钩子换过的干净值，
+         * 就会认为"这个字段不含本模块路径"，一条都不改 ——
+         * 实测症状就是"原地改写零条日志，toString 仍带路径"。
+         */
+        scrubAllLoaders();
+        detachFromThreads();
+
         hookLdLibraryPath();
         hookToString("dalvik.system.DexPathList");
         hookToString("dalvik.system.BaseDexClassLoader");
         hookToString("java.lang.ClassLoader");
         hookFieldGet();
         hookActualClassToString();
+        hookStringConcat();
         /*
          * 这里曾经试图给 BaseDexClassLoader / ClassLoader 的**所有方法**
          * 挂返回值 scrub，想一网打尽。实测不可行，已撤：
@@ -76,8 +88,6 @@ final class PathHiding {
          *
          * 结论：整类拦截代价不可控，只能针对具体方法。
          */
-        scrubAllLoaders();
-        detachFromThreads();
         if (com.rev.antihookbypass.ExpFlags.UIPEEK) {
             selfCheckAll();
         }
@@ -140,12 +150,35 @@ final class PathHiding {
                     new de.robv.android.xposed.XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
+                            /*
+                             * 必须放行自己人。
+                             *
+                             * 踩过的坑：scrub 自己要用反射读字段，
+                             * 而这里把 Field.get 的返回值换成了 framework.jar，
+                             * 于是 scrub 读到的永远是"已经干净"的值，
+                             * 永远不会进"含本模块路径"的分支 ——
+                             * 表现成"原地改写一条日志都没有"。
+                             *
+                             * 判定：调用栈里出现本类，就说明是自己发起
+                             * 的反射读，直接放行原值。
+                             */
+                            if (selfCalling()) return;
                             scrubResult(param);
                         }
                     });
         } catch (Throwable t) {
             HookEntry.log("PathHiding Field.get 跳过: " + t);
         }
+    }
+
+    /** 当前调用栈里是否有本类自己的帧。 */
+    private static boolean selfCalling() {
+        StackTraceElement[] st = new Throwable().getStackTrace();
+        for (StackTraceElement e : st) {
+            String cn = e.getClassName();
+            if (cn != null && cn.startsWith("com.rev.antihookbypass.")) return true;
+        }
+        return false;
     }
 
     private static void scrubResult(de.robv.android.xposed.XC_MethodHook.MethodHookParam param) {
@@ -274,9 +307,18 @@ final class PathHiding {
                     Object v = f.get(cl);
                     if (isStr) {
                         if (v instanceof String && ((String) v).contains(SELF)) {
-                            f.set(cl, REPLACE);
-                            HookEntry.log("SELFCL 抹除字段 " + nm + " @" + c.getSimpleName());
-                            changed++;
+                            /*
+                             * 原地改写，不 set 字段。
+                             *
+                             * 换引用没用：ART 把读这个 final 字段内联成了
+                             * 直接引用那个 String 对象，换引用改不到内联处。
+                             * 改对象内容才两边一致。
+                             */
+                            if (rewriteStringInPlace((String) v)) {
+                                HookEntry.log("SELFCL 原地改写字段 " + nm
+                                        + " @" + c.getSimpleName());
+                                changed++;
+                            }
                         }
                     } else if (v instanceof java.io.File) {
                         if (((java.io.File) v).getPath().contains(SELF)) {
@@ -440,10 +482,7 @@ final class PathHiding {
                  * 于是这条路径一直留着。
                  */
                 if (e instanceof String && ((String) e).contains(SELF)) {
-                    try {
-                        ((java.util.List) lst).set(i, REPLACE);
-                        changed[0]++;
-                    } catch (Throwable ignored) { }
+                    if (rewriteStringInPlace((String) e)) changed[0]++;
                 } else if (e instanceof java.io.File
                         && ((java.io.File) e).getPath().contains(SELF)) {
                     try {
@@ -462,8 +501,7 @@ final class PathHiding {
                 for (int i = 0; i < arr.length && budget[0] > 0; i++) {
                     Object e = arr[i];
                     if (e instanceof String && ((String) e).contains(SELF)) {
-                        arr[i] = REPLACE;
-                        changed[0]++;
+                        if (rewriteStringInPlace((String) e)) changed[0]++;
                     } else if (e instanceof java.io.File
                             && ((java.io.File) e).getPath().contains(SELF)) {
                         arr[i] = new java.io.File(REPLACE);
@@ -485,8 +523,7 @@ final class PathHiding {
                 Object v;
                 try { v = m.get(k); } catch (Throwable t) { continue; }
                 if (v instanceof String && ((String) v).contains(SELF)) {
-                    try { ((java.util.Map) m).put(k, REPLACE); changed[0]++; }
-                    catch (Throwable ignored) { }
+                    if (rewriteStringInPlace((String) v)) changed[0]++;
                 } else if (v != null) {
                     scrubDeep0(v, seen, budget, changed, depth + 1);
                 }
@@ -534,8 +571,7 @@ final class PathHiding {
                     Object v = f.get(o);
                     if (v instanceof String) {
                         if (((String) v).contains(SELF)) {
-                            f.set(o, REPLACE);
-                            changed[0]++;
+                            if (rewriteStringInPlace((String) v)) changed[0]++;
                         }
                     } else if (v instanceof java.io.File) {
                         if (((java.io.File) v).getPath().contains(SELF)) {
@@ -757,6 +793,13 @@ final class PathHiding {
             }
         }
         HookEntry.log("SELFCL 实例总数=" + total + " 仍带路径=" + bad);
+        /* 把本模块那个 ClassLoader 的 toString 全文打出来，确认实际内容 */
+        try {
+            ClassLoader mine = PathHiding.class.getClassLoader();
+            String t = String.valueOf(mine);
+            HookEntry.log("SELFCL 全文 " + (t.length() > 260
+                    ? t.substring(0, 260) : t));
+        } catch (Throwable ignored) { }
         /* 把带路径那个实例的 module 字段逐层扒开，看清路径真正存在哪 */
         for (ClassLoader cl : all) {
             if (cl != null && String.valueOf(cl).contains(SELF)) {
@@ -767,6 +810,130 @@ final class PathHiding {
     }
 
 
+
+
+    /*
+     * ---------------------------------------------------------------
+     * 就地改写 String 内部字节
+     * ---------------------------------------------------------------
+     *
+     * 这是本轮最关键的发现，绕过了 JIT 常量内联。
+     *
+     * 前面查明：o1.a / o1.e 两个 final String 字段 set 成功了，
+     * get 出来确实是 framework.jar，但 toString 仍输出原 base.apk 路径。
+     * 原因是 ART 把「读这个 final 字段」内联成了「直接引用那个 String 对象」——
+     * 注意它内联的是<b>对象引用</b>，不是字面量。
+     *
+     * 由此得出正确解法：**不换引用，只换那个对象的内部字节**。
+     * 字段仍指向原对象，内联处也指向同一对象，
+     * 但对象的内容已经是新字符串 —— 两边读出来一致，都是干净的。
+     *
+     * 长度必须严格相等，所以替换词都选等长的：
+     *     antihookbypass      (14) -> androidruntime       (14)
+     *     libantihook_bypass.so (21) -> libandroid_runtime.so (21)
+     *
+     * java.lang.String 在 Android 9+ 用 compact string：
+     * 内部是 byte[] value + byte coder（0=LATIN1，1=UTF16）。
+     * 纯 ASCII 路径 coder=0，改 byte[] 即可。老系统是 char[]，也一并处理。
+     *
+     * 改完要把缓存的 hash 清零，否则后续 hashCode()/HashMap 查找会不一致。
+     */
+    private static final String SELF_SHORT = "antihookbypass";
+    private static final String REPL_SHORT = "androidruntime";
+    private static final String SELF_SO = "libantihook_bypass.so";
+    private static final String REPL_SO = "libandroid_runtime.so";
+
+    static boolean rewriteStringInPlace(String s) {
+        if (s == null || !s.contains(SELF_SHORT)) return false;
+        /*
+         * 走 JNI。
+         *
+         * Java 反射在这里完全走不通：String.value 是 hidden API，
+         * getDeclaredField("value") 直接抛
+         *     NoSuchFieldException: No field value in class Ljava/lang/String;
+         * 而 JNI 的 GetFieldID 不受 hiddenapi 政策拦截。
+         */
+        try {
+            return NativeLayer.nativeRewriteString(s);
+        } catch (Throwable t) {
+            HookEntry.log("SELFCL 原地改写失败: " + t);
+            return false;
+        }
+    }
+
+    /** 清掉缓存的 hash，避免改写后 hashCode 与内容不一致。 */
+    private static void resetStringHash(String s) {
+        try {
+            java.lang.reflect.Field hf = String.class.getDeclaredField("hash");
+            hf.setAccessible(true);
+            hf.setInt(s, 0);
+        } catch (Throwable ignored) { }
+    }
+
+
+    /**
+     * 拦截字符串拼接的出口。
+     *
+     * <h2>为什么盯这里</h2>
+     * 决定性事实链：
+     * <ol>
+     *   <li>{@code o1.a} / {@code o1.e} 两个 String 字段读出来已干净</li>
+     *   <li>{@code o1.b} 容器里的 File 元素已换成 framework.jar</li>
+     *   <li>全字段扫描（PRBHIT）找不到任何含本模块路径的 String 字段</li>
+     *   <li>但 {@code toString()} 仍输出原 base.apk 路径</li>
+     * </ol>
+     * 说明那段路径是<b>拼接时现造</b>的，不在任何字段里。
+     *
+     * 既然它是拼出来的，拦拼接的出口即可 —— 不管上层怎么拼、
+     * 拼在哪个类里，最终都要经过 StringBuilder.toString 或 String.concat。
+     *
+     * <h2>为什么必须放行自己</h2>
+     * 这些方法被全进程高频调用，钩子内部若再触发改名会递归。
+     * {@link #selfCalling()} 保证只有外部调用被处理。
+     */
+    private static void hookStringConcat() {
+        try {
+            de.robv.android.xposed.XposedBridge.hookAllMethods(
+                    StringBuilder.class, "toString",
+                    new de.robv.android.xposed.XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            if (selfCalling()) return;
+                            Object r = param.getResult();
+                            if (r instanceof String && ((String) r).contains(SELF_SHORT)) {
+                                String fixed = String.valueOf(r)
+                                        .replace(SELF_SO, REPL_SO)
+                                        .replace(SELF_SHORT, REPL_SHORT);
+                                param.setResult(fixed);
+                            }
+                        }
+                    });
+            HookEntry.log("PathHiding 已挂 StringBuilder.toString");
+        } catch (Throwable t) {
+            HookEntry.log("PathHiding StringBuilder 跳过: " + t);
+        }
+
+        try {
+            de.robv.android.xposed.XposedBridge.hookAllMethods(
+                    String.class, "concat",
+                    new de.robv.android.xposed.XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            if (selfCalling()) return;
+                            Object r = param.getResult();
+                            if (r instanceof String && ((String) r).contains(SELF_SHORT)) {
+                                String fixed = String.valueOf(r)
+                                        .replace(SELF_SO, REPL_SO)
+                                        .replace(SELF_SHORT, REPL_SHORT);
+                                param.setResult(fixed);
+                            }
+                        }
+                    });
+            HookEntry.log("PathHiding 已挂 String.concat");
+        } catch (Throwable t) {
+            HookEntry.log("PathHiding String.concat 跳过: " + t);
+        }
+    }
 
     /**
      * 把所有线程的 contextClassLoader 里指向本模块的那个摘掉。

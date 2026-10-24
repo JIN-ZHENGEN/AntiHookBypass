@@ -3807,6 +3807,124 @@ static int l3_trim_when_settled(void) {
  * nativeSanitizeRuntime 更早。检测器通常 1 秒内完成扫描，
  * 越早装上视图越稳。
  */
+
+/* ================================================================== */
+/* 原地改写 String 内部字节（走 JNI，绕开 hidden API）                   */
+/* ================================================================== */
+/*
+ * 为什么必须走 JNI 而不是 Java 反射
+ * --------------------------------
+ * Java 侧 `String.class.getDeclaredField("value")` 在本机直接抛：
+ *     NoSuchFieldException: No field value in class Ljava/lang/String;
+ * 这是 hidden API 政策在拦 —— java.lang 核心类的私有字段对反射不可见。
+ *
+ * 而 JNI 的 GetFieldID 走 native 路径，不做 hiddenapi 检查。
+ * 这条通道是解这个问题的唯一正路。
+ *
+ * 为什么需要改写而不是换引用
+ * ------------------------
+ * ART 会把「读某个 final 字段」内联成「直接引用那个 String 对象」。
+ * 换引用改不到内联处，所以只能改对象自己的字节。
+ *
+ * 长度必须严格相等：
+ *     antihookbypass        (14) -> androidruntime         (14)
+ *     libantihook_bypass.so (21) -> libandroid_runtime.so  (21)
+ *
+ * 调用方拿到的仍是同一个 String 对象、同一个引用，
+ * 但内容已经换成中性包名，任何读法（反射、toString、ptrace 读内存）
+ * 看到的都是一致的干净值。
+ */
+static int ahb_patch_bytes(unsigned char *b, int n, int is_wide) {
+    static const char from[] = "antihookbypass";
+    static const char to[]   = "androidruntime";
+    static const char fromso[] = "libantihook_bypass.so";
+    static const char toso[]   = "libandroid_runtime.so";
+    int step = is_wide ? 2 : 1;
+    int hits = 0;
+    int i;
+
+    if (n < (int)sizeof(from)) return 0;
+
+    /* 先处理更长的 so 名，避免被短串替换打断 */
+    for (i = 0; i + (int)sizeof(fromso) - 1 <= n; i += step) {
+        int k, ok = 1;
+        for (k = 0; k < (int)sizeof(fromso) - 1; k++) {
+            unsigned char c = b[i + k * step];
+            if (c != (unsigned char)fromso[k]) { ok = 0; break; }
+        }
+        if (!ok) continue;
+        for (k = 0; k < (int)sizeof(toso) - 1; k++) {
+            /* 只写低字节，宽字符的高字节保持 0 */
+            b[i + k * step] = (unsigned char)toso[k];
+        }
+        hits++;
+    }
+    for (i = 0; i + (int)sizeof(from) - 1 <= n; i += step) {
+        int k, ok = 1;
+        for (k = 0; k < (int)sizeof(from) - 1; k++) {
+            unsigned char c = b[i + k * step];
+            if (c != (unsigned char)from[k]) { ok = 0; break; }
+        }
+        if (!ok) continue;
+        for (k = 0; k < (int)sizeof(to) - 1; k++) {
+            b[i + k * step] = (unsigned char)to[k];
+        }
+        hits++;
+    }
+    return hits;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_rev_antihookbypass_NativeLayer_nativeRewriteString(JNIEnv *env, jclass cls,
+                                                            jstring js) {
+    jclass sc;
+    jfieldID fid;
+    int hits = 0;
+
+    (void)cls;
+    if (!js) return JNI_FALSE;
+    sc = (*env)->FindClass(env, "java/lang/String");
+    if (!sc) { (*env)->ExceptionClear(env); return JNI_FALSE; }
+
+    /* Android 9+ compact string：byte[] value */
+    fid = (*env)->GetFieldID(env, sc, "value", "[B");
+    if (fid) {
+        jbyteArray arr = (jbyteArray)(*env)->GetObjectField(env, js, fid);
+        if (arr) {
+            jsize n = (*env)->GetArrayLength(env, arr);
+            jbyte *buf = (*env)->GetByteArrayElements(env, arr, NULL);
+            if (buf) {
+                hits += ahb_patch_bytes((unsigned char *)buf, (int)n, 0);
+                (*env)->ReleaseByteArrayElements(env, arr, buf, 0);
+            }
+        }
+    } else {
+        (*env)->ExceptionClear(env);
+        /* 老系统：char[] value */
+        fid = (*env)->GetFieldID(env, sc, "value", "[C");
+        if (!fid) { (*env)->ExceptionClear(env); return JNI_FALSE; }
+        {
+            jcharArray arr = (jcharArray)(*env)->GetObjectField(env, js, fid);
+            if (arr) {
+                jsize n = (*env)->GetArrayLength(env, arr);
+                jchar *buf = (*env)->GetCharArrayElements(env, arr, NULL);
+                if (buf) {
+                    hits += ahb_patch_bytes((unsigned char *)buf, (int)n, 1);
+                    (*env)->ReleaseCharArrayElements(env, arr, buf, 0);
+                }
+            }
+        }
+    }
+
+    /* 清掉缓存的 hash，避免改写后 hashCode 与内容不一致 */
+    if (hits > 0) {
+        jfieldID hf = (*env)->GetFieldID(env, sc, "hash", "I");
+        if (hf) (*env)->SetIntField(env, js, hf, (jint)0);
+        else (*env)->ExceptionClear(env);
+    }
+    return hits > 0 ? JNI_TRUE : JNI_FALSE;
+}
+
 JNIEXPORT void JNICALL
 Java_com_rev_antihookbypass_NativeLayer_nativeEarlyInit(JNIEnv *env, jclass cls) {
     (void)env; (void)cls;

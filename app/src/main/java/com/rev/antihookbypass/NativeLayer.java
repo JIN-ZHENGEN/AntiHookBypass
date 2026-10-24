@@ -32,6 +32,16 @@ final class NativeLayer {
     private static native int nativeSanitizeRuntime(int ops);
 
     /**
+     * 就地改写 String 内部字节：antihookbypass -> androidruntime（等长）。
+     *
+     * <p>走 JNI 而不是 Java 反射，因为 {@code String.value} 是 hidden API，
+     * 反射会抛 {@code NoSuchFieldException}；JNI 的 GetFieldID 不受该政策拦截。
+     *
+     * @return 是否真的改写到了内容
+     */
+    static native boolean nativeRewriteString(String s);
+
+    /**
      * 显式早初始化。
      *
      * <p>为什么需要这个而不是靠 JNI_OnLoad：实测本模块由 LSPosed 加载时
