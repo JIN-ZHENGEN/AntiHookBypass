@@ -1981,6 +1981,7 @@ static int maps_patch_got_all_locked(void) {
 static int g_libview_fd = -1;
 static char g_libview_path[AHB_PATH_MAX];
 static int g_libview_busy = 0;
+static struct timespec g_libview_t0;
 
 int ahb_libview_fd_for(const char *path) {
     char *raw = NULL;
@@ -2019,27 +2020,69 @@ int ahb_libview_fd_for(const char *path) {
     }
 
     mfd = (int)syscall(SYS_memfd_create, "ahb-libview", 0);
+    clock_gettime(CLOCK_MONOTONIC, &g_libview_t0);
     if (mfd < 0) { syscall(SYS_close, sfd); g_libview_busy = 0; return -1; }
 
     /*
-     * 直接写"内存内容"，不做磁盘拷贝。
+     * 必须先把整个文件内容填进去，再覆盖映射段。
      *
-     * 设计要点：这个视图的用途就是"让磁盘看起来等于内存"，
-     * 所以每个映射段直接 pwrite 内存里的字节即可 —— 既不需要先
-     * pread 磁盘内容，也不需要逐页比对"哪里不同"。
+     * 这一步不能省。教训：曾经为省时间把 memfd 做成稀疏文件、
+     * 只写 maps 里实际映射的段，未映射区域全是 0 —— 结果检测器
+     * 按 ELF 结构去读时直接报 "ELF 解析失败: bad offset 0"，
+     * 那一项从 SAFE 变回 RISK。
      *
-     * 实测依据：v2.6 的写回量是 36864 字节，而 libart.so 整个文件
-     * 有 23MB。之前按"整文件拷贝 + 逐页比对差异"实现，每启动一次
-     * 要搬 23MB（读+写 46MB），实测拖慢 400ms，纯属自己给自己加戏。
+     * 原因：一个 .so 在 maps 里只映射 PT_LOAD 段，而 ELF 结构里
+     * 还有 section header table、符号表、字符串表、.comment 等区域
+     * 并不出现在 maps 中，但检测器解析 ELF 时需要读到它们。
+     * 只写映射段，这些区域就是 0，解析必挂。
      *
-     * 现在：ftruncate 成稀疏文件（瞬间，不占物理页），
-     * 只把 maps 里实际映射的段写进去（通常 8-12MB，一次 pwrite 每段），
-     * 未映射的区域保持稀疏 0 —— 检测器按段校验，不会读到那里。
+     * 用 copy_file_range 让内核直接把文件内容搬进 memfd（不进用户态），
+     * 再把映射段覆盖成内存内容。整份 23MB 的拷贝成本放在后台预热里，
+     * 不占检测器的扫描窗口。
      */
     if (syscall(SYS_ftruncate, mfd, (long long)fsize) != 0) {
         syscall(SYS_close, mfd); syscall(SYS_close, sfd);
         g_libview_busy = 0;
         return -1;
+    }
+
+    /* 先整份拷进来，保证 ELF 结构完整可解析 */
+    {
+        off_t in_off = 0, out_off = 0;
+        size_t left = fsize;
+        while (left > 0) {
+            ssize_t r = syscall(SYS_copy_file_range, sfd, &in_off, mfd, &out_off,
+                                left, 0);
+            if (r > 0) { left -= (size_t)r; continue; }
+            break;
+        }
+        if (left > 0) {
+            /* copy_file_range 不可用时退回 pread+pwrite */
+            unsigned char *tmp = (unsigned char *)malloc(1 << 20);
+            if (!tmp) {
+                syscall(SYS_close, mfd); syscall(SYS_close, sfd);
+                g_libview_busy = 0;
+                return -1;
+            }
+            while (left > 0) {
+                size_t want = (left < (1u << 20)) ? left : (1u << 20);
+                ssize_t r = syscall(SYS_pread64, sfd, tmp, want,
+                                    (long long)(fsize - left));
+                if (r <= 0) break;
+                {
+                    size_t put = 0;
+                    while (put < (size_t)r) {
+                        ssize_t w = syscall(SYS_pwrite64, mfd, tmp + put,
+                                            (size_t)r - put,
+                                            (long long)(fsize - left + put));
+                        if (w <= 0) break;
+                        put += (size_t)w;
+                    }
+                }
+                left -= (size_t)r;
+            }
+            free(tmp);
+        }
     }
 
     n = maps_read_all(&raw, &cap);
@@ -2055,10 +2098,6 @@ int ahb_libview_fd_for(const char *path) {
                 sscanf(line, "%llx-%llx %7s %llx", &lo, &hi, perm, &off) == 4) {
                 size_t seg = (size_t)(hi - lo);
                 if (seg > 0 && off < fsize && off + seg <= fsize) {
-                    /*
-                     * 一次 pwrite 写整段。pwrite 会阻塞到写完，
-                     * 单次几 MB 在这个场景下是几十毫秒量级。
-                     */
                     size_t put = 0;
                     while (put < seg) {
                         size_t chunk = (seg - put < (4 << 20)) ? (seg - put) : (4 << 20);
@@ -2088,7 +2127,12 @@ int ahb_libview_fd_for(const char *path) {
     if (g_libview_fd >= 0) syscall(SYS_close, g_libview_fd);
     g_libview_fd = mfd;
     snprintf(g_libview_path, sizeof(g_libview_path), "%s", path);
-    ahb_filelog("LIBVIEW ready %s size=%zu", path, fsize);
+    struct timespec _t1;
+    long _ms;
+    clock_gettime(CLOCK_MONOTONIC, &_t1);
+    _ms = (_t1.tv_sec - g_libview_t0.tv_sec) * 1000 +
+          (_t1.tv_nsec - g_libview_t0.tv_nsec) / 1000000;
+    ahb_filelog("LIBVIEW ready %s size=%zu cost=%ldms", path, fsize, _ms);
 
     {
         int out = dup(g_libview_fd);
