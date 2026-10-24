@@ -23,6 +23,27 @@
 #ifndef AHB_MAPS_HIDE_H
 #define AHB_MAPS_HIDE_H
 
+/*
+ * 开发开关：只有 /data/local/tmp/ahb_verbose 存在时才允许写任何文件。
+ *
+ * 默认关闭意味着模块在目标进程里**零文件写入** —— 不产生日志、
+ * 不产生 dump、不产生结果快照，目标 App 扫描自己的私有目录看不到任何异物。
+ *
+ * 用真实 syscall，避免经过我们自己接管过的 access/stat 包装。
+ */
+static int ahb_dev_writes_allowed(void);
+static int ahb_dev_writes_allowed(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    {
+        long r = syscall(SYS_faccessat, AT_FDCWD, "/data/local/tmp/ahb_verbose",
+                         F_OK, 0);
+        cached = (r == 0) ? 1 : 0;
+    }
+    return cached;
+}
+
+
 #include <link.h>
 #include <signal.h>
 
@@ -702,8 +723,16 @@ static int maps_make_clean_fd(void) {
      * 诊断 dump：只在指纹变化时写一次，且最多 4 次。
      * 用真实 syscall 打开，避免经过自己的包装。
      */
-    if (g_maps_filtered <= 4) {
-        /* 写到本进程自己的数据目录：app 身份写不了 /data/local/tmp */
+    if (g_maps_filtered <= 4 && ahb_dev_writes_allowed()) {
+        /*
+         * 只有在开发开关打开时才落盘。
+         *
+         * 这是审查揪出来的一处痕迹：默认把 maps 过滤结果写进
+         * 目标 App 自己的 files/ 目录，文件名还带着 maps_filtered。
+         * 对方只要 listFiles() 扫一眼自己的私有目录就能发现。
+         *
+         * 现在默认一个字节都不写；开关不存在时这段整个跳过。
+         */
         char dpath[256];
         char cmd[128] = {0};
         int cf = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/cmdline", O_RDONLY, 0);

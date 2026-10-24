@@ -188,6 +188,39 @@ Vulkan 初始化直接 abort——系统库对这几个函数有自己的假设�
 
 **代价**：零。持有 inline hook 的模块不再受影响；挂 Java 方法的一直不受影响。
 
+### 默认不碰目标应用自己的方法
+
+早前有一个"结果观察器"，它按「类里有 native 方法」的形状挂钩，
+把检测器的判定结果原样记下来方便核对。
+
+这个设计有严重副作用：它挂的是**目标应用自己的方法**。
+对自带反 Hook 的应用（例如 hunter），后果是双重的：
+
+1. 它的 antiXposed 检查（读方法是否被 hook 过）直接命中，于是走反制；
+2. 挂钩破坏了 native 调用契约，进程 SIGSEGV，或触发 ART
+   `jit_code_cache.cc` 的 zombie code 断言而 abort。
+
+实测证据：
+
+```
+F er_main_process: jit_code_cache.cc:1309] Check failed: !ContainsElement(zombie_code_, code_ptr)
+Zygote: Process 25927 exited due to signal 6 (Aborted)
+```
+
+现在它默认**不安装**，只有 `/data/local/tmp/ahb_verbose` 存在时才装。
+隐藏痕迹本身不需要它（那是 native 层做的），生产路径必须关掉。
+
+同时保留一条对照结论：把各层全关（`none`）后，hunter 依然给出同一个
+JIT 断言 —— 说明那个崩溃不是本模块的层造成的，是它与注入环境本身的
+交互问题，需要另行处理。
+
+### 默认不往目标应用目录写任何文件
+
+模块运行在目标应用的进程里，任何落盘文件都出现在**它自己的私有目录**中。
+对方只要 `listFiles()` 扫一眼就能看到 `ahb_native.log` 这类异物。
+所以默认做到零文件写入，只在开发开关打开时落盘；升级后会主动删除
+历史版本遗留在目标目录里的本模块文件（只删自己的，不碰用户数据）。
+
 ### 这个视图必须让整个文件都能解析
 
 第一版实现为省时间，把 memfd 做成稀疏文件、只写入 maps 里实际映射的段。

@@ -38,6 +38,59 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     static final String TAG = "AntiHookBypass";
 
+    /**
+     * 开发开关：只有 /data/local/tmp/ahb_verbose 存在时才允许往磁盘写任何东西。
+     *
+     * <p>存在的意义：模块运行在目标 App 的进程里，任何落盘文件都出现在
+     * 目标 App 自己的私有目录中。对方只要 {@code listFiles()} 扫一眼
+     * 就能看到 {@code ahb_native.log}、{@code ahb_verdict.json}、
+     * {@code maps_filtered} 这类异物 —— 这比类名特征更直接。
+     *
+     * <p>所以默认路径必须做到<b>零文件写入</b>，只在开发调试时由
+     * shell 手动建这个开关文件才落盘。
+     */
+    static boolean devWritesAllowed() {
+        try {
+            return new java.io.File("/data/local/tmp/ahb_verbose").exists();
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * 清理历史遗留痕迹。
+     *
+     * <p>早期版本会把日志和取证文件写进目标 App 的私有目录，
+     * 已经落下的文件不会因为新版本改了默认行为就消失。这里在启动时
+     * 主动删掉本模块自己的产物 —— 只删文件名匹配的项，不碰任何用户数据。
+     *
+     * <p>开发开关打开时不清理，方便调试。
+     */
+    static void purgeOwnTraces(android.content.Context ctx) {
+        if (ctx == null || devWritesAllowed()) return;
+        java.io.File[] dirs = new java.io.File[] {
+                ctx.getFilesDir(), ctx.getCacheDir(), ctx.getDir("ahb", 0)
+        };
+        for (java.io.File d : dirs) {
+            if (d == null) continue;
+            java.io.File[] list = d.listFiles();
+            if (list == null) continue;
+            for (java.io.File f : list) {
+                if (f == null) continue;
+                String n = f.getName();
+                if (n == null) continue;
+                boolean mine = n.startsWith("ahb_native")
+                        || n.equals("ahb_verdict.json")
+                        || n.equals("ahb.log")
+                        || n.equals("maps_filtered");
+                if (mine && f.isFile()) {
+                    // 删除失败不抛，下一次启动还会再试
+                    f.delete();
+                }
+            }
+        }
+    }
+
     private static volatile boolean installed = false;
 
     @Override
@@ -52,6 +105,57 @@ public class HookEntry implements IXposedHookLoadPackage {
         }
 
         log("装载配置: " + ModuleConfig.describe());
+
+        /*
+         * 启动即清理本模块自己的历史遗留文件。
+         *
+         * 这件事必须做：老版本把日志写进了目标 App 的 files/ 目录，
+         * 那些文件不会因为新版本改了默认行为而自己消失。
+         * 只删本模块自己的产物，不碰任何用户数据。
+         */
+        try {
+            Context appCtx = null;
+            try {
+                Application app = (Application) Class
+                        .forName("android.app.AndroidAppHelper")
+                        .getMethod("currentApplication")
+                        .invoke(null);
+                appCtx = app;
+            } catch (Throwable ignored) { }
+            if (appCtx == null) {
+                try {
+                    Object at = Class.forName("android.app.ActivityThread")
+                            .getMethod("currentActivityThread").invoke(null);
+                    Object app = at.getClass()
+                            .getMethod("getApplication").invoke(at);
+                    if (app instanceof Context) appCtx = (Context) app;
+                } catch (Throwable ignored) { }
+            }
+            purgeOwnTraces(appCtx);
+            /*
+             * 备用路径：拿不到 Context 时直接按包名拼数据目录。
+             * 目标进程里 dataDir 一定存在，这条兜底不会白跑。
+             */
+            if (appCtx == null && lpparam.appInfo != null) {
+                String dd = lpparam.appInfo.dataDir;
+                if (dd != null) {
+                    java.io.File base = new java.io.File(dd, "files");
+                    java.io.File[] list = base.listFiles();
+                    if (list != null) {
+                        for (java.io.File f : list) {
+                            if (f == null) continue;
+                            String n = f.getName();
+                            if (n == null) continue;
+                            boolean mine = n.startsWith("ahb_native")
+                                    || n.equals("ahb_verdict.json")
+                                    || n.equals("ahb.log")
+                                    || n.equals("maps_filtered");
+                            if (mine && f.isFile()) f.delete();
+                        }
+                    }
+                }
+            }
+        } catch (Throwable ignored) { }
 
         /*
          * 最先装 native 层，再装 Java 层。
@@ -74,8 +178,28 @@ public class HookEntry implements IXposedHookLoadPackage {
 
         /*
          * 判定取证：只读记录检测器自己的判定 JSON，不修改任何返回值。
+         *
+         * 默认<b>不安装</b>，只在开发开关打开时安装。
+         *
+         * 原因是一次实测事故：这个观察器按「类里有 native 方法」的形状挂钩，
+         * 而它挂的是<b>目标应用自己的方法</b>。对 hunter 这类自带反 Hook 的
+         * 应用，后果是双重的：
+         *
+         *   1. 它的 antiXposed 检查（"ChooseUtils.choose get Xposed hook
+         *      item == null"）直接命中，于是走反制；
+         *   2. 挂钩破坏了 native 调用契约，进程 SIGSEGV，或触发 ART
+         *      jit_code_cache.cc 的 zombie code 断言而 abort。
+         *
+         * 实测证据：进程以 signal 6 (Aborted) 退出并打印
+         *   Check failed: !ContainsElement(zombie_code_, code_ptr)
+         * 另一个进程以 signal 11 (SEGV_MAPERR) 崩在 libhunter.so。
+         *
+         * 更根本的问题是它属于「接管」：为了观察而改写别人方法的调用路径。
+         * 隐藏痕迹本身不需要它（那是 native 层做的），所以生产路径必须关掉。
          */
-        installVerdictProbe(lpparam.classLoader, lpparam);
+        if (devWritesAllowed()) {
+            installVerdictProbe(lpparam.classLoader, lpparam);
+        }
 
         boolean l1Trace = false, l1Kill = false, l1Crash = false;
 
@@ -209,6 +333,7 @@ public class HookEntry implements IXposedHookLoadPackage {
                                      * 全靠猜，还出现过把残缺 JSON 当结论的事故。
                                      */
                                     try {
+                                      if (devWritesAllowed()) {
                                         String dir = null;
                                         try {
                                             android.app.Application app =
@@ -225,6 +350,7 @@ public class HookEntry implements IXposedHookLoadPackage {
                                         java.io.FileOutputStream fo = new java.io.FileOutputStream(f);
                                         fo.write(j.getBytes("UTF-8"));
                                         fo.close();
+                                      }
                                     } catch (Throwable te) { /* 取证失败不影响主流程 */ }
                                     for (int i = 0; i < j.length(); i += 180) {
                                         log("VERDICT " + cn + "." + m.getName() + " ["
