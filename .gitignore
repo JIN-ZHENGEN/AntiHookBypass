@@ -1,16 +1,30 @@
+# 构建产物
 build/
+hdex/
+
+# 排查期间的临时日志与抓取文件
+*.txt
+*.png
+*.bak
+*.apk
+dexs.py
+
+# Python 缓存
+__pycache__/
+tools/__pycache__/
+
+# 签名密钥绝对不入库
+.keys/
 *.jks
 *.keystore
-*.idsig
-__pycache__/
-*.pyc
-.idea/
-*.swp
-*.bak
-*.tmp
-.keys/
 
-# 历史故障快照里的旧签名密钥与安装包：不入公共仓库
-review/**/*.jks
-review/**/*.apk
-build/*.apk
+# 逆向过程遗留的样本件
+q.so
+t.so
+lh.so
+li.so
+h.apk
+mc.bak
+mh.bak
+nm.bak
+nm.bak.c

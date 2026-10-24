@@ -109,6 +109,68 @@ public class HookEntry implements IXposedHookLoadPackage {
             installed = true;
         }
 
+        /*
+         * 第一件事就把 native 层唤醒。
+         *
+         * 顺序依据：检测器通常在进程起来 1 秒内完成扫描，而 native 层
+         * 原来要等 L2 开关流程走到 nativeSanitizeRuntime 才初始化，
+         * 中间隔了好几秒 —— 那段窗口里视图过滤还没装上。
+         * 把它提到这里，让"最早可用的时机"真的是最早。
+         */
+        /*
+         * 不需要 Context。
+         *
+         * 原来这里先取 currentApplication()，取不到就跳过 —— 那是个 bug：
+         * handleLoadPackage 早期 ActivityThread.currentApplication() 常常
+         * 还是 null，于是整段初始化被静默跳过，而且连日志都不留
+         * （异常被 catch 后只在 t 非空时才打）。表现就是"看起来加了初始化
+         * 却完全没生效"。
+         *
+         * 实际 ensureLoaded 只做 System.loadLibrary，根本用不到 Context，
+         * 所以直接调，不要为拿不到的参数放弃整段初始化。
+         */
+        try {
+            NativeLayer.earlyInit(null);
+        } catch (Throwable t) {
+            log("earlyInit 异常: " + t);
+        }
+
+        /*
+         * EXP_NOOP：只保留 LSPosed 的注入，模块本身不做任何事
+         * （不 loadLibrary、不挂 hook、不建视图）。
+         * 用来把"框架注入"与"模块行为"彻底分开：
+         * 如果这样仍然崩，说明目标检测的是 Xposed 框架存在本身。
+         */
+        /*
+         * 隐藏框架 API 的可见性。必须最早做：目标的检测在自己
+         * 进程初始化阶段就会查这些类名，晚一步它已经查到了。
+         */
+        try {
+            ApiHiding.install();
+        } catch (Throwable t) {
+            log("ApiHiding 安装失败: " + t);
+        }
+
+        /* 隐藏本模块在 ClassLoader 文本描述里的路径 */
+        try {
+            PathHiding.install();
+        } catch (Throwable t) {
+            log("PathHiding 安装失败: " + t);
+        }
+
+        if (com.rev.antihookbypass.ExpFlags.UIPEEK) {
+            try {
+                UiPeek.install(lpparam.classLoader);
+            } catch (Throwable t) {
+                log("UiPeek 启动失败: " + t);
+            }
+        }
+
+        if (com.rev.antihookbypass.ExpFlags.NOOP) {
+            log("EXP_NOOP: 模块空转");
+            return;
+        }
+
         log("装载配置: " + ModuleConfig.describe());
 
         /*

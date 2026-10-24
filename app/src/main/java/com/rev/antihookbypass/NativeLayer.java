@@ -32,6 +32,19 @@ final class NativeLayer {
     private static native int nativeSanitizeRuntime(int ops);
 
     /**
+     * 显式早初始化。
+     *
+     * <p>为什么需要这个而不是靠 JNI_OnLoad：实测本模块由 LSPosed 加载时
+     * JNI_OnLoad 与 assets/native_init 声明的 native_init 都不会被调用
+     * （两个函数里的探针一次都没打印，反汇编确认代码在）。
+     * 真正被调用的只有下面那些 JNI 方法本身。
+     *
+     * <p>所以早初始化必须由 Java 侧显式触发一次。用 pthread_once 兜底，
+     * 重复调用无害。
+     */
+    private static native void nativeEarlyInit();
+
+    /**
      * 按需交换 libart 代码段（1=临时换成磁盘字节，0=换回原字节）。
      * 用于"内存 CRC 与文件 CRC 一致"这类判定：只在计算瞬间成立，
      * 其他时刻其他模块的 hook 完好无损。
@@ -66,6 +79,19 @@ final class NativeLayer {
 
     static void markSwapReady() {
         s_swapReady = true;
+    }
+
+    /**
+     * 尽早初始化 native 层，由 HookEntry 在 handleLoadPackage 最开头调用。
+     * 只保证 so 已加载并跑过一次早初始化，不涉及任何具体层开关。
+     */
+    static void earlyInit(Context ctx) {
+        if (!ensureLoaded(ctx)) return;
+        try {
+            nativeEarlyInit();
+        } catch (Throwable t) {
+            HookEntry.log("nativeEarlyInit 异常: " + t);
+        }
     }
 
     static boolean installAndSanitize(Context ctx) {

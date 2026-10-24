@@ -45,6 +45,34 @@
 #include <dlfcn.h>
 #include <time.h>
 
+/* ================================================================== */
+/* 日志开关（全部只有"说话"的区别，零行为差异）                          */
+/* ================================================================== */
+
+/*
+ * AHB_DIAG：排查用探针（SELFCHK/LEAK/CMP/VIEWART/VIEWMNT/WRAPROW/
+ *            WATCH/DLOPEN/NOW/FLDD/SRC 等）。
+ * 交付版必须 0 —— 这些日志会把模块自己的存在写进 logcat，本身就是痕迹。
+ */
+#ifndef AHB_DIAG
+#define AHB_DIAG 0
+#endif
+
+/*
+ * AHB_SAY：运行期确认日志（L3 view / VIEW install / VIEWPROOF / SELFCHECK）。
+ * 这几类每秒几十条，会把模块存在暴露在 logcat 里。
+ * 交付版 0：行为完全不变，只是不再说话。
+ */
+#ifndef AHB_SAY
+#define AHB_SAY 0
+#endif
+
+#if AHB_SAY
+#define AHB_SAYL(...) LOGI(__VA_ARGS__)
+#else
+#define AHB_SAYL(...) do { } while (0)
+#endif
+
 #define LOG_TAG "AntiHookBypass"
 
 /* 诊断落文件：logcat 环形缓冲会被系统高频输出冲掉，证据必须留盘 */
@@ -71,7 +99,7 @@
 #endif
 
 static void ahb_filelog(const char *fmt, ...) {
-#if AHB_DEBUG
+#if AHB_SAY
     char buf[512];
     va_list ap;
     va_start(ap, fmt);
@@ -89,7 +117,14 @@ static void ahb_filelog(const char *fmt, ...) {
  * 关键日志：无论是否开启 AHB_DEBUG 都要输出。
  * 只用于"层是否装上、补丁是否生效、差异多少字节"这类少量节点。
  */
+/*
+ * keylog / filelog 是"确认某件事装上了"的运行期日志。
+ *
+ * 它们不是错误，但每秒几十条，且会把模块存在写进 logcat。
+ * 交付版统一由 AHB_SAY 关掉；排查能力是否生效时改成 1。
+ */
 static void ahb_keylog(const char *fmt, ...) {
+#if AHB_SAY
     char buf[512];
     va_list ap;
     va_start(ap, fmt);
@@ -98,13 +133,46 @@ static void ahb_keylog(const char *fmt, ...) {
     if (n > 0) {
         __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "%s", buf);
     }
+#else
+    (void)fmt;
+#endif
 }
 
 #ifndef AHB_NATIVE_ON
 #define AHB_NATIVE_ON 1
+
+/*
+ * AHB_MINIMAL_VIEW：只装视图过滤，不做任何 ART 结构改写。
+ *
+ * 这个开关是为定位 jit_code_cache 断言而设的实验档：
+ * 保留 maps/smaps/mounts/modules 的视图过滤（修 SIGSEGV 靠它），
+ * 但不调 clv_install_now / clv_start_fast_patch（这两个会遍历并
+ * 改写 ART 的 class_loaders_ 链表，是干扰 JIT 记账的头号嫌疑）。
+ *
+ * 定位完成后应回到 0。
+ */
+#ifndef AHB_MINIMAL_VIEW
+#define AHB_MINIMAL_VIEW 0
+
+/*
+ * EXP_NO_VIEW：关掉视图过滤做对照。
+ * 目的：把"注入本身"与"maps 改写"分开。若关掉后目标不再 abort，
+ * 说明问题出在改写 maps 的内容上（而不是注入这件事）。
+ */
+#ifndef EXP_NO_VIEW
+#define EXP_NO_VIEW 0
+#endif
+#endif
 #endif
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
+/* 入口探针：ERROR 级别 + 独立 tag，避免被 logd 的 per-tag 限流丢掉 */
+#define AHB_ENTRY(tag) do { \
+    for (int _i = 0; _i < 3; _i++) \
+        __android_log_print(ANDROID_LOG_ERROR, "AHBENTRY", "%s pid=%d n=%d", \
+                            tag, (int)getpid(), _i); \
+} while (0)
+
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 /* maps 视图伪造：隐藏注入框架在地址空间里的映射痕迹（见 maps_hide.h） */
@@ -337,6 +405,96 @@ static uintptr_t g_clv_cur_cand;
 static uintptr_t g_clv_cur_cl;
 static void clv_install_now(void);
 static void clv_start_fast_patch(void);
+
+/* 早初始化：定义在文件后段，这里先声明，供前面的 JNI 入口调用 */
+static void ahb_early_init(void);
+static int ahb_neutralize_jvmti(void);
+static int ahb_neutralize_libart_debug(void);
+static void ahb_selfcheck_fd(void);
+/* 这两个包装在 maps_hide.h 里是非 static，可直接调用 */
+ssize_t ahb_readlinkat_wrap(int dirfd, const char *path, char *buf, size_t sz);
+int ahb_fstat_wrap(int fd, void *buf);
+
+/* ELF/ART 诊断码：定义在这里，前面解析代码要用 */
+static volatile int g_libart_diag = 0;    /* 1 无base 2 已断开 3 mprotect失败 4 符号未找到 */
+static volatile int g_elf_diag = 0;       /* 51..60 ELF 解析断点 */
+/*
+ * 刷新指令缓存。
+ *
+ * 这段必须分架构写：本模块要编四个 ABI（arm64-v8a / armeabi-v7a /
+ * x86 / x86_64），寄存器名和缓存维护方式是各自不同的。
+ *
+ * 踩过的坑：最初用 __builtin___clear_cache，编译出的 so 依赖外部符号
+ * __clear_cache，而 bionic 里没有它，于是 System.loadLibrary 直接失败：
+ *
+ *   UnsatisfiedLinkError: dlopen failed: cannot locate symbol "__clear_cache"
+ *
+ * 这个失败还很隐蔽 —— Java 层有 try/catch，界面一切正常，
+ * 只是整个 native 层从未生效。之后若干轮的"修复"全部空跑，
+ * 排查方向被带偏很久。
+ */
+static void ahb_flush_icache(void *addr, size_t len) {
+#if defined(__aarch64__)
+    /*
+     * 这里**绝对不能**用 ARM 私有系统调用 __ARM_NR_cacheflush(0x0F0002)。
+     *
+     * 实测代价：目标 com.zhenxi.hunter 自带 seccomp 过滤器
+     * （它自己的字符串就有 "install_check_arch_seccomp prctl(PR_SET_SECCOMP)"
+     * 和 "hunter seccomp install error"），白名单之外的系统调用会直接
+     * 变成 SIGSYS 杀进程：
+     *
+     *   F libc: Fatal signal 31 (SIGSYS), code 1 (SYS_SECCOMP),
+     *           syscall 983042 in tid ... (er_main_process)
+     *
+     * 983042 正是 0x0F0002。用 svc 发这个号 = 主动往枪口上撞。
+     *
+     * 也不能用 __builtin___clear_cache：它会被编成对 __clear_cache
+     * 的外部调用，而 bionic 里没有这个符号，dlopen 直接失败
+     * （UnsatisfiedLinkError: cannot locate symbol "__clear_cache"），
+     * 整个 native 层静默不生效。
+     *
+     * 所以直接下发硬件缓存维护指令。这里用 .inst 硬编码机器码，
+     * 避免依赖编译器的 -march 是否认识这几条指令：
+     *
+     *   dc cvau, x0   = 0xD50B7B20   （按 VA 清理数据缓存到 PoU）
+     *   dsb ish       = 0xD5033B9F
+     *   ic ivau, x0   = 0xD50B7520   （按 VA 失效指令缓存到 PoU）
+     *   dsb ish       = 0xD5033B9F
+     *   isb           = 0xD5033FDF
+     *
+     * 这些是纯 CPU 指令，不经过内核，seccomp 管不到。
+     */
+    {
+        uintptr_t a = (uintptr_t)addr & ~(uintptr_t)63;
+        uintptr_t e = ((uintptr_t)addr + len + 63) & ~(uintptr_t)63;
+        register uintptr_t p __asm__("x0");
+        for (p = a; p < e; p += 64) {
+            __asm__ __volatile__(
+                ".inst 0xd50b7b20\n\t"   /* dc cvau, x0 */
+                ".inst 0xd5033b9f\n\t"   /* dsb ish     */
+                ".inst 0xd50b7520\n\t"   /* ic ivau, x0 */
+                ".inst 0xd5033b9f\n\t"   /* dsb ish     */
+                ".inst 0xd5033fdf\n\t"   /* isb         */
+                : "+r"(p) : : "memory");
+        }
+    }
+#elif defined(__arm__)
+    /*
+     * 32 位 ARM 没有 dc/ic 这套；用 mprotect 往返把页重新映射一次，
+     * 内核在处理 mprotect 时会做必要的缓存维护。
+     */
+    (void)addr; (void)len;
+#else
+    /*
+     * x86 / x86_64 上指令缓存与数据缓存由硬件保持一致，
+     * 且 clang 在这两个目标上能把 __builtin___clear_cache 处理干净，
+     * 不会产生外部符号依赖。
+     */
+    __builtin___clear_cache((char *)addr, (char *)addr + len);
+#endif
+}
+
+
 
 
 static unsigned long g_guard_ticks = 0;
@@ -771,6 +929,516 @@ static pthread_t    g_guard_thread;
 #define GUARD_EARLY_TICKS 40
 static int g_maps_idle = 0;
 
+/* ================================================================== */
+/* 库加载后立刻中和 JVMTI 插件入口                                       */
+/* ================================================================== */
+
+/*
+ * 依据（ART 自己打印，不是推测）
+ * -----------------------------
+ * 实测日志：
+ *
+ *   W er_main_process: Openjdkjvmti plugin was loaded on a non-debuggable
+ *     Runtime. Plugin was loaded too late to change runtime debuggable state.
+ *   F er_main_process: jit_code_cache.cc:1309] Check failed:
+ *     !ContainsElement(zombie_code_, code_ptr)
+ *
+ * 紧接着就是 Abort。也就是说：目标把 JVMTI 插件拉起来之后，ART 在
+ * "非 debuggable 却又要按 debuggable 语义重装入口"这种不一致状态下
+ * 遍历所有类重装 stub，与 lsplant 已经改写过的入口在 zombie_code_ 表上
+ * 撞车，直接 abort。
+ *
+ * 为什么不在 dlopen 处拦
+ * ---------------------
+ * 实测：hunter 主进程里 dlopen 只有 1 次（本模块自己调用的 libc.so），
+ * android_dlopen_ext 0 次。它用的是静态编进 libhunter.so 的 xDL，
+ * 自己解析 ELF 再手工映射，完全不经过 libc 的加载入口。
+ * 所以只能在"库已经进到进程里、但还没被调用"的窗口内动手。
+ *
+ * 窗口有多大：实测从 ART 打印那条 W 到 Abort 之间约 50ms，够用。
+ *
+ * 做法：由已有的 guard 线程高频轮询 maps，一旦出现该库，
+ * 就按 ELF 的 .dynsym 找到 ArtPlugin_Initialize 并把入口改成立即返回。
+ * 目标是走它自己已有的失败分支（JvmTi::init fail / == null），
+ * 不伪造任何检测结果。
+ */
+
+/*
+ * 读真实的 /proc/self/maps，绕过本模块自己的过滤。
+ *
+ * 为什么必须绕：本模块在 syscall 上装了包装，凡是 /proc/self/maps 的
+ * open 都会被重定向到"过滤后的视图"。而这里要判断的是
+ * "目标库到底有没有被映射进这个进程"——查过滤视图做这个判断是错的，
+ * 而且会走一遍完整的过滤流程（很慢），在紧循环里直接把窗口错过。
+ *
+ * 实测教训：最初这里就是普通 syscall()，结果在 1ms 轮询下
+ * 中和次数始终为 0，看起来像"库永远不在"，实际是读错了数据源。
+ */
+static char *ahb_read_real_maps(size_t *out_len) {
+    char *buf;
+    size_t cap = 512 * 1024, len = 0;
+    long fd;
+    maps_ensure_raw_syscall();
+    if (!g_raw_syscall) return NULL;
+    fd = ((ahb_sys6_fn)g_raw_syscall)(SYS_openat, AT_FDCWD,
+                                      (long)"/proc/self/maps", O_RDONLY, 0, 0, 0);
+    if (fd < 0) return NULL;
+    buf = (char *)malloc(cap);
+    if (!buf) {
+        ((ahb_sys6_fn)g_raw_syscall)(SYS_close, fd, 0, 0, 0, 0, 0);
+        return NULL;
+    }
+    for (;;) {
+        long k;
+        if (len + 65536 > cap) {
+            char *nb = (char *)realloc(buf, cap * 2);
+            if (!nb) break;
+            buf = nb;
+            cap *= 2;
+        }
+        k = ((ahb_sys6_fn)g_raw_syscall)(SYS_read, fd, (long)(buf + len),
+                                        (long)(cap - len - 1), 0, 0, 0);
+        if (k <= 0) break;
+        len += (size_t)k;
+    }
+    ((ahb_sys6_fn)g_raw_syscall)(SYS_close, fd, 0, 0, 0, 0, 0);
+    buf[len] = 0;
+    if (out_len) *out_len = len;
+    return buf;
+}
+
+#define AHB_JVMTI_LIB "libopenjdkjvmti.so"
+
+/*
+ * 从真实 maps 里的加载实例算出 load bias。
+ *
+ * 为什么必须"多候选"：实测 hunter 主进程里这个库有两处独立映射
+ *
+ *   792cc52000-792cd3f000 r--p 00000000  /apex/.../libopenjdkjvmti.so
+ *   792e296000-792e2c4000 r--p 00000000  /apex/.../libopenjdkjvmti.so
+ *   792e2c4000-792e37b000 r-xp 0002e000  /apex/.../libopenjdkjvmti.so
+ *
+ * 两行的 file offset 都是 0。最初的实现取"第一条 offset==0"当 base，
+ * 正好取到 792cc52000 那个非加载实例，ELF 头校验不过 → 解析失败 →
+ * 中和次数一直是 0。所以这里对每一行都算一次 base = start - offset，
+ * 去重后逐个尝试，成功为止。
+ */
+static int ahb_collect_bases(const char *lib, uintptr_t *out, int max) {
+    size_t len = 0;
+    char *m = ahb_read_real_maps(&len);
+    char *line;
+    int n = 0;
+    if (!m) return 0;
+    line = m;
+    while (line && *line && n < max) {
+        char *nl = strchr(line, '\n');
+        if (strstr(line, lib)) {
+            char *dash = strchr(line, '-');
+            if (dash) {
+                uintptr_t st = (uintptr_t)strtoull(line, NULL, 16);
+                char *q = dash + 1;
+                int fld = 0;
+                unsigned long foff;
+                while (*q && fld < 2) {
+                    if (*q == ' ') { fld++; while (*q == ' ') q++; continue; }
+                    q++;
+                }
+                foff = strtoul(q, NULL, 16);
+                if (st > (uintptr_t)foff) {
+                    uintptr_t base = st - (uintptr_t)foff;
+                    int i, dup = 0;
+                    for (i = 0; i < n; i++) if (out[i] == base) { dup = 1; break; }
+                    if (!dup) out[n++] = base;
+                }
+            }
+        }
+        if (!nl) break;
+        line = nl + 1;
+    }
+    free(m);
+    return n;
+}
+
+static int ahb_collect_jvmti_bases(uintptr_t *out, int max) {
+    return ahb_collect_bases(AHB_JVMTI_LIB, out, max);
+}
+
+
+/*
+ * 安全读取自身内存。
+ *
+ * 这里不能用 /proc/self/mem：实测在 app 域被 SELinux 拒绝，open 直接失败，
+ * 于是 ELF 解析全部返回 0（诊断码 art 一直是 0），看起来像"符号不存在"。
+ *
+ * 改用 process_vm_readv 读自己：自读是允许的，且目标页未映射时只会
+ * 返回短读或 -1，不会像直接解引用那样崩掉进程。
+ */
+static long ahb_mem_read(uintptr_t addr, void *buf, size_t len) {
+    struct iovec li, ri;
+    if (!g_real_pvr) g_real_pvr = (pvr_fn)dlsym(RTLD_DEFAULT, "process_vm_readv");
+    if (!g_real_pvr) return -1;
+    li.iov_base = buf;
+    li.iov_len  = len;
+    ri.iov_base = (void *)addr;
+    ri.iov_len  = len;
+    return (long)g_real_pvr(getpid(), &li, 1, &ri, 1, 0);
+}
+
+
+/*
+ * 在一个候选 base 上解析出 ArtPlugin_Initialize 的运行时地址。
+ * 成功返回非 0，失败返回 0。
+ */
+static uintptr_t ahb_entry_at_base(uintptr_t base) {
+    unsigned char eh[64];
+    uint64_t phoff = 0;
+    uint16_t phentsize = 0, phnum = 0;
+    uint64_t dyn_vaddr = 0, dyn_sz = 0;
+    uintptr_t symtab = 0, strtab = 0;
+    unsigned char dyn[16 * 64];
+    int i, k;
+
+    if (ahb_mem_read(base, eh, sizeof(eh)) != (long)sizeof(eh)) return 0;
+    if (memcmp(eh, "\177ELF", 4) != 0) return 0;
+    if (eh[4] != 2) return 0;                       /* 只要 ELF64 */
+    phoff     = *(uint64_t *)(eh + 0x20);
+    phentsize = *(uint16_t *)(eh + 0x36);
+    phnum     = *(uint16_t *)(eh + 0x38);
+    if (phnum == 0 || phentsize < 56 || phnum > 64) return 0;
+
+    for (i = 0; i < (int)phnum; i++) {
+        unsigned char ph[56];
+        if (ahb_mem_read(base + phoff + (uint64_t)i * phentsize,
+                         ph, sizeof(ph)) != (long)sizeof(ph)) break;
+        if (*(uint32_t *)(ph + 0) == 2) {           /* PT_DYNAMIC */
+            dyn_vaddr = *(uint64_t *)(ph + 0x10);
+            dyn_sz    = *(uint64_t *)(ph + 0x28);
+            break;
+        }
+    }
+    if (!dyn_vaddr || dyn_sz < 16) return 0;
+
+    if (dyn_sz > sizeof(dyn)) dyn_sz = sizeof(dyn);
+    if (ahb_mem_read(base + dyn_vaddr, dyn, (size_t)dyn_sz) != (long)dyn_sz) return 0;
+    for (k = 0; k < (int)(dyn_sz / 16); k++) {
+        uint64_t tag = *(uint64_t *)(dyn + k * 16);
+        uint64_t val = *(uint64_t *)(dyn + k * 16 + 8);
+        if (tag == 0) break;
+        if (tag == 6) symtab = base + (uintptr_t)val;   /* DT_SYMTAB */
+        if (tag == 5) strtab = base + (uintptr_t)val;   /* DT_STRTAB */
+    }
+    if (!symtab || !strtab) return 0;
+
+    /*
+     * 扫符号表。没有 DT_HASH/DT_GNU_HASH 就直接线性扫，
+     * 上限 4096 项 —— 这个库的导出符号在千级以内，足够覆盖。
+     */
+    for (k = 0; k < 4096; k++) {
+        unsigned char sym[24];
+        uint32_t nmo;
+        uint64_t val;
+        char name[64];
+        if (ahb_mem_read(symtab + (uintptr_t)k * 24, sym, sizeof(sym)) != (long)sizeof(sym))
+            break;
+        nmo = *(uint32_t *)(sym + 0);
+        val = *(uint64_t *)(sym + 8);
+        if (nmo == 0 && val == 0) break;
+        if (nmo == 0 || nmo > 60000) continue;
+        if (ahb_mem_read(strtab + nmo, name, sizeof(name)) != (long)sizeof(name)) continue;
+        name[sizeof(name) - 1] = 0;
+        if (strcmp(name, "ArtPlugin_Initialize") == 0) {
+            /*
+             * st_value 在共享库里是相对 load bias 的虚拟地址；
+             * 若落在首个可执行段（通常是 0x2000 以上）就直接加 base。
+             */
+            return base + (uintptr_t)val;
+        }
+    }
+    return 0;
+}
+
+/*
+ * 在内存里的 ELF 映像中按名字找导出符号：返回 base + st_value。
+ *
+ * 为什么要自己解析而不能 dlsym：实测 dlsym(RTLD_DEFAULT,
+ * "_ZN3art15instrumentation15Instrumentation30UpdateEntrypointsForDebuggableEv")
+ * 返回 NULL（诊断码 art=1）。原因是 Android 的链接器命名空间限制，
+ * 应用侧看不到 libart 的符号。但内存里的 ELF 结构是完整的，
+ * 自己按 .dynamic → .dynsym → .dynstr 走一遍就能拿到。
+ *
+ * 为什么必须分块批量读：libart 的 .dynsym 有几万项，
+ * 逐项 pread 24 字节要几万次系统调用，慢到会错过时机。
+ * 这里改为每次读进 4096 项（96KB）再在本地扫。
+ */
+/* ------------------------------------------------------------------ */
+/* 用 dl_iterate_phdr 拿链接器已经解析好的段信息                          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 为什么会走到这一步
+ * -----------------
+ * 目标：把 ART 的 UpdateEntrypointsForDebuggable 入口断掉（原因见下）。
+ * 但 dlsym(RTLD_DEFAULT, "_ZN3art15instrumentation15Instrumentation30..."
+ * "UpdateEntrypointsForDebuggableEv") 返回 NULL —— Android 的链接器
+ * 命名空间限制，应用侧看不到 libart 的导出符号。
+ *
+ * 于是想自己解析内存里的 ELF。第一版靠 maps 猜 load bias：
+ * 取"offset 为 0 的第一段起点"。实测在 libart 上猜错
+ * （诊断停在 55 = 找不到 PT_DYNAMIC），因为 ELF 头所在的段
+ * 与 .dynamic 所在的段不一定相邻于同一个 bias 基准。
+ *
+ * 正确做法：dl_iterate_phdr 给出的 dlpi_addr 就是链接器算好的
+ * load bias，dlpi_phdr 是已经解析好的程序头数组，两者都可信，
+ * 不需要任何猜测。libart 由链接器加载，一定能被它看到。
+ */
+struct ahb_phdr_ctx {
+    const char *want;       /* 要匹配的库名子串 */
+    uintptr_t  bias;        /* 输出：load bias */
+    const void *phdr;       /* 输出：程序头数组地址 */
+    int        phnum;
+    int        found;
+};
+
+static int ahb_phdr_cb(struct dl_phdr_info *info, size_t sz, void *data) {
+    struct ahb_phdr_ctx *c = (struct ahb_phdr_ctx *)data;
+    (void)sz;
+    if (!info || !info->dlpi_name) return 0;
+    if (strstr(info->dlpi_name, c->want)) {
+        c->bias  = (uintptr_t)info->dlpi_addr;
+        c->phdr  = (const void *)info->dlpi_phdr;
+        c->phnum = info->dlpi_phnum;
+        c->found = 1;
+        return 1;   /* 找到就停 */
+    }
+    return 0;
+}
+
+static uintptr_t ahb_elf_find_export(uintptr_t base, const char *want) {
+    struct ahb_phdr_ctx c;
+    const unsigned char *eh;
+    uint64_t dyn_vaddr = 0, dyn_sz = 0;
+    unsigned char dyn[16 * 96];
+    uintptr_t symtab = 0, strtab = 0;
+    uint64_t strsz = 0;
+    char *str;
+    int i, k;
+    uintptr_t result = 0;
+
+    memset(&c, 0, sizeof(c));
+    c.want = "libart.so";
+    dl_iterate_phdr(ahb_phdr_cb, &c);
+    if (!c.found || !c.phdr || c.phnum <= 0) { g_elf_diag = 71; return 0; }
+
+    /* 用链接器给的 bias 和 phdr 直接找 PT_DYNAMIC */
+    for (i = 0; i < c.phnum; i++) {
+        const Elf64_Phdr *ph = (const Elf64_Phdr *)c.phdr + i;
+        if (ph->p_type == 2 /* PT_DYNAMIC */) {
+            dyn_vaddr = ph->p_vaddr;
+            dyn_sz    = ph->p_memsz;
+            break;
+        }
+    }
+    if (!dyn_vaddr || dyn_sz < 16) { g_elf_diag = 72; return 0; }
+
+    eh = (const unsigned char *)0;
+    (void)eh;
+
+    if (dyn_sz > sizeof(dyn)) dyn_sz = sizeof(dyn);
+    if (ahb_mem_read(c.bias + dyn_vaddr, dyn, (size_t)dyn_sz) != (long)dyn_sz) {
+        g_elf_diag = 73;
+        return 0;
+    }
+    for (k = 0; k < (int)(dyn_sz / 16); k++) {
+        uint64_t tag = *(uint64_t *)(dyn + k * 16);
+        uint64_t val = *(uint64_t *)(dyn + k * 16 + 8);
+        if (tag == 0) break;
+        if (tag == 6)  symtab = c.bias + (uintptr_t)val;   /* DT_SYMTAB */
+        if (tag == 5)  strtab = c.bias + (uintptr_t)val;   /* DT_STRTAB */
+        if (tag == 10) strsz  = val;                       /* DT_STRSZ  */
+    }
+    if (!symtab || !strtab) { g_elf_diag = 74; return 0; }
+    if (strsz == 0 || strsz > (8u << 20)) strsz = 2u << 20;
+
+    str = (char *)malloc((size_t)strsz);
+    if (!str) { g_elf_diag = 75; return 0; }
+    {
+        long g = ahb_mem_read(strtab, str, (size_t)strsz);
+        if (g < 64) { g_elf_diag = 76; free(str); return 0; }
+    }
+
+    {
+        const int PER = 4096;
+        unsigned char *chunk = (unsigned char *)malloc((size_t)PER * 24);
+        if (!chunk) { g_elf_diag = 77; free(str); return 0; }
+        for (k = 0; k < 400; k++) {
+            long got = ahb_mem_read(symtab + (uintptr_t)k * PER * 24,
+                                    chunk, (size_t)PER * 24);
+            int cnt = (got > 0) ? (int)(got / 24) : 0;
+            int z, stop = 0;   /* stop 保留以备后续使用 */
+            if (cnt <= 0) break;
+            for (z = 0; z < cnt; z++) {
+                unsigned char *sp = chunk + (size_t)z * 24;
+                uint32_t nmo = *(uint32_t *)(sp + 0);
+                uint64_t val = *(uint64_t *)(sp + 8);
+                /*
+                 * 注意：.dynsym 的第 0 项必然是 (name=0, value=0) 的
+                 * 保留项 STN_UNDEF。
+                 * 最初的终止条件写成 "nmo==0 && val==0 就停"，
+                 * 结果第一项就命中、整张表一个符号都没扫到
+                 * （诊断码停在 78 = 扫完没找到）。
+                 * 正确做法是跳过它，按读到的条数扫满。
+                 */
+                if (nmo == 0 || nmo >= strsz) continue;
+                if (strcmp(str + nmo, want) == 0) {
+                    result = c.bias + (uintptr_t)val;
+                    break;
+                }
+            }
+            if (result || stop) break;
+        }
+        if (!result) g_elf_diag = 78;
+        free(chunk);
+    }
+    free(str);
+    return result;
+}
+
+
+static volatile int g_jvmti_patched = 0;
+static volatile int g_jvmti_diag = 0;      /* 诊断：0 未跑 1 无库 2 无base 3 无入口 4 已打 */
+
+/* 把函数入口改成立即返回 1（插件初始化失败），已改过则直接返回 */
+static int ahb_patch_entry(uintptr_t fa) {
+    unsigned char *p = (unsigned char *)fa;
+    uintptr_t page;
+    size_t pgsz;
+    if (!fa) return 0;
+    pgsz = (size_t)sysconf(_SC_PAGESIZE);
+    if (pgsz == 0) pgsz = 4096;
+    page = fa & ~(uintptr_t)(pgsz - 1);
+    if (mprotect((void *)page, pgsz, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return 0;
+    /* mov w0, #1 ; ret —— 返回非 0 = 插件初始化失败 */
+    p[0] = 0x20; p[1] = 0x00; p[2] = 0x80; p[3] = 0x52;
+    p[4] = 0xc0; p[5] = 0x03; p[6] = 0x5f; p[7] = 0xd6;
+    ahb_flush_icache(p, 8);
+    mprotect((void *)page, pgsz, PROT_READ | PROT_EXEC);
+    return 1;
+}
+
+static void ahb_try_patch_jvmti(void) {
+    uintptr_t bases[8];
+    int nb, i, hit = 0;
+
+    if (g_jvmti_patched) return;
+
+    nb = ahb_collect_jvmti_bases(bases, 8);
+    {
+        static int lg = 0;
+        #if AHB_DIAG
+        if (lg < 3) { lg++; LOGE("WATCH collect bases=%d", nb); }
+        #endif
+    }
+    if (nb == 0) { g_jvmti_diag = 1; return; }
+    for (i = 0; i < nb; i++) {
+        uintptr_t fa = ahb_entry_at_base(bases[i]);
+        {
+            static int lg2 = 0;
+#if AHB_DIAG
+            if (lg2 < 6) { lg2++; LOGE("WATCH base[%d]=%lx entry=%lx", i, (unsigned long)bases[i], (unsigned long)fa); }
+#endif
+        }
+        if (!fa) continue;
+        g_jvmti_diag = 3;
+        if (ahb_patch_entry(fa)) {
+            hit++;
+            {
+                int k;
+#if AHB_DIAG
+                for (k = 0; k < 2; k++)
+                    LOGE("JVMTI 中和完成 base=%lx entry=%lx", (unsigned long)bases[i], (unsigned long)fa);
+#else
+                (void)k;
+#endif
+            }
+        }
+    }
+    if (hit) { g_jvmti_patched = 1; g_jvmti_diag = 4; }
+}
+
+
+/* ------------------------------------------------------------------ */
+/* JVMTI 专用看门线程                                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 为什么单独开一个线程、而不是放进已有的 250ms guard 循环
+ * ------------------------------------------------------
+ * 实测时间线（同一进程，毫秒级）：
+ *
+ *   06.032  W  Openjdkjvmti plugin was loaded on a non-debuggable Runtime
+ *   06.083  F  jit_code_cache.cc:1309 Check failed  -> Abort
+ *
+ * 从"库已经被加载"到"ART abort"只有约 50ms。
+ * 250ms 的循环几乎必然错过这个窗口（实测中和完成 0 次）。
+ *
+ * 所以这里用 2ms 的紧循环，但每次检测都很便宜：
+ * 用 dl_iterate_phdr 遍历已加载模块（几十个），比读 300KB 的 maps
+ * 快三个数量级，2ms 一次完全可接受。
+ *
+ * 只在启动后的前 3 秒工作，之后退出线程 —— 那个窗口一过，
+ * JVMTI 该不该加载都已经确定了。
+ */
+
+static void *jvmti_watch_thread(void *arg) {
+    unsigned long t0 = ahb_now_us();
+    int sc_done = 0;
+    (void)arg;
+    while (!g_jvmti_patched) {
+        if (ahb_now_us() - t0 > 3000000UL) break;   /* 3 秒后退出 */
+        /*
+         * 不用 dl_iterate_phdr 判断"库在不在"。
+         *
+         * 原因：目标的 xDL 是手工 mmap 加载的，**不会**把自己挂进
+         * 链接器的 link_map，所以 dl_iterate_phdr 看不到它
+         * （实测：改用 dl_iterate_phdr 之后中和次数仍然是 0）。
+         * 而 /proc/self/maps 反映的是真实 VMA，一定看得到。
+         *
+         * ahb_try_patch_jvmti 内部第一步就是廉价的子串扫描，
+         * 库不在时立刻返回，所以 1ms 一次的代价可以接受。
+         */
+        ahb_try_patch_jvmti();
+        if (g_jvmti_patched) break;
+        /*
+         * 自证一次就够。
+         * 放在这里而不是 early_init：实测进程启动最初几毫秒打的日志
+         * 会被 logd 丢掉（EARLY_BODY / EARLY_INIT 一条都看不到，
+         * 而稍后的 DLOPEN[n] 正常），所以推迟到 400ms 之后。
+         */
+#if AHB_DIAG
+        if (!sc_done && ahb_now_us() - t0 > 400000UL) {
+            sc_done = 1;
+            ahb_selfcheck_fd();
+        }
+#endif
+        usleep(1000);
+    }
+    return NULL;
+}
+
+static void ahb_start_jvmti_watch(void) {
+    static int started = 0;
+    pthread_t th;
+    if (started) return;
+    started = 1;
+    {
+        int rc = pthread_create(&th, NULL, jvmti_watch_thread, NULL);
+        #if AHB_DIAG
+        int k; for (k = 0; k < 2; k++) LOGE("WATCH 线程创建 rc=%d", rc);
+        #endif
+        if (rc == 0) pthread_detach(th);
+    }
+}
+
 static void *guard_loop(void *arg) {
     int ops = (int)(intptr_t)arg;
     LOGI("L4 guard_loop 启动 interval=250ms ops=%#x", ops);
@@ -787,6 +1455,13 @@ static void *guard_loop(void *arg) {
          * 跳板页收敛与 ClassLoader 链表不同：它们抹掉的是"痕迹"本身，
          * 不影响任何模块的功能，因此适合反复执行。
          */
+        /*
+         * 每次迭代都检查 JVMTI 插件是否已被目标加载。
+         * 一旦出现就立刻中和它的入口 —— 窗口只有几十毫秒，
+         * 所以这一步放在最前面，且自身极轻（先 grep maps 关键字）。
+         */
+        ahb_try_patch_jvmti();
+
         if ((ops & NATIVE_OP_TRAMP) != 0) {
             neutralize_anon_exec_pages();
         }
@@ -803,7 +1478,7 @@ static void *guard_loop(void *arg) {
                 LOGI("RAWREAD: %s", buf);
                 g_dbg_i = 0;
             }
-            LOGI("VIEWPROOF calls=%lu hits=%lu sys=%lu slots=%d hb=%d",
+            AHB_SAYL("VIEWPROOF calls=%lu hits=%lu sys=%lu slots=%d hb=%d",
                      (unsigned long)g_clv_calls, (unsigned long)g_clv_hits,
                      (unsigned long)g_sys_calls, g_clv_n, hb);
                 last_c = g_clv_calls;
@@ -844,7 +1519,7 @@ static void *guard_loop(void *arg) {
             int before = g_clv_n;
             clv_install_now();
             if (g_clv_n != before) {
-                LOGI("L3 view: 周期补扫 slots %d -> %d", before, g_clv_n);
+                AHB_SAYL("L3 view: 周期补扫 slots %d -> %d", before, g_clv_n);
             }
         }
         /*
@@ -1133,7 +1808,7 @@ static void clv_build_fake(uintptr_t real_vptr) {
 
     g_fake_cl_addr = (uintptr_t)g_fake_cl;
     g_fake_ready = 1;
-    LOGI("L3 view: 合成候选就绪 cl=%#lx head=%#lx vptr=%#lx",
+    AHB_SAYL("L3 view: 合成候选就绪 cl=%#lx head=%#lx vptr=%#lx",
          (unsigned long)g_fake_cl_addr, (unsigned long)head, (unsigned long)real_vptr);
     ahb_filelog("VIEW fake ready cl=%#lx head=%#lx",
                 (unsigned long)g_fake_cl_addr, (unsigned long)head);
@@ -1498,7 +2173,7 @@ static void clv_build(uintptr_t head) {
 
     sl->ready = 1;
     g_clv_n++;
-    LOGI("L3 view: 登记 head=%#lx 真实节点=%d (共%d条)",
+    AHB_SAYL("L3 view: 登记 head=%#lx 真实节点=%d (共%d条)",
          (unsigned long)head, sl->keep, g_clv_n);
     ahb_filelog("VIEW register head=%#lx keep=%d total=%d",
                 (unsigned long)head, sl->keep, g_clv_n);
@@ -2042,7 +2717,9 @@ static ssize_t clv_pvr(pid_t pid, const struct iovec *local, unsigned long liovc
             rescans++;
             last_us = now_us;
             int before = g_clv_n;
+#if !AHB_MINIMAL_VIEW
             clv_install_now();
+#endif
             if (g_clv_n != before) {
                 LOGI("RESCAN: 第 %d 次补扫 slots %d -> %d", rescans, before, g_clv_n);
                 ahb_filelog("RESCAN %d: %d -> %d", rescans, before, g_clv_n);
@@ -2732,11 +3409,11 @@ static void clv_install_now(void) {
             if (nxt == h) break;
             cur = nxt;
         }
-        LOGI("SELFCHECK head=%#lx real=%d walked=%d (检测器将看到 walked)",
+        AHB_SAYL("SELFCHECK head=%#lx real=%d walked=%d (检测器将看到 walked)",
              (unsigned long)h, walk_dll_real(h), walked);
     }
 
-    LOGI("L3 view: 早期安装完成 候选=%d 条 pvr=%p syscall=%p",
+    AHB_SAYL("L3 view: 早期安装完成 候选=%d 条 pvr=%p syscall=%p",
          found, (void *)g_real_pvr, (void *)g_real_syscall);
     ahb_keylog("VIEW install found=%d slots=%d pvr=%p syscall=%p",
                 found, g_clv_n, (void *)g_real_pvr, (void *)g_real_syscall);
@@ -2821,7 +3498,7 @@ static void *clv_fast_patch_thread(void *arg) {
             nanosleep(&ts, NULL);
         }
     }
-    LOGI("FASTPATCH: 结束，累计接管 %d 处", g_clv_got_patched);
+    AHB_SAYL("FASTPATCH: 结束，累计接管 %d 处", g_clv_got_patched);
     return NULL;
 }
 
@@ -3057,7 +3734,7 @@ static int l3_trim_when_settled(void) {
             if (count < 2 || count > 64) continue;   /* 与检测器同口径 */
 
             int is_cl = looks_like_class_loaders(head, step);
-            LOGI("L3(sync) candidate clo=%#zx lo=%#zx count=%d classloaders=%d",
+            AHB_SAYL("L3(sync) candidate clo=%#zx lo=%#zx count=%d classloaders=%d",
                  cl_off, list_off, count, is_cl);
             if (!is_cl) continue;                    /* 不是 class_loaders_，绝不剪 */
 
@@ -3082,14 +3759,14 @@ static int l3_trim_when_settled(void) {
             if (!g_real_pvr) {
                 g_real_pvr = (pvr_fn)dlsym(RTLD_DEFAULT, "process_vm_readv");
                 g_real_syscall = (syscall_fn)dlsym(RTLD_DEFAULT, "syscall");
-                LOGI("L3 view: process_vm_readv=%p syscall=%p",
+                AHB_SAYL("L3 view: process_vm_readv=%p syscall=%p",
                      (void *)g_real_pvr, (void *)g_real_syscall);
             }
             {
                 /* 证明用：报告包装函数被走了多少次、命中覆盖多少次 */
                 static unsigned long rep_c = 0, rep_h = 0;
                 if (g_clv_calls != rep_c || g_clv_hits != rep_h) {
-                    LOGI("L3 view: 包装被调用 %lu 次，命中覆盖 %lu 次",
+                    AHB_SAYL("L3 view: 包装被调用 %lu 次，命中覆盖 %lu 次",
                          (unsigned long)g_clv_calls, (unsigned long)g_clv_hits);
                     rep_c = g_clv_calls;
                     rep_h = g_clv_hits;
@@ -3110,7 +3787,7 @@ static int l3_trim_when_settled(void) {
                 clv_build(head);
             }
             clv_patch_got();
-            LOGI("L3 view: head=%#lx 真实 count=%d -> 视图 %d 节点 (ART 未写入)",
+            AHB_SAYL("L3 view: head=%#lx 真实 count=%d -> 视图 %d 节点 (ART 未写入)",
                  (unsigned long)head, count, CLV_KEEP);
             g_l3_done = 1;
             return 1;
@@ -3123,13 +3800,51 @@ static int l3_trim_when_settled(void) {
 /* JNI 与 LSPosed native_init 导出入口                                 */
 /* ================================================================== */
 
+/*
+ * 显式早初始化入口。
+ *
+ * Java 层在 handleLoadPackage 的第一步就调它，比等 L2 开关走到
+ * nativeSanitizeRuntime 更早。检测器通常 1 秒内完成扫描，
+ * 越早装上视图越稳。
+ */
+JNIEXPORT void JNICALL
+Java_com_rev_antihookbypass_NativeLayer_nativeEarlyInit(JNIEnv *env, jclass cls) {
+    (void)env; (void)cls;
+    ahb_early_init();
+}
+
 __attribute__((visibility("default")))
 jint JNICALL
 Java_com_rev_antihookbypass_NativeLayer_nativeSanitizeRuntime(JNIEnv *env, jclass cls, jint ops) {
+    { int i; for (i = 0; i < 3; i++) LOGE("SANITIZE-ENTER v=NEUTRAL2 pid=%d", (int)getpid()); }
+    /*
+     * 这里才是本模块真实的 native 入口。
+     *
+     * 依据（实测，非推测）：JNI_OnLoad 与 native_init 里的探针
+     * （ERROR 级、独立 tag）在目标进程里一次都没出现过；反汇编确认
+     * 两个函数里都确实调用了那条日志，所以不是被优化掉。
+     * 而 Java 层的 nativeSanitizeRuntime 每次启动都被调用
+     * （日志里有"L2 nativeSanitizeRuntime 完成"）。
+     *
+     * 结论：LSPosed 加载本模块时并不走 JNI_OnLoad，assets/native_init
+     * 声明的 legacy 协议在这个版本上也没有触发 native_init。
+     * 于是把初始化挂到确定会被调用的这个 JNI 函数上，用 pthread_once
+     * 保证只跑一次。
+     */
+    ahb_early_init();
     (void)cls;
     jint mask = 0;
     int o = (int)ops;
-    if (o == 0) o = NATIVE_OP_ALL; /* 未指定时按全开，保证"装上即有效" */
+    /*
+     * 注意：0 就是"全关"，不能再被当成"未指定按全开"。
+     *
+     * 早期这里写的是 if (o == 0) o = NATIVE_OP_ALL，本意是"Java 没指定就
+     * 全开"。但 Java 侧用 0 明确表示关掉全部动作，于是两者语义打架：
+     * 我把 Java 默认改成 0 想做"只留视图过滤"的对照实验，实际上
+     * native 侧仍然全开，实验结论全部失真（还多崩了几次）。
+     *
+     * 未指定由 Java 侧的 parseNative 负责给默认值，这里只管执行。
+     */
 
     LOGI("L2 begin ops=%#x (art=%d linker=%d tramp=%d)", o,
          (o & NATIVE_OP_ART) ? 1 : 0,
@@ -3288,9 +4003,636 @@ static void ahb_guard_linker_tail(void) {
     LOGI("GUARD: linker64 末尾 0x%lx 补可读页 %d/64", cur, ok);
 }
 
+/*
+ * 自检：从**进程内部**核对每个 /proc 入口的视图是否已经干净。
+ *
+ * 为什么要从进程内部测：root shell 读 /proc/<pid>/maps 拿的是内核
+ * 真实内容，我们只改"本进程自己打开时看到的视图"，两者本来就不同。
+ * 用 root 视角去验证过滤效果，得到的结论没有意义 —— 这一条踩过。
+ *
+ * 这里走的是和外部调用完全相同的路径：先把要过滤的东西生成好，
+ * 再统计残留痕迹数。目标是每个入口都为 0。
+ */
+static void ahb_selfcheck_entry(const char *path, const char *label) {
+    size_t len = 0;
+    char *buf;
+    int fd = ahb_filtered_fd_for(path);
+    int hits = 0;
+    if (fd < 0) { AHB_SAYL("SELFCHECK %-8s fd=-1（未接管）", label); return; }
+    buf = ahb_read_file_all_fd(fd, &len);
+    if (!buf) { syscall(SYS_close, fd); AHB_SAYL("SELFCHECK %-8s read失败", label); return; }
+    {
+        static const char *const mk[] = {
+            "antihookbypass", "liblspd", "lsplant", "lsposed",
+            "zygisk", "riru", "/data/adb", "KSU", "magisk", NULL
+        };
+        const char *const *m;
+        for (m = mk; *m; m++) {
+            const char *p = buf, *e = buf + len;
+            while (p < e) {
+                const char *hit = ahb_memstr(p, (size_t)(e - p), *m);
+                if (!hit) break;
+                hits++; p = hit + 1;
+            }
+        }
+    }
+    AHB_SAYL("SELFCHECK %-8s 字节=%zu 残留痕迹=%d", label, len, hits);
+    free(buf);
+    syscall(SYS_close, fd);
+}
+
+static void ahb_selfcheck_all(void) {
+    ahb_selfcheck_entry("/proc/self/maps", "maps");
+    ahb_selfcheck_entry("/proc/self/smaps", "smaps");
+    ahb_selfcheck_entry("/proc/self/mounts", "mounts");
+    ahb_selfcheck_entry("/proc/modules", "modules");
+}
+
+/*
+ * 早期初始化，只执行一次。
+ * ====================
+ *
+ * 为什么必须抽出来：本模块由 LSPosed 以 legacy native_init 协议加载，
+ * **不走 System.loadLibrary 的 JNI_OnLoad**。实测证据：JNI_OnLoad 里
+ * 紧跟 clv_start_fast_patch 之后的那条日志从未出现过，而 native_init
+ * 的日志一直在。
+ *
+ * 后果是 JNI_OnLoad 里的初始化整段作废，其中最严重的是
+ * clv_start_fast_patch() —— 全文件只有那一处调用它，等于抢跑线程
+ * 从来没启动过。补丁只能等后续零散时机，表现为"有的项时好时坏"。
+ *
+ * 所以把初始化收拢成一个函数，两个入口都调用，用 pthread_once 保证
+ * 只跑一次，谁先到谁执行。
+ */
+static pthread_once_t g_early_once = PTHREAD_ONCE_INIT;
+
+/*
+ * 早期初始化的进展标志。
+ *
+ * 为什么用标志而不是只靠日志：实测 logd 在进程启动瞬间对这个 tag 的
+ * 突发日志会丢，EARLY_BODY / EARLY_INIT 这类启动最早期打出的行
+ * 一条都看不到，而稍后零散打出的 DLOPEN[n] 却能正常保留。
+ * 于是把"走到哪一步"记在全局变量里，由后续一定会执行到的
+ * dlopen 包装把它带出来 —— 纯内存，零副作用。
+ */
+static volatile int g_early_stage = 0;    /* 1=body 进入 2=JVMTI 已处理 3=视图就绪 */
+static volatile int g_jvmti_result = -1;  /* -1 未做 0 失败 1 成功 */
+
+int ahb_early_stage_get(void) { return g_early_stage; }
+int ahb_jvmti_result_get(void) { return g_jvmti_result; }
+int ahb_jvmti_diag_get(void) { return g_jvmti_diag; }
+int ahb_libart_diag_get(void) { return g_libart_diag; }
+int ahb_elf_diag_get(void) { return g_elf_diag; }
+
+/* ================================================================== */
+/* 中和 JVMTI 插件入口                                                  */
+/* ================================================================== */
+
+/*
+ * 依据（实测调用栈 + 实测字符串，不是推测）
+ * ----------------------------------------
+ * com.zhenxi.hunter 主进程 abort 的完整栈是：
+ *
+ *   jit_code_cache.cc:1309  Check failed: !ContainsElement(zombie_code_, code_ptr)
+ *   JitCodeCache::AddZombieCodeInternal
+ *   JitCodeCache::AddZombieCode
+ *   Instrumentation::InstallStubsForClass
+ *   ClassLinker::VisitClassesInternal / VisitClasses
+ *   Instrumentation::UpdateEntrypointsForDebuggable
+ *   openjdkjvmti::DeoptManager::FinishSetup
+ *   ArtPlugin_Initialize
+ *   libhunter.so                     <-- 目标自己调进来
+ *
+ * 也就是说：目标把 JVMTI 插件拉起来，运行时被当成 debuggable，
+ * ART 于是遍历**所有类**重装入口 stub；而 lsplant 已经把大量方法的
+ * 入口改成了自己的跳板，两边在 zombie_code_ 表上撞车，直接 abort。
+ *
+ * 这不是本模块做了什么，而是"框架 hook"与"JVMTI 调试代理"天生冲突：
+ * 只要框架在，目标一旦把 JVMTI 拉起来就会踩这个断言。
+ *
+ * 为什么不能靠拦 dlopen / 藏文件
+ * ------------------------------
+ * 实测：给 dlopen 加探针，目标主进程整轮只调 1 次（libc.so）；
+ * 加 dlsym 屏蔽，命中 0 条；藏 libopenjdkjvmti.so 文件，命中 0 条。
+ * 它用静态编进 libhunter.so 里的 xDL，配合自有解析直接拿到符号，
+ * 完全不经过 libc 的 open/dlopen。
+ *
+ * 所以改成在"函数入口"这一层处理：自己先把该库加载进来，
+ * 把它的插件入口 ArtPlugin_Initialize 改写成"立即返回非 0"。
+ * 目标之后无论用哪条路拿到这个符号，拿到的都是我们改过的入口，
+ * 于是走它自己已有的 `JvmTi::init ArtPlugin_Initialize == null`
+ * / `JvmTi::init fail` 分支 —— 那是它亲手写的失败处理，不会崩。
+ *
+ * 只改这一个函数的第一条指令，且改动只在本进程内（MAP_PRIVATE 私有页）。
+ */
+/* ================================================================== */
+/* 断开 ART 的"按 debuggable 语义重装入口"这条链                          */
+/* ================================================================== */
+
+/*
+ * 依据（ART 自己打印的日志 + 完整 native 栈，不是推测）
+ * ---------------------------------------------------
+ *    W  Openjdkjvmti plugin was loaded on a non-debuggable Runtime.
+ *       Plugin was loaded too late to change runtime debuggable state.
+ *    F  jit_code_cache.cc:1309  Check failed: !ContainsElement(zombie_code_, code_ptr)
+ *
+ *    #13  Instrumentation::InstallStubsForClass
+ *    #14  ClassLinker::VisitClassesInternal
+ *    #15  Instrumentation::UpdateEntrypointsForDebuggable
+ *    #16  openjdkjvmti::DeoptManager::FinishSetup
+ *    #17  ArtPlugin_Initialize
+ *    #18  libhunter.so
+ *
+ * 目标把 JVMTI 插件拉起来后，ART 走进"运行时不是 debuggable、却要按
+ * debuggable 语义把所有类的入口 stub 重装一遍"这条自相矛盾的路径。
+ * 而 lsplant 早已把大量方法的入口换成自己的跳板，两边在 zombie_code_
+ * 表上撞车，断言失败直接 abort。
+ *
+ * 为什么不在加载处拦
+ * -----------------
+ * 实测：hunter 主进程里 dlopen 只调 1 次（本模块自己的 libc.so），
+ * android_dlopen_ext 0 次；它用静态编进 libhunter.so 的 xDL 手工映射。
+ * 而"库被映射"到"入口被调用"之间只有微秒级间隙 —— 实测从 ART 打出
+ * 上面那条 W 到 abort 只有 14ms，但映射与调用几乎紧挨着，
+ * 1ms 轮询永远抢不到（实测中和 0 次）。
+ *
+ * 所以在冲突点本身处理：把这条遍历链的**顶端**改成空返回。
+ * 这一步在进程早期就能做（libart 从一开始就加载好了），没有竞态。
+ *
+ * 只影响"重装入口 stub"这一件事：正常方法的执行、hook 分发、
+ * 目标自身的检测逻辑都不受影响。仅在本模块作用域内的进程生效。
+ */
+#define AHB_ART_UPDATE_ENTRY \
+    "_ZN3art15instrumentation15Instrumentation30UpdateEntrypointsForDebuggableEv"
+
+/* ------------------------------------------------------------------ */
+/* 自证：假 fd 的 readlink / fstat 是否与真 maps 一致                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 为什么必须自证：hunter 的 checkFileIsLegal 是
+ * "open(/proc/<pid>/maps) 成功后，readlink 这个 fd，核对路径"。
+ * 我们交的是 memfd，若 readlink 露出 /memfd:maps 就当场被识破。
+ *
+ * 只看"日志里没出现 memfd"不够 —— 它可能这轮压根没走那条分支。
+ * 所以在自己进程里把同样的动作做一遍，把结果打出来：
+ * open → readlink → 应得到 /proc/<pid>/maps；fstat → st_dev 应为
+ * proc 的 0x9fa0，st_ino 应与真 maps 相同。
+ */
+/* 统计一个缓冲区里某个子串出现次数 */
+static int ahb_cnt(const char *buf, const char *needle) {
+    int n = 0;
+    size_t l = strlen(needle);
+    const char *p = buf;
+    while ((p = strstr(p, needle)) != NULL) { n++; p += l; }
+    return n;
+}
+
+/* 用裸 syscall 读一个"真路径"，完全绕开本模块任何包装 */
+static char *ahb_read_path_raw(const char *path, size_t *out_len) {
+    char *b;
+    size_t cap = 512 * 1024, len = 0;
+    long fd;
+    maps_ensure_raw_syscall();
+    if (!g_raw_syscall) return NULL;
+    fd = ((ahb_sys6_fn)g_raw_syscall)(SYS_openat, AT_FDCWD, (long)path, O_RDONLY, 0, 0, 0);
+    if (fd < 0) return NULL;
+    b = (char *)malloc(cap);
+    if (!b) { ((ahb_sys6_fn)g_raw_syscall)(SYS_close, fd, 0, 0, 0, 0, 0); return NULL; }
+    for (;;) {
+        long k;
+        if (len + 65536 > cap) break;
+        k = ((ahb_sys6_fn)g_raw_syscall)(SYS_read, fd, (long)(b + len),
+                                        (long)(cap - len - 1), 0, 0, 0);
+        if (k <= 0) break;
+        len += (size_t)k;
+    }
+    ((ahb_sys6_fn)g_raw_syscall)(SYS_close, fd, 0, 0, 0, 0, 0);
+    b[len] = 0;
+    if (out_len) *out_len = len;
+    return b;
+}
+
+#if AHB_DIAG
+static void ahb_selfcheck_fd(void) {
+    int fd;
+    int pid = (int)getpid();
+    char *buf;
+    size_t cap = 512 * 1024, len = 0;
+    int i;
+    static const char *const needles[] = {
+        "antihookbypass", "libantihook_bypass", "lspd", "lsposed", "lsplant",
+        "zygisk", "riru", "xposed", "edxp", "magisk", NULL
+    };
+
+    maps_ensure_raw_syscall();
+    if (!g_raw_syscall) return;
+
+    /*
+     * 决定性对比：同一时刻，"内核真内容"与"包装 fd 内容"里
+     * 各自的痕迹数量。
+     *
+     * 这一项是整轮排查的关键。前面几轮都在猜"哪里漏了"：
+     * 猜标记没加、猜掩码没写、猜统计写错，全都不是。
+     * 必须同时拿到两边的计数，才知道问题出在"过滤没跑"还是"过滤跑了但没匹配"。
+     */
+    {
+        size_t rl = 0, wl = 0;
+        char *raw = ahb_read_path_raw("/proc/self/maps", &rl);
+        int fd2 = maps_open_wrap("/proc/self/maps", O_RDONLY, 0);
+        char *wrapped = NULL;
+        if (fd2 >= 0) {
+            size_t cap2 = 512 * 1024, l2 = 0;
+            wrapped = (char *)malloc(cap2);
+            if (wrapped) {
+                for (;;) {
+                    long k;
+                    if (l2 + 65536 > cap2) break;
+                    k = ((ahb_sys6_fn)g_raw_syscall)(SYS_read, fd2,
+                                                    (long)(wrapped + l2),
+                                                    (long)(cap2 - l2 - 1), 0, 0, 0);
+                    if (k <= 0) break;
+                    l2 += (size_t)k;
+                }
+                wrapped[l2] = 0;
+                wl = l2;
+            }
+            ((ahb_sys6_fn)g_raw_syscall)(SYS_close, fd2, 0, 0, 0, 0, 0);
+        }
+        if (raw && wrapped) {
+            LOGE("CMP 内核 len=%lu 痕迹=%d | 包装 len=%lu 痕迹=%d",
+                 (unsigned long)rl, ahb_cnt(raw, "antihookbypass"),
+                 (unsigned long)wl, ahb_cnt(wrapped, "antihookbypass"));
+            LOGE("CMP 内核 aexec=%d | 包装 aexec=%d",
+                 ahb_cnt(raw, "r-xp 00000000 00:00 0"),
+                 ahb_cnt(wrapped, "r-xp 00000000 00:00 0"));
+            /* 把包装内容里仍含痕迹的行逐行打出来，看清是哪几行漏了 */
+            {
+                const char *pp = wrapped;
+                int shown = 0;
+                while (pp && *pp && shown < 6) {
+                    const char *nl2 = strchr(pp, '\n');
+                    size_t l = nl2 ? (size_t)(nl2 - pp) : strlen(pp);
+                    if (ahb_memstr(pp, l, "antihookbypass")) {
+                        char t[256];
+                        size_t c = l < sizeof(t) - 1 ? l : sizeof(t) - 1;
+                        memcpy(t, pp, c); t[c] = 0;
+                        /*
+                         * 直接把这行原文喂给判定函数，看它到底认不认。
+                         * 这一步能一次性分清两种可能：
+                         *   trace=1 → 判定是对的，问题在别处（比如这行不是
+                         *             走 masked 分支，而是走了合并/别的分支）
+                         *   trace=0 → 判定本身没认出这行，是匹配问题
+                         */
+                        LOGE("WRAPROW trace=%d len=%lu %s",
+                             maps_line_is_trace_len(pp, l), (unsigned long)l, t);
+                        shown++;
+                    }
+                    if (!nl2) break;
+                    pp = nl2 + 1;
+                }
+            }
+        } else {
+            LOGE("CMP 读取失败 raw=%p wrapped=%p", (void *)raw, (void *)wrapped);
+        }
+        /* 包装视图里 libart 的段数：应合并成 6 段、无 00ba0000 碎片 */
+        if (wrapped) {
+            const char *pp = wrapped;
+            int seg = 0, frag = 0;
+            while (pp && *pp) {
+                const char *nl2 = strchr(pp, '\n');
+                size_t l = nl2 ? (size_t)(nl2 - pp) : strlen(pp);
+                if (ahb_memstr(pp, l, "libart.so")) {
+                    char t[256];
+                    size_t c = l < sizeof(t) - 1 ? l : sizeof(t) - 1;
+                    memcpy(t, pp, c); t[c] = 0;
+                    seg++;
+                    if (strstr(t, "00ba0000")) frag++;
+                    LOGE("VIEWART %s", t);
+                }
+                if (!nl2) break;
+                pp = nl2 + 1;
+            }
+            LOGE("VIEWART seg=%d frag=%d", seg, frag);
+        }
+        /* 包装视图里 /proc/self/mounts 的 root 痕迹 */
+        {
+            size_t ml = 0;
+            char *mw;
+            int fd3 = maps_open_wrap("/proc/self/mounts", O_RDONLY, 0);
+            if (fd3 >= 0) {
+                size_t cap3 = 256 * 1024, l3 = 0;
+                mw = (char *)malloc(cap3);
+                if (mw) {
+                    for (;;) {
+                        long k;
+                        if (l3 + 65536 > cap3) break;
+                        k = ((ahb_sys6_fn)g_raw_syscall)(SYS_read, fd3,
+                                                        (long)(mw + l3),
+                                                        (long)(cap3 - l3 - 1), 0, 0, 0);
+                        if (k <= 0) break;
+                        l3 += (size_t)k;
+                    }
+                    mw[l3] = 0;
+                    ml = l3;
+                    LOGE("VIEWMNT len=%lu adb=%d magisk=%d",
+                         (unsigned long)ml, ahb_cnt(mw, "/data/adb"),
+                         ahb_cnt(mw, "magisk"));
+                    free(mw);
+                }
+                ((ahb_sys6_fn)g_raw_syscall)(SYS_close, fd3, 0, 0, 0, 0, 0);
+            } else {
+                LOGE("VIEWMNT open 失败");
+            }
+        }
+        free(raw);
+        free(wrapped);
+        return;   /* 本轮只做这个对比，其余自检跳过 */
+    }
+
+    /* --- 第一段：fd 身份伪装（已验证通过，保留回归） --- */
+    fd = maps_open_wrap("/proc/self/maps", O_RDONLY, 0);
+    if (fd < 0) { LOGE("SELFCHK open 失败"); return; }
+    {
+        char p[64];
+        char ln_k[160], ln_w[160];
+        ssize_t n;
+        snprintf(p, sizeof(p), "/proc/self/fd/%d", fd);
+        ln_k[0] = 0;
+        n = (ssize_t)((ahb_sys6_fn)g_raw_syscall)(SYS_readlinkat, AT_FDCWD,
+                                                  (long)p, (long)ln_k,
+                                                  (long)(sizeof(ln_k) - 1), 0, 0);
+        if (n > 0) ln_k[n] = 0;
+        ln_w[0] = 0;
+        n = ahb_readlinkat_wrap(AT_FDCWD, p, ln_w, sizeof(ln_w) - 1);
+        if (n > 0) ln_w[n] = 0;
+        LOGE("SELFCHK readlink 内核=%s 包装=%s", ln_k[0] ? ln_k : "(空)",
+             ln_w[0] ? ln_w : "(空)");
+    }
+    {
+        struct stat sk, sw, rs;
+        memset(&sk, 0, sizeof(sk)); memset(&sw, 0, sizeof(sw));
+        ((ahb_sys6_fn)g_raw_syscall)(SYS_fstat, fd, (long)&sk, 0, 0, 0, 0);
+        ahb_fstat_wrap(fd, &sw);
+        memset(&rs, 0, sizeof(rs));
+        ((ahb_sys6_fn)g_raw_syscall)(SYS_newfstatat, AT_FDCWD,
+                                     (long)"/proc/self/maps", (long)&rs, 0, 0, 0);
+        LOGE("SELFCHK fstat 内核 dev=0x%lx ino=%lu | 包装 dev=0x%lx ino=%lu | 真maps ino=%lu",
+             (unsigned long)sk.st_dev, (unsigned long)sk.st_ino,
+             (unsigned long)sw.st_dev, (unsigned long)sw.st_ino,
+             (unsigned long)rs.st_ino);
+    }
+
+    /*
+     * --- 第二段：过滤视图里还剩哪些痕迹 ---
+     *
+     * 这是本轮最重要的一项。前面几轮都在"猜"哪里漏了，
+     * 而这里直接把"对方会读到的那份 maps"整体拿出来，
+     * 逐个对照 hunter 自己用的那几类特征词去数。
+     * 数出来的才是真泄露点，不数就是猜。
+     */
+    buf = (char *)malloc(cap);
+    if (!buf) { ((ahb_sys6_fn)g_raw_syscall)(SYS_close, fd, 0, 0, 0, 0, 0); return; }
+    for (;;) {
+        long k;
+        if (len + 65536 > cap) break;
+        k = ((ahb_sys6_fn)g_raw_syscall)(SYS_read, fd, (long)(buf + len),
+                                        (long)(cap - len - 1), 0, 0, 0);
+        if (k <= 0) break;
+        len += (size_t)k;
+    }
+    ((ahb_sys6_fn)g_raw_syscall)(SYS_close, fd, 0, 0, 0, 0, 0);
+    buf[len] = 0;
+
+    for (i = 0; needles[i]; i++) {
+        const char *p = buf;
+        int cnt = 0;
+        size_t nl = strlen(needles[i]);
+        while ((p = strstr(p, needles[i])) != NULL) { cnt++; p += nl; }
+        if (cnt > 0) LOGE("LEAK %s x%d", needles[i], cnt);
+    }
+    /* 把仍含 antihookbypass 的那几行的原文打出来，看清是哪个字段漏的 */
+    {
+        const char *p = buf;
+        int shown = 0;
+        while (p && *p && shown < 5) {
+            const char *nl2 = strchr(p, '\n');
+            size_t l = nl2 ? (size_t)(nl2 - p) : strlen(p);
+            if (ahb_memstr(p, l, "antihookbypass")) {
+                char t[256];
+                size_t c = l < sizeof(t) - 1 ? l : sizeof(t) - 1;
+                memcpy(t, p, c); t[c] = 0;
+                LOGE("LEAKROW %s", t);
+                shown++;
+            }
+            if (!nl2) break;
+            p = nl2 + 1;
+        }
+    }
+
+    /* 匿名可执行段：hunter 把它当作注入跳板的直接证据 */
+    {
+        const char *p = buf;
+        int ae = 0;
+        while (p && *p) {
+            const char *nl2 = strchr(p, '\n');
+            size_t l = nl2 ? (size_t)(nl2 - p) : strlen(p);
+            /*
+             * 必须按行判断。第一版这里写的是
+             *   if (l > 20 && strstr(p, "r-xp") && strstr(p, " 00:00 0"))
+             * 但 strstr 会越过本行扫到缓冲区末尾，
+             * 于是"前面某行是 r-xp" + "后面某行有 00:00 0" 就被算成匿名段，
+             * 报出 3518 个 —— 完全是统计 bug，不是真泄露。
+             */
+            if (l > 20 && ahb_memstr(p, l, "r-xp") && ahb_memstr(p, l, " 00:00 0  ")) {
+                if (!ahb_memstr(p, l, " /")) ae++;
+            }
+            if (!nl2) break;
+            p = nl2 + 1;
+        }
+        LOGE("LEAK 匿名可执行段 x%d", ae);
+    }
+    free(buf);
+}
+#endif
+
+
+
+static int ahb_neutralize_libart_debug(void) {
+    unsigned char *p;
+    uintptr_t page;
+    size_t pgsz;
+
+    p = (unsigned char *)ahb_elf_find_export(0, AHB_ART_UPDATE_ENTRY);
+    if (!p) { g_libart_diag = 1; return 0; }
+
+    pgsz = (size_t)sysconf(_SC_PAGESIZE);
+    if (pgsz == 0) pgsz = 4096;
+    page = (uintptr_t)p & ~(uintptr_t)(pgsz - 1);
+    if (mprotect((void *)page, pgsz, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        g_libart_diag = 3;
+        return 0;
+    }
+    /* 第一条指令改成 ret：函数立刻返回，不再遍历类表 */
+    p[0] = 0xc0; p[1] = 0x03; p[2] = 0x5f; p[3] = 0xd6;
+    ahb_flush_icache(p, 4);
+    mprotect((void *)page, pgsz, PROT_READ | PROT_EXEC);
+    g_libart_diag = 2;
+    {
+#if AHB_DIAG
+        int k;
+        for (k = 0; k < 2; k++)
+            LOGE("ART 断开完成 fn=%lx", (unsigned long)p);
+#endif
+    }
+    return 1;
+}
+
+
+
+static int ahb_neutralize_jvmti(void) {
+    static int done = 0;
+    void *h;
+    unsigned char *p;
+    uintptr_t page;
+    size_t pgsz;
+    /*
+     * 先自己加载。若它本来就会在稍后被目标加载，这一步让"加载"这件事
+     * 提前到我们手里 —— 动态链接器对同名库只会真正加载一次。
+     */
+    /*
+     * 按绝对路径优先加载：APEX 里的库在应用的默认搜索命名空间里
+     * 不一定找得到，按 soname 直接 dlopen 可能返回 NULL。
+     */
+    h = dlopen("/apex/com.android.art/lib64/libopenjdkjvmti.so", RTLD_NOW);
+    if (!h) h = dlopen("libopenjdkjvmti.so", RTLD_NOW);
+    if (!h) h = dlopen("/apex/com.android.art/lib64/libjdwp.so", RTLD_NOW);
+    if (!h) {
+        int i;
+        for (i = 0; i < 5; i++)
+            #if AHB_DIAG
+            LOGE("JVMTI 中和：库加载失败 dlerror=%s", dlerror());
+            #endif
+        return -10;   /* 库加载失败 */
+    }
+    if (done) return 1;
+    p = (unsigned char *)dlsym(h, "ArtPlugin_Initialize");
+    if (!p) {
+        #if AHB_DIAG
+        { int i; for (i = 0; i < 5; i++) LOGE("JVMTI 中和：找不到 ArtPlugin_Initialize"); }
+        #endif
+        return -11;   /* 符号找不到 */
+        return 0;
+    }
+    pgsz = (size_t)sysconf(_SC_PAGESIZE);
+    if (pgsz == 0) pgsz = 4096;
+    page = (uintptr_t)p & ~(uintptr_t)(pgsz - 1);
+    if (mprotect((void *)page, pgsz, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        #if AHB_DIAG
+        { int i; for (i = 0; i < 5; i++) LOGE("JVMTI 中和：mprotect 失败 errno=%d", errno); }
+        #endif
+        return -12;   /* mprotect 失败 */
+    }
+    /*
+     * mov w0, #0x1 ; ret  —— 返回非 0 表示插件初始化失败。
+     * 目标自己就有这个分支：JvmTi::init fail / ArtPlugin_Initialize == null。
+     */
+    p[0] = 0x20; p[1] = 0x00; p[2] = 0x80; p[3] = 0x52;   /* mov w0, #1 */
+    p[4] = 0xc0; p[5] = 0x03; p[6] = 0x5f; p[7] = 0xd6;   /* ret */
+    /*
+     * 刷新指令缓存。
+     *
+     * 这里**不能用** __builtin___clear_cache：实测它会被编译成对
+     * __clear_cache 的外部调用，而 bionic 里没有这个符号，于是
+     * System.loadLibrary 直接失败：
+     *   UnsatisfiedLinkError: dlopen failed: cannot locate symbol "__clear_cache"
+     * 而且失败得很隐蔽 —— Java 层有 try/catch，界面看起来一切正常，
+     * 只是整个 native 层从未生效（maps 过滤、GOT 补丁、JVMTI 中和全都没有）。
+     *
+     * 直接下 AArch64 的缓存维护指令，不依赖任何外部符号。
+     */
+    ahb_flush_icache(p, 8);
+    mprotect((void *)page, pgsz, PROT_READ | PROT_EXEC);
+    done = 1;
+    {
+        int i;
+        for (i = 0; i < 5; i++)
+            LOGE("JVMTI 中和完成：ArtPlugin_Initialize @%p 已改为直接返回失败", (void *)p);
+    }
+    return 1;
+}
+
+static void ahb_early_init_body(void) {
+    g_early_stage = 1;
+    AHB_ENTRY("early_init_body");
+    /*
+     * 先把真实函数地址解析好，再开始任何接管。
+     * clv_patch_got 依赖 g_real_pvr 非空才干活，若首轮扫描发生在赋值前，
+     * 那一轮就整轮跳过。
+     */
+    if (!g_real_pvr)     g_real_pvr     = (pvr_fn)dlsym(RTLD_DEFAULT, "process_vm_readv");
+    if (!g_real_syscall) g_real_syscall = (syscall_fn)dlsym(RTLD_DEFAULT, "syscall");
+
+    /*
+     * 退出函数的真指针也在这里解析好。
+     * 退出路径上必须做到"零解析"：那一刻动态链接器锁可能已被持有，
+     * 再 dlsym 会卡死或崩。上一版探针就是这么把进程弄崩的。
+     */
+    ep_prepare();
+    /* 预取真实 procfs 的 stat：后面 fake fd 要交这份值 */
+    ahb_prefetch_real_stats();
+
+    /*
+     * 视图过滤与补丁开关一律取默认值，不读任何文件。
+     * 读配置文件的路径会被目标监看 open 记录而暴露，所以没有现场开关，
+     * 要改就改代码重新打包。
+     */
+#if EXP_NO_VIEW
+    /* 实验：完全关掉视图过滤，只保留注入本身 */
+    g_enable_maps_hide = 0;
+#else
+    g_enable_maps_hide = 1;
+#endif
+
+    /*
+     * 中和 JVMTI 插件入口。
+     * 必须在目标自己拉起 JVMTI 之前完成，所以放在最前面，
+     * 且不受任何层开关影响 —— 这不是"检测规避"，是防 ART abort。
+     */
+    /*
+     * 先断开 ART 的"重装入口 stub"链条。
+     * 这是 hunter 主进程 abort 的直接冲突点，必须在目标拉起 JVMTI 之前完成；
+     * libart 从进程启动就在，这里没有竞态。
+     */
+    ahb_neutralize_libart_debug();
+
+    g_jvmti_result = ahb_neutralize_jvmti();
+    g_early_stage = 2;
+
+    /* JVMTI 专用看门线程：2ms 轮询，抢在目标调用前把入口中和掉 */
+    ahb_start_jvmti_watch();
+
+#if AHB_PROBE
+    ahb_selfcheck_all();
+#endif
+
+#if !AHB_MINIMAL_VIEW
+    /* 最早的可靠时机：vm 已有效，检测器还没开始扫 */
+    clv_install_now();
+    /* 抢跑线程：它调用的 clv_patch_got 已改为轻量重定位路径 */
+    clv_start_fast_patch();
+#endif
+    g_early_stage = 3;
+}
+
+static void ahb_early_init(void) {
+    pthread_once(&g_early_once, ahb_early_init_body);
+}
+
 __attribute__((visibility("default")))
 jint JNI_OnLoad(JavaVM *vm, void *reserved) {
     (void)reserved;
+    AHB_ENTRY("JNI_OnLoad");
     if (!vm) return JNI_ERR;
     g_vm = vm;
 #if !AHB_NATIVE_ON
@@ -3327,23 +4669,7 @@ jint JNI_OnLoad(JavaVM *vm, void *reserved) {
      * 那一轮就整轮跳过，接管只能等下一轮 —— 实测表现为"约一半的启动
      * ClassLoader 项读到真值 32"。
      */
-    if (!g_real_pvr)      g_real_pvr      = (pvr_fn)dlsym(RTLD_DEFAULT, "process_vm_readv");
-    if (!g_real_syscall)  g_real_syscall  = (syscall_fn)dlsym(RTLD_DEFAULT, "syscall");
-
-    /*
-     * 视图过滤与补丁开关一律取默认值，不再读任何文件。
-     *
-     * 原来这里会去开 /data/local/tmp/ahb_layers 看有没有 nomapshide /
-     * nopatch 之类的字样。那是一条会被目标应用探测到的路径：
-     * 它只要监看本进程 open 过哪些文件，就能发现这个不属于它的路径。
-     * 模块没有设置界面，也就不需要现场切换；要改就改代码重新打包。
-     */
-    g_enable_maps_hide = 1;
-
-    /* 最早的可靠时机：vm 已有效，检测器还没开始扫 */
-    clv_install_now();
-    /* 抢跑线程保留：它调用的 clv_patch_got 已改为轻量重定位路径 */
-    clv_start_fast_patch();
+    ahb_early_init();
     LOGI("JNI_OnLoad: 早期视图安装 slots=%d", g_clv_n);
 
     /*
@@ -3369,6 +4695,7 @@ static void on_library_loaded(const char *name, void *handle) {
 
 __attribute__((visibility("default")))
 NativeOnModuleLoaded native_init(const NativeAPIEntries *entries) {
+    AHB_ENTRY("native_init");
     if (entries) {
         g_hook = entries->hook_func;
         g_unhook = entries->unhook_func;
@@ -3393,7 +4720,7 @@ NativeOnModuleLoaded native_init(const NativeAPIEntries *entries) {
             ahb_filelog("INIT got vm=%p (n=%d)", (void *)g_vm, (int)nv);
         }
     }
-    clv_install_now();
+    ahb_early_init();
     ahb_filelog("INIT done slots=%d", g_clv_n);
     return on_library_loaded;
 }

@@ -72,6 +72,21 @@ static const char *const g_trace_markers[] = {
     "edxp.prop",
     "/data/misc/riru",
     "libantihook_bypass.so",
+    /*
+     * 本模块自己的包路径。
+     *
+     * 必须单列：模块的 so 是用 System.loadLibrary 从模块 APK 里加载的，
+     * 映射行的路径是 /data/app/~~xxx==/com.rev.antihookbypass-xxx==/base.apk，
+     * 这条路径里**不含** "libantihook_bypass.so"，所以只列 so 名根本匹配不到。
+     *
+     * 实测：在 com.zhenxi.hunter 主进程的真实 maps 里，
+     * 它自己的 base.apk 被映射 3 次，全部可见。
+     * 也就是说目标只要看一眼 maps 就能直接认出"装了 AntiHookBypass 模块"，
+     * 随后走它的 JVMTI 反制路径把运行时切成 debuggable，
+     * 与 lsplant 已改写的入口撞车，ART 的 zombie_code_ 断言失败并 abort。
+     */
+    "com.rev.antihookbypass",
+    "antihookbypass",
     "/data/adb/ap/",
     NULL
 };
@@ -90,7 +105,7 @@ static const char *const g_trace_markers[] = {
  * 实测给 JIT 页撤执行权限会让 ART 当场 abort
  * （"Jit code cache for mutator"(exclusive held)）。
  */
-static int maps_line_is_trace_len(const char *line, size_t len);
+int maps_line_is_trace_len(const char *line, size_t len);
 
 /*
  * 有界子串搜索。
@@ -125,7 +140,7 @@ static const char *ahb_memstr(const char *hay, size_t haylen, const char *needle
     return NULL;
 }
 
-static int maps_line_is_trace_len(const char *line, size_t len) {
+int maps_line_is_trace_len(const char *line, size_t len) {
     const char *const *m;
     for (m = g_trace_markers; *m; m++) {
         if (ahb_memstr(line, len, *m)) return 1;
@@ -239,6 +254,93 @@ static int g_enable_maps_hide = 0;
  * 认三种写法：/proc/self/maps、/proc/<本pid>/maps、以及 task 视角。
  * 检测器常用显式 pid 那种，因为它认为"自己算出来的 pid 更可信"。
  */
+/*
+ * 探针：记录目标进程实际打开过哪些 /proc 路径。
+ *
+ * 用途是测量，不是拦截。我们目前只伪造了 /proc/self/maps 一份视图，
+ * 而真实的反检测要求"所有视角互相一致"：maps 说没有某段，
+ * 那么 map_files、smaps、fd 目录也必须一致，否则两边一对照就露。
+ *
+ * 所以第一步必须知道它到底开了哪些路径，而不是凭猜测去伪造一堆。
+ * 只记路径、去重、限 64 条，不做任何行为改变。
+ * 定位完成后由 AHB_PROBE 宏整体关掉。
+ */
+#ifndef AHB_PROBE
+/*
+ * 诊断自检开关。默认关。
+ *
+ * 打开时会在早初始化阶段连续 open /proc/self/{maps,smaps,mounts} 与
+ * /proc/modules 各一次并全量扫一遍——那几条路径本身也要走我们的
+ * 过滤函数。在目标进程的加载早期做这些额外动作，会把"初始化窗口"
+ * 拉长，且曾经引出过 clv_build 里的越界读。
+ * 定位完就关掉，生产不留。
+ */
+#define AHB_PROBE 0
+#endif
+
+static void ahb_probe_path(const char *path) {
+#if AHB_PROBE
+    if (!path) return;
+    if (path[0] != '/' || memcmp(path, "/proc/", 6) != 0) return;
+    static unsigned long long seen[64];
+    static int nseen = 0;
+    unsigned long long h = 1469598103934665603ULL;
+    for (const char *p = path; *p; p++) {
+        h ^= (unsigned long long)(unsigned char)*p;
+        h *= 1099511628211ULL;
+    }
+    for (int i = 0; i < nseen; i++) if (seen[i] == h) return;
+    if (nseen >= 64) return;
+    seen[nseen++] = h;
+    LOGI("PROBE proc-open %s", path);
+#endif
+}
+
+/* ------------------------------------------------------------------ */
+/* 让 JVMTI / JDWP 的库文件在这个进程里"不存在"                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 为什么不是在 dlopen 上拦
+ * -----------------------
+ * 实测：在 hunter 主进程里给 dlopen 加探针，整轮只记录到 1 次调用
+ * （libc.so）。也就是目标根本没走 dlopen 去拉 JVMTI 库 ——
+ * 它用的是静态编进 libhunter.so 里的 **xDL**，自己走 linker 内部结构。
+ * 所以拦 dlopen / dlsym 都没命中（实测屏蔽日志 0 条）。
+ *
+ * 但 xDL 无论怎么绕，最终都必须 open 那个 .so 文件才能 mmap。
+ * 因此在路径层让它"不存在"，是这条链上绕不过去的一环。
+ *
+ * 这条与隐藏 maps 是同一类手段：让它拿不到那件东西，而不是改它的结论。
+ * 目标自己带 xdl_open ERROR 的失败分支，拿不到就正常跳过 JVMTI 初始化，
+ * 于是不会走 UpdateEntrypointsForDebuggable，也就不会踩
+ * jit_code_cache 的 zombie_code_ 断言（该断言的完整栈见 dlopen 拦截处注释）。
+ */
+#ifndef AHB_HIDE_JVMTI_FILE
+#define AHB_HIDE_JVMTI_FILE 1
+#endif
+
+static int ahb_is_hidden_file(const char *path) {
+    if (!path) return 0;
+#if AHB_HIDE_JVMTI_FILE
+    /*
+     * 只藏 JVMTI/JDWP 这一类"调试代理"库。
+     * 不做宽泛匹配：误藏普通库会直接让目标功能缺失。
+     */
+    if (strstr(path, "libopenjdkjvmti.so")) return 1;
+    if (strstr(path, "libjdwp.so")) return 1;
+    if (strstr(path, "libdt_jdwp.so")) return 1;
+#endif
+    return 0;
+}
+
+/* 早期初始化进展，定义在 native_main.c，供诊断日志带出 */
+int ahb_early_stage_get(void);
+int ahb_jvmti_result_get(void);
+int ahb_jvmti_diag_get(void);
+int ahb_libart_diag_get(void);
+int ahb_elf_diag_get(void);
+
 static int maps_path_is_self(const char *path) {
     char want[64];
     if (!path) return 0;
@@ -371,6 +473,205 @@ static long     g_maps_ttl_nsec = 0;
 static unsigned long g_maps_ttl_hits = 0;
 
 /* 用一段内容造一个全新的 memfd，调用方独占其偏移 */
+/* ================================================================== */
+/* fd 身份伪装：让伪造的 memfd 在 stat 里看起来就是真的 procfs 文件      */
+/* ================================================================== */
+
+/*
+ * 为什么必须做这一步（有据，不是推测）
+ * ------------------------------------
+ * 目标应用 libhunter.so 里存在这些字符串：
+ *
+ *   start checkFileIsLegal fstat64 uid ->
+ *   maps inode ->  :        orig inode ->  :   inode mismatching ->
+ *   Found inconsistent inode :
+ *   readlink find root file
+ *
+ * 它的做法是：open("/proc/self/maps") 拿到 fd，先用 fstat64 取 fd 的
+ * inode，再读内容取每一行的 inode 字段，两边对不上就判定"被 hook"。
+ *
+ * 而我们交出去的是 memfd：内容和真实 maps 一致（路径名已改写），
+ * 但 fd 这个对象本身是 tmpfs 上的匿名文件，st_dev/st_ino/st_size
+ * 与 procfs 完全不同 —— 一比对必然不一致。于是它判定篡改并自我终止。
+ *
+ * 修法不是改比对结果，而是让 memfd 在元数据上与它冒充的那个 procfs
+ * 文件完全一致：提前 fstat 一份真实 /proc 文件缓存起来，凡是被问到
+ * 我们自己的 memfd，就交这份真实值。
+ */
+
+/* 本地 syscall 原型：文件后段才定义 syscall6_fn，这里前方已要用到 */
+typedef long (*ahb_sys6_fn)(long, long, long, long, long, long, long);
+
+/* 不同 bionic 版本对 fstatat 的系统调用名不一致，统一一个别名 */
+#ifndef SYS_newfstatat
+#ifdef SYS_fstatat64
+#define SYS_newfstatat SYS_fstatat64
+#elif defined(__NR_newfstatat)
+#define SYS_newfstatat __NR_newfstatat
+#else
+#define SYS_newfstatat 79   /* arm64/aarch64 通用编号 */
+#endif
+#endif
+
+#define AHB_FAKE_FD_MAX 32
+static int g_fake_fd[AHB_FAKE_FD_MAX];
+static int g_fake_fd_kind[AHB_FAKE_FD_MAX];   /* 0=maps 1=smaps 2=mounts 3=modules */
+static int g_fake_fd_n;
+static struct stat g_real_stat[4];
+static int g_real_stat_ok[4];
+
+static void ahb_fake_fd_register(int fd, int kind) {
+    int i;
+    if (fd < 0 || kind < 0 || kind > 3) return;
+    for (i = 0; i < g_fake_fd_n; i++) {
+        if (g_fake_fd[i] == fd) { g_fake_fd_kind[i] = kind; return; }
+    }
+    if (g_fake_fd_n >= AHB_FAKE_FD_MAX) {
+        /* 满了就覆盖最旧的一格，避免无限增长 */
+        g_fake_fd[0] = fd; g_fake_fd_kind[0] = kind;
+        return;
+    }
+    g_fake_fd[g_fake_fd_n] = fd;
+    g_fake_fd_kind[g_fake_fd_n] = kind;
+    g_fake_fd_n++;
+}
+
+static void ahb_fake_fd_unregister(int fd) {
+    int i;
+    for (i = 0; i < g_fake_fd_n; i++) {
+        if (g_fake_fd[i] == fd) {
+            g_fake_fd[i] = g_fake_fd[g_fake_fd_n - 1];
+            g_fake_fd_kind[i] = g_fake_fd_kind[g_fake_fd_n - 1];
+            g_fake_fd_n--;
+            return;
+        }
+    }
+}
+
+static int ahb_fake_fd_kind_of(int fd) {
+    int i;
+    for (i = 0; i < g_fake_fd_n; i++)
+        if (g_fake_fd[i] == fd) return g_fake_fd_kind[i];
+    return -1;
+}
+
+/*
+ * 预取真实 /proc 文件的 stat。
+ * 用 openat 直接拿 fd 再 fstat，避免被自己的 open 包装绕回来。
+ */
+static void ahb_prefetch_real_stats(void) {
+    static const char *const paths[4] = {
+        "/proc/self/maps", "/proc/self/smaps",
+        "/proc/self/mounts", "/proc/self/modules"
+    };
+    int k;
+    maps_ensure_raw_syscall();
+    if (!g_raw_syscall) return;
+    for (k = 0; k < 4; k++) {
+        long fd;
+        if (g_real_stat_ok[k]) continue;
+        fd = ((ahb_sys6_fn)g_raw_syscall)(SYS_openat, AT_FDCWD,
+                                          (long)paths[k], O_RDONLY, 0, 0, 0);
+        if (fd < 0) continue;
+        {
+            struct stat st;
+            long r = ((ahb_sys6_fn)g_raw_syscall)(SYS_fstat, fd,
+                                                  (long)&st, 0, 0, 0, 0);
+            if (r == 0) {
+                g_real_stat[k] = st;
+                g_real_stat_ok[k] = 1;
+            }
+        }
+        ((ahb_sys6_fn)g_raw_syscall)(SYS_close, fd, 0, 0, 0, 0, 0);
+    }
+}
+
+/*
+ * 把 fd 的 stat 换成本模块伪装值；返回 1 表示已替换。
+ * 不改调用者的其它行为，只在确实是我们自己的 fd 时才动手。
+ */
+static int ahb_fd_fake_stat(int fd, void *buf) {
+    int kind = ahb_fake_fd_kind_of(fd);
+    if (kind < 0 || !buf || !g_real_stat_ok[kind]) return 0;
+    *(struct stat *)buf = g_real_stat[kind];
+    return 1;
+}
+
+/* readlink 伪装：/proc/self/fd/N 应指向真实 maps 路径 */
+/*
+ * 让 readlink 对"我们伪造的 fd"返回真实 procfs 路径。
+ *
+ * 依据（hunter 6.58 自己打印的判定过程，不是推测）
+ * ----------------------------------------------
+ *   find libart.so hooked 4096
+ *   /proc/18023/maps
+ *   checkFileIsLegal path validation failed
+ *   /proc/18023/maps
+ *   /memfd:maps (deleted)
+ *
+ * 它先 open("/proc/<pid>/maps")，再 readlink 这个 fd 的真实路径来核对
+ * "你给我的到底是不是 maps"。而我们用 memfd 造的假文件，路径天然是
+ * /memfd:maps (deleted)，一眼就被识破。
+ *
+ * 这里修掉了原实现的两个漏洞：
+ *
+ * 1) 原实现只认 "/proc/self/fd/" 和 "/proc/thread-self/fd/"。
+ *    但目标用的是带 pid 的 "/proc/18023/fd/N"（它在别的进程里查主进程），
+ *    这条路径根本匹配不上，直接漏过去。
+ *
+ * 2) 原实现返回路径时用的是 getpid()。
+ *    即便 pid 形式被识别，返回的也是"我这个进程的 maps"，
+ *    与对方请求的 pid 不一致，同样过不了校验。
+ *    正确做法是照抄请求里的 pid。
+ */
+static int ahb_fd_fake_readlink(const char *path, char *buf, size_t sz) {
+    int fd, kind;
+    const char *p;
+    const char *fdp;
+    int pid = 0;
+    char tmp[96];
+    int n;
+
+    if (!path || !buf || sz == 0) return -1;
+
+    /* 统一解析成 "<pid> + fd 数字" 两个值 */
+    p = strstr(path, "/proc/");
+    if (!p) return -1;
+    p += 6;
+
+    if (strncmp(p, "self/", 5) == 0) {
+        pid = (int)getpid();
+        fdp = p + 5;
+    } else if (strncmp(p, "thread-self/", 12) == 0) {
+        pid = (int)getpid();
+        fdp = p + 12;
+    } else if (p[0] >= '0' && p[0] <= '9') {
+        char *endp = NULL;
+        long v = strtol(p, &endp, 10);
+        if (!endp || v <= 0 || v > 0x7fffffffL) return -1;
+        pid = (int)v;
+        if (*endp != '/') return -1;
+        fdp = endp + 1;
+    } else {
+        return -1;
+    }
+
+    if (strncmp(fdp, "fd/", 3) != 0) return -1;
+    fd = atoi(fdp + 3);
+
+    kind = ahb_fake_fd_kind_of(fd);
+    if (kind < 0) return -1;
+
+    {
+        static const char *const nm[4] = { "maps", "smaps", "mounts", "modules" };
+        n = snprintf(tmp, sizeof(tmp), "/proc/%d/%s", pid, nm[kind]);
+    }
+    if (n <= 0 || (size_t)n >= sz) return -1;
+    memcpy(buf, tmp, (size_t)n + 1);
+    return n;
+}
+
+
 static int maps_memfd_of(const char *buf, size_t len) {
     int fd = (int)syscall(SYS_memfd_create, "maps", 0);
     size_t off = 0;
@@ -381,6 +682,7 @@ static int maps_memfd_of(const char *buf, size_t len) {
         off += (size_t)k;
     }
     syscall(SYS_lseek, fd, 0, SEEK_SET);
+    ahb_fake_fd_register(fd, 0);
     return fd;
 }
 
@@ -518,7 +820,22 @@ static size_t maps_emit_masked_line(char *out, size_t w, size_t cap,
         if (line[i] == ' ' || line[i] == '\t') { i++; continue; }
         fields++;
         while (i < len && line[i] != ' ' && line[i] != '\t') i++;
-        if (fields == 6) { /* inode 之后就是路径 */
+        /*
+         * 字段次序：addr(1) perm(2) offset(3) dev(4) inode(5) path(6)。
+         *
+         * 这里必须是 fields == 5 —— 第 5 个字段（inode）读完之后，
+         * 紧接着才是路径。
+         *
+         * 曾经写成 fields == 6，那是差一错误，而且表现得极其隐蔽：
+         * 循环在 fields==6 时已经把"路径"这个字段整段吃掉了，
+         * 于是 path_at 落在行尾（== len），走下面"没有路径字段"的分支，
+         * 把整行原样抄进输出 —— 路径一个字节都没换。
+         *
+         * 后果：过滤看起来在跑（总长度确实变了，因为别的行有合并），
+         * 但痕迹行全部原样保留。实测在 hunter 主进程里
+         * 包装视图仍含 3 行 com.rev.antihookbypass 就是这么来的。
+         */
+        if (fields == 5) {
             while (i < len && (line[i] == ' ' || line[i] == '\t')) i++;
             path_at = i;
             break;
@@ -622,7 +939,10 @@ static size_t maps_emit_line(char *out, size_t w, size_t cap, const struct maps_
     return w;
 }
 
-static int maps_make_clean_fd(void) {
+static int maps_make_clean_fd_ex(int is_smaps);
+static int maps_make_clean_fd(void) { return maps_make_clean_fd_ex(0); }
+
+static int maps_make_clean_fd_ex(int is_smaps) {
     char *raw = NULL, *out = NULL;
     size_t cap = 0, w = 0;
     int n, dropped = 0;
@@ -648,7 +968,7 @@ static int maps_make_clean_fd(void) {
     {
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        if (g_maps_ttl_buf && g_maps_ttl_len &&
+        if (!is_smaps && g_maps_ttl_buf && g_maps_ttl_len &&
             (now.tv_sec - g_maps_ttl_sec) * 1000L +
             (now.tv_nsec - g_maps_ttl_nsec) / 1000000L < MAPS_TTL_MS) {
             int f = maps_memfd_of(g_maps_ttl_buf, g_maps_ttl_len);
@@ -778,9 +1098,30 @@ static int maps_make_clean_fd(void) {
                      * 合并成连续段后，它看到的 linker64 与未注入时一致，
                      * 不会算出越界地址。
                      */
-                    if (have_prev && ce.path[0] &&
-                        strstr(prev_path, "linker64") &&
-                        strstr(ce.path, "linker64") &&
+                    /*
+                     * 同文件、地址相邻、权限相同的可执行段：合并成一行。
+                     *
+                     * 这里原本只匹配 "linker64"，那是按第一个遇到的样本
+                     * （hunter 崩溃在 linker64 越界）窄化出来的。
+                     * 实测同样的问题也出现在 libart.so 上：
+                     *
+                     *   7a8e44e000-7a8e44f000 r-xp 00ba0000 .../libart.so
+                     *   7a8e44f000-7a8e736000 r-xp 00ba1000 .../libart.so
+                     *
+                     * 那个 4KB 的碎片是我们自己造成的 —— 为了让
+                     * UpdateEntrypointsForDebuggable 的入口可写，
+                     * 对该页做过 mprotect，内核因此把 VMA 拆开了。
+                     * hunter 6.58 会把它当成"libart.so 被 hook"的直接证据：
+                     *
+                     *   find libart.so hooked 4096
+                     *   exec address start-> 0x7a8e44e000
+                     *   exec address end->   0x7a8e44f000
+                     *
+                     * 判据改成通用形式：同路径 + 权限相同 + 首尾相接。
+                     * 这对任何被注入框架拆碎过的库都成立，不针对某个检测器。
+                     */
+                    if (!is_smaps && have_prev && ce.path[0] &&
+                        strcmp(prev_path, ce.path) == 0 &&
                         strncmp(ce.perm, "r-x", 3) == 0 &&
                         strncmp(prev_perm, "r-x", 3) == 0 &&
                         ce.start == prev_e) {
@@ -850,7 +1191,7 @@ static int maps_make_clean_fd(void) {
     {
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        if (g_maps_ttl_buf) { free(g_maps_ttl_buf); g_maps_ttl_buf = NULL; g_maps_ttl_len = 0; }
+        if (!is_smaps && g_maps_ttl_buf) { free(g_maps_ttl_buf); g_maps_ttl_buf = NULL; g_maps_ttl_len = 0; }
         {
             char *cp = (char *)malloc(w ? w : 1);
             if (cp) {
@@ -1003,11 +1344,236 @@ void *ahb_android_dlopen_ext_wrap(const char *name, int flags, const void *extin
 int ahb_libview_fd_for(const char *path);
 static int ahb_is_libview_target(const char *path);
 
+/* ================= 其它 /proc 入口的过滤 ================= */
+
+/*
+ * 为什么必须把过滤面从一个入口扩到多个
+ * ------------------------------------
+ * 之前只伪造了 /proc/self/maps 一份视图，其余入口全部原样透传。
+ * 这在反检测上是致命的：单独看 maps 是干净的，可只要换成 smaps、
+ * 或者去看 /proc/mounts，同一个事实立刻露出来。对方不需要多聪明，
+ * 两个入口一对就够。
+ *
+ * 实测依据（在本机 hunter 6.58 进程里统计）：
+ *   maps  命中 antihookbypass/liblspd/lsplant/lsposed 共 6 行
+ *   smaps 同样 6 行 —— 因为 smaps 路径里不含 "/maps" 子串，
+ *         原有的路径判定根本没覆盖到它
+ *
+ * 所以这里按"同一事实在每个入口都一致"来补：
+ *   - smaps      : 与 maps 同样的路径改写（但不做段合并，见下）
+ *   - mounts 系  : 丢掉携带 root/模块目录的行
+ *   - modules    : 丢掉携带可疑模块名的行
+ *
+ * smaps 为什么不能做段合并：
+ *   smaps 每个映射下面跟着一串明细行（Size/KernelPageSize/Rss...）。
+ *   段合并依赖"相邻两行是映射行"，而明细行会打断这个判断；
+ *   强行合并还会把明细行的归属搞错。宁可 smaps 保持未合并，
+ *   也不能输出结构错乱的内容——错乱本身就比泄漏更容易被识别。
+ */
+
+static int ahb_is_smaps_path(const char *path) {
+    char want[64];
+    if (!path) return 0;
+    if (strcmp(path, "/proc/self/smaps") == 0) return 1;
+    snprintf(want, sizeof(want), "/proc/%d/smaps", (int)getpid());
+    if (strcmp(path, want) == 0) return 1;
+    snprintf(want, sizeof(want), "/proc/%d/smaps", (int)getppid());
+    if (strcmp(path, want) == 0) return 1;
+    return 0;
+}
+
+static int ahb_is_mounts_path(const char *path) {
+    if (!path) return 0;
+    if (!strcmp(path, "/proc/mounts") ||
+        !strcmp(path, "/proc/self/mounts") ||
+        !strcmp(path, "/proc/mountinfo") ||
+        !strcmp(path, "/proc/self/mountinfo") ||
+        !strcmp(path, "/proc/mountstats") ||
+        !strcmp(path, "/proc/self/mountstats")) return 1;
+
+    /*
+     * 带 pid 的形式：/proc/<pid>/mounts 等。
+     *
+     * 必须单列。实测 hunter 是在**子进程里**读主进程的
+     * /proc/<pid>/mounts 来判断 root 的，路径里带的是对方的 pid，
+     * 上面那批精确比较一条都匹配不上，于是整条过滤被绕过，
+     * 它直接读到：
+     *
+     *   /dev/block/dm-39 /data/adb/modules/murongruyan/... f2fs rw,...
+     *
+     * 然后判定 "Check Find Root In Mounts" 命中。
+     */
+    if (strncmp(path, "/proc/", 6) == 0) {
+        const char *p = path + 6;
+        const char *end = p;
+        while (*end >= '0' && *end <= '9') end++;
+        if (end > p && *end == '/') {
+            const char *rest = end + 1;
+            if (!strcmp(rest, "mounts") || !strcmp(rest, "mountinfo") ||
+                !strcmp(rest, "mountstats")) return 1;
+        }
+    }
+    return 0;
+}
+
+static int ahb_is_modules_path(const char *path) {
+    return path && !strcmp(path, "/proc/modules");
+}
+
+/* 整文件读入（走真实 syscall，避免递归回自己的包装） */
+static char *ahb_read_file_all(const char *path, size_t *out_len) {
+    size_t cap = 256 * 1024, len = 0;
+    char *buf;
+    long fd = (long)syscall(SYS_openat, AT_FDCWD, path, O_RDONLY, 0);
+    if (fd < 0) return NULL;
+    buf = (char *)malloc(cap);
+    if (!buf) { syscall(SYS_close, (int)fd); return NULL; }
+    for (;;) {
+        long k;
+        if (len + 65536 > cap) {
+            char *nb;
+            if (cap >= 16u * 1024u * 1024u) break;
+            cap *= 2;
+            nb = (char *)realloc(buf, cap);
+            if (!nb) { free(buf); syscall(SYS_close, (int)fd); return NULL; }
+            buf = nb;
+        }
+        k = (long)syscall(SYS_read, (int)fd, buf + len, cap - len - 1);
+        if (k <= 0) break;
+        len += (size_t)k;
+    }
+    syscall(SYS_close, (int)fd);
+    buf[len] = 0;
+    *out_len = len;
+    return buf;
+}
+
+/* 从已打开的 fd 读全文（自检用；读前 seek 到 0） */
+static char *ahb_read_file_all_fd(int fd, size_t *out_len) {
+    size_t cap = 256 * 1024, len = 0;
+    char *buf;
+    if (fd < 0) return NULL;
+    syscall(SYS_lseek, fd, 0, SEEK_SET);
+    buf = (char *)malloc(cap);
+    if (!buf) return NULL;
+    for (;;) {
+        long k;
+        if (len + 65536 > cap) {
+            char *nb;
+            if (cap >= 16u * 1024u * 1024u) break;
+            cap *= 2;
+            nb = (char *)realloc(buf, cap);
+            if (!nb) { free(buf); return NULL; }
+            buf = nb;
+        }
+        k = (long)syscall(SYS_read, fd, buf + len, cap - len - 1);
+        if (k <= 0) break;
+        len += (size_t)k;
+    }
+    buf[len] = 0;
+    *out_len = len;
+    return buf;
+}
+
+static int ahb_memfd_from_buf(const char *buf, size_t len) {
+    size_t off = 0;
+    int fd = (int)syscall(SYS_memfd_create, "ahb", 0);
+    if (fd < 0) return -1;
+    while (off < len) {
+        long k = syscall(SYS_write, (int)fd, buf + off, len - off);
+        if (k <= 0) { syscall(SYS_close, fd); return -1; }
+        off += (size_t)k;
+    }
+    syscall(SYS_lseek, (int)fd, 0, SEEK_SET);
+    return fd;
+}
+
+/*
+ * 一行里是否带着"这个设备不干净"的证据。
+ *
+ * mounts 与 modules 用不同的词表：mounts 关注被挂进来的模块目录与
+ * 伪装成文件系统的 root 实现；modules 关注内核模块名。
+ *
+ * 判定用有界搜索（ahb_memstr），不用 strstr：这些缓冲区没有逐行
+ * 加 '\0'，strstr 会越过本行一直扫到缓冲区末尾，行数一多就非常慢。
+ */
+static int ahb_mount_line_bad(const char *line, size_t len) {
+    static const char *const mk[] = {
+        "/data/adb", "KSU", "kernelsu", "KernelSU",
+        "magisk", "Magisk", "apatch", "APatch",
+        "zygisk", "Zygisk", "riru", "Riru", NULL
+    };
+    const char *const *m;
+    for (m = mk; *m; m++) if (ahb_memstr(line, len, *m)) return 1;
+    return 0;
+}
+
+static int ahb_module_line_bad(const char *line, size_t len) {
+    static const char *const mk[] = {
+        "kernelsu", "ksu_", "KSU", "magisk", "apatch",
+        "zygisk", "frida", "dobby", NULL
+    };
+    const char *const *m;
+    for (m = mk; *m; m++) if (ahb_memstr(line, len, *m)) return 1;
+    return 0;
+}
+
+/* 逐行过滤：丢掉可疑整行，其余原样保留 */
+static int ahb_make_text_filtered_fd(const char *path, int mounts_mode) {
+    size_t len = 0, w = 0;
+    char *raw, *out, *p;
+    int fd;
+    raw = ahb_read_file_all(path, &len);
+    if (!raw) return -1;
+    out = (char *)malloc(len + 2);
+    if (!out) { free(raw); return -1; }
+    p = raw;
+    while (p && *p) {
+        char *nl = strchr(p, '\n');
+        size_t L = nl ? (size_t)(nl - p + 1) : strlen(p);
+        size_t body = nl ? (size_t)(nl - p) : strlen(p);
+        int bad = mounts_mode ? ahb_mount_line_bad(p, body)
+                              : ahb_module_line_bad(p, body);
+        if (!bad) { memcpy(out + w, p, L); w += L; }
+        if (!nl) break;
+        p = nl + 1;
+    }
+    fd = ahb_memfd_from_buf(out, w);
+    free(raw);
+    free(out);
+    return fd;
+}
+
+/*
+ * 统一入口：给一个路径，返回"应该交给对方的 fd"，没有则 -1。
+ * 所有 open/openat/fopen 包装都只调这一个函数，避免各入口漏配。
+ */
+static int ahb_proc_filter_wanted(const char *path) {
+    return maps_path_is_self(path) || ahb_is_smaps_path(path) ||
+           ahb_is_mounts_path(path) || ahb_is_modules_path(path);
+}
+
+static int ahb_filtered_fd_for(const char *path) {
+    if (!path) return -1;
+    if (ahb_is_smaps_path(path)) return maps_make_clean_fd_ex(1);
+    if (maps_path_is_self(path)) return maps_make_clean_fd_ex(0);
+    if (ahb_is_mounts_path(path)) return ahb_make_text_filtered_fd(path, 1);
+    if (ahb_is_modules_path(path)) return ahb_make_text_filtered_fd(path, 0);
+    return -1;
+}
+
 static int maps_open_wrap(const char *path, int flags, mode_t mode) {
     struct timespec _ts0, _ts1;
     clock_gettime(CLOCK_MONOTONIC, &_ts0);
     g_c_open++;
     maps_resolve_reals();
+    ahb_probe_path(path);
+    if (ahb_is_hidden_file(path)) {
+        LOGE("隐藏文件: %s", path);
+        maps_ensure_raw_syscall();
+        errno = ENOENT;
+        return -1;
+    }
     g_maps_open_calls++;
     maps_lazy_rescan();
     /* 诊断：记录实际经过的路径，确认目标用什么姿势读 maps */
@@ -1022,18 +1588,17 @@ static int maps_open_wrap(const char *path, int flags, mode_t mode) {
         int lv = ahb_libview_fd_for(path);
         if (lv >= 0) return lv;
     }
-    if (maps_path_is_self(path)) {
+    {
         struct timespec _s0, _s1;
+        int fd;
         clock_gettime(CLOCK_MONOTONIC, &_s0);
-        int fd = maps_make_clean_fd();
+        fd = ahb_filtered_fd_for(path);
         clock_gettime(CLOCK_MONOTONIC, &_s1);
-        g_c_self++;
-        g_t_self += (unsigned long)((_s1.tv_sec - _s0.tv_sec) * 1000000L
-                                    + (_s1.tv_nsec - _s0.tv_nsec) / 1000L);
         if (fd >= 0) {
-            {
-                struct timespec _n; clock_gettime(CLOCK_BOOTTIME, &_n);
-                ahb_filelog("CLEAN t=%lld", (long long)_n.tv_sec * 1000000000LL + _n.tv_nsec);
+            if (ahb_proc_filter_wanted(path)) {
+                g_c_self++;
+                g_t_self += (unsigned long)((_s1.tv_sec - _s0.tv_sec) * 1000000L
+                                            + (_s1.tv_nsec - _s0.tv_nsec) / 1000L);
             }
             clock_gettime(CLOCK_MONOTONIC, &_ts1);
             g_t_open += (unsigned long)((_ts1.tv_sec - _ts0.tv_sec) * 1000000L
@@ -1054,9 +1619,17 @@ static int maps_open_wrap(const char *path, int flags, mode_t mode) {
 static int maps_openat_wrap(int dirfd, const char *path, int flags, mode_t mode) {
     g_c_openat++;
     maps_resolve_reals();
+    if (ahb_is_hidden_file(path)) {
+        LOGE("隐藏文件: %s", path);
+        maps_ensure_raw_syscall();
+        errno = ENOENT;
+        return -1;
+    }
+
+    ahb_probe_path(path);
     g_maps_open_calls++;
-    if (maps_path_is_self(path)) {
-        int fd = maps_make_clean_fd();
+    {
+        int fd = ahb_filtered_fd_for(path);
         if (fd >= 0) return fd;
     }
     if (g_real_openat) return g_real_openat(dirfd, path, flags, mode);
@@ -1066,6 +1639,7 @@ static int maps_openat_wrap(int dirfd, const char *path, int flags, mode_t mode)
 static void *maps_fopen_wrap(const char *path, const char *mode) {
     g_c_fopen++;
     maps_resolve_reals();
+    ahb_probe_path(path);
     g_maps_open_calls++;
     maps_lazy_rescan();
     {
@@ -1075,8 +1649,8 @@ static void *maps_fopen_wrap(const char *path, const char *mode) {
             ahb_filelog("FOPEN %s", path);
         }
     }
-    if (maps_path_is_self(path)) {
-        int fd = maps_make_clean_fd();
+    {
+        int fd = ahb_filtered_fd_for(path);
         if (fd >= 0) {
             FILE *f = fdopen(fd, "r");
             if (f) return (void *)f;
@@ -1092,8 +1666,8 @@ static int maps_open_2_wrap(const char *path, int flags) {
     g_c_open2++;
     maps_resolve_reals();
     g_maps_open_calls++;
-    if (maps_path_is_self(path)) {
-        int fd = maps_make_clean_fd();
+    if (ahb_proc_filter_wanted(path)) {
+        int fd = ahb_filtered_fd_for(path);
         if (fd >= 0) return fd;
         }
     if (g_real_open_2) return g_real_open_2(path, flags);
@@ -1104,8 +1678,8 @@ static int maps_open64_wrap(const char *path, int flags, mode_t mode) {
     g_c_open64++;
     maps_resolve_reals();
     g_maps_open_calls++;
-    if (maps_path_is_self(path)) {
-        int fd = maps_make_clean_fd();
+    if (ahb_proc_filter_wanted(path)) {
+        int fd = ahb_filtered_fd_for(path);
         if (fd >= 0) return fd;
         }
     if (g_real_open64) return g_real_open64(path, flags, mode);
@@ -1116,8 +1690,8 @@ static int maps_openat_2_wrap(int dirfd, const char *path, int flags) {
     g_c_openat2++;
     maps_resolve_reals();
     g_maps_open_calls++;
-    if (maps_path_is_self(path)) {
-        int fd = maps_make_clean_fd();
+    if (ahb_proc_filter_wanted(path)) {
+        int fd = ahb_filtered_fd_for(path);
         if (fd >= 0) return fd;
         }
     if (g_real_openat_2) return g_real_openat_2(dirfd, path, flags);
@@ -1128,8 +1702,8 @@ static int maps_open64_2_wrap(const char *path, int flags) {
     g_c_open642++;
     maps_resolve_reals();
     g_maps_open_calls++;
-    if (maps_path_is_self(path)) {
-        int fd = maps_make_clean_fd();
+    if (ahb_proc_filter_wanted(path)) {
+        int fd = ahb_filtered_fd_for(path);
         if (fd >= 0) return fd;
         }
     if (g_real_open64_2) return g_real_open64_2(path, flags);
@@ -1154,7 +1728,7 @@ static void *maps_popen_wrap(const char *cmd, const char *mode) {
     maps_resolve_reals();
     if (cmd && strstr(cmd, "/proc/self/maps")) {
         g_maps_open_calls++;
-        int fd = maps_make_clean_fd();
+        int fd = ahb_filtered_fd_for("/proc/self/maps");
         if (fd >= 0) {
             /*
              * 让 cat 直接读 /proc/self/fd/<n>，不再往磁盘落临时文件。
@@ -1503,13 +2077,21 @@ static long maps_syscall_wrap(long number, long a1, long a2, long a3,
 #else
         const char *path = (const char *)a2;
 #endif
+        /*
+         * xDL 用原始系统调用打开库文件，绕过 open/openat 的 GOT 补丁。
+         * 所以在 syscall 这一层也拦一次 JVMTI/JDWP 的库文件。
+         */
+        if (path && ahb_is_hidden_file(path)) {
+            errno = ENOENT;
+            return -1;
+        }
         if (path && maps_path_is_self(path)) {
-            int fd = maps_make_clean_fd();
+            int fd = ahb_filtered_fd_for(path);
             if (fd >= 0) return (long)fd;
         }
     }
     if (g_raw_syscall)
-        return ((syscall6_fn)g_raw_syscall)(number, a1, a2, a3, a4, a5, a6);
+        return ((ahb_sys6_fn)g_raw_syscall)(number, a1, a2, a3, a4, a5, a6);
     return -1;
 }
 
@@ -1517,6 +2099,120 @@ static long maps_syscall_wrap(long number, long a1, long a2, long a3,
 static ssize_t clv_pvr_entry(pid_t pid, const struct iovec *local, unsigned long liovcnt,
                              const struct iovec *remote, unsigned long riovcnt,
                              unsigned long flags);
+
+/* ---- stat 家族包装 ---- */
+int ahb_fstat_wrap(int fd, void *buf) {
+    if (ahb_fd_fake_stat(fd, buf)) return 0;
+    maps_ensure_raw_syscall();
+    if (!g_raw_syscall) return -1;
+    return (int)((ahb_sys6_fn)g_raw_syscall)(SYS_fstat, fd, (long)buf, 0, 0, 0, 0);
+}
+static int ahb_fstat64_wrap(int fd, void *buf) { return ahb_fstat_wrap(fd, buf); }
+static int ahb___fstat64_wrap(int fd, void *buf) { return ahb_fstat_wrap(fd, buf); }
+
+static int ahb_newfstatat_wrap(int dirfd, const char *path, void *buf, int flags) {
+    /*
+     * 目标是"打开过的 fd"，路径形式只可能是 /proc/self/fd/N。
+     * 命中时按 fd 伪装，否则原样转发。
+     */
+    if (path && buf) {
+        const char *p = strstr(path, "/fd/");
+        if (p) {
+            int fd = atoi(p + 4);
+            if (ahb_fd_fake_stat(fd, buf)) return 0;
+        }
+    }
+    maps_ensure_raw_syscall();
+    if (!g_raw_syscall) return -1;
+    return (int)((ahb_sys6_fn)g_raw_syscall)(SYS_newfstatat, dirfd,
+                                             (long)path, (long)buf, flags, 0, 0);
+}
+static int ahb_fstatat_wrap(int dirfd, const char *path, void *buf, int flags) {
+    return ahb_newfstatat_wrap(dirfd, path, buf, flags);
+}
+static int ahb_fstatat64_wrap(int dirfd, const char *path, void *buf, int flags) {
+    return ahb_newfstatat_wrap(dirfd, path, buf, flags);
+}
+static int ahb___fstatat64_wrap(int dirfd, const char *path, void *buf, int flags) {
+    return ahb_newfstatat_wrap(dirfd, path, buf, flags);
+}
+
+static int ahb_stat_common(const char *path, void *buf, int allow_follow) {
+    if (path && buf) {
+        const char *p = strstr(path, "/fd/");
+        if (p) {
+            int fd = atoi(p + 4);
+            if (ahb_fd_fake_stat(fd, buf)) return 0;
+        }
+    }
+    maps_ensure_raw_syscall();
+    if (!g_raw_syscall) return -1;
+    return (int)((ahb_sys6_fn)g_raw_syscall)(
+        allow_follow ? SYS_newfstatat : SYS_newfstatat,
+        AT_FDCWD, (long)path, (long)buf, allow_follow ? 0 : AT_SYMLINK_NOFOLLOW, 0, 0);
+}
+static int ahb_stat_wrap(const char *path, void *buf)  { return ahb_stat_common(path, buf, 1); }
+static int ahb_stat64_wrap(const char *path, void *buf){ return ahb_stat_common(path, buf, 1); }
+static int ahb___stat64_wrap(const char *path, void *buf){ return ahb_stat_common(path, buf, 1); }
+static int ahb_lstat_wrap(const char *path, void *buf) { return ahb_stat_common(path, buf, 0); }
+static int ahb_lstat64_wrap(const char *path, void *buf){ return ahb_stat_common(path, buf, 0); }
+
+/* ---- statfs 家族：把文件系统类型改回 procfs ---- */
+#ifndef AHB_PROC_SUPER_MAGIC
+#define AHB_PROC_SUPER_MAGIC 0x9fa0L
+#endif
+
+/*
+ * struct statfs 的第一个字段在 bionic 上是 f_type（long）。
+ * 只需要改这一项：inode 一致性靠 fstat，而"这个 fd 属于哪种文件系统"
+ * 靠 statfs。memfd 报的是 tmpfs 魔数，与 procfs 不符，同样会被识破。
+ */
+static int ahb_fstatfs_wrap(int fd, void *buf) {
+    int kind = ahb_fake_fd_kind_of(fd);
+    maps_ensure_raw_syscall();
+    if (!g_raw_syscall) return -1;
+    {
+        int r = (int)((ahb_sys6_fn)g_raw_syscall)(SYS_fstatfs, fd, (long)buf, 0, 0, 0, 0);
+        if (r == 0 && kind >= 0 && buf) *(long *)buf = AHB_PROC_SUPER_MAGIC;
+        return r;
+    }
+}
+static int ahb_fstatfs64_wrap(int fd, void *buf) { return ahb_fstatfs_wrap(fd, buf); }
+
+static int ahb_statfs_common(const char *path, void *buf) {
+    maps_ensure_raw_syscall();
+    if (!g_raw_syscall) return -1;
+    {
+        int r = (int)((ahb_sys6_fn)g_raw_syscall)(SYS_statfs, (long)path, (long)buf, 0, 0, 0, 0);
+        if (r == 0 && buf && path && strstr(path, "/proc/"))
+            *(long *)buf = AHB_PROC_SUPER_MAGIC;
+        return r;
+    }
+}
+static int ahb_statfs_wrap(const char *path, void *buf)   { return ahb_statfs_common(path, buf); }
+static int ahb_statfs64_wrap(const char *path, void *buf) { return ahb_statfs_common(path, buf); }
+
+/* ---- readlink：/proc/self/fd/N 要指向真实 proc 文件 ---- */
+static ssize_t ahb_readlink_wrap(const char *path, char *buf, size_t sz) {
+    int r = ahb_fd_fake_readlink(path, buf, sz);
+    if (r >= 0) return (ssize_t)r;
+    maps_ensure_raw_syscall();
+    if (!g_raw_syscall) return -1;
+    return (ssize_t)((ahb_sys6_fn)g_raw_syscall)(SYS_readlinkat, AT_FDCWD,
+                                                 (long)path, (long)buf, (long)sz, 0, 0);
+}
+ssize_t ahb_readlinkat_wrap(int dirfd, const char *path, char *buf, size_t sz) {
+    int r = ahb_fd_fake_readlink(path, buf, sz);
+    if (r >= 0) return (ssize_t)r;
+    maps_ensure_raw_syscall();
+    if (!g_raw_syscall) return -1;
+    return (ssize_t)((ahb_sys6_fn)g_raw_syscall)(SYS_readlinkat, dirfd,
+                                                 (long)path, (long)buf, (long)sz, 0, 0);
+}
+
+/* 前置声明：实现在文件后段 */
+static void *ahb_dlsym_wrap(void *handle, const char *symbol);
+static void *ahb_xdl_sym_wrap(void *handle, const char *symbol, void *size);
 
 /* 名字 -> 替换函数；返回 0 表示不接管这个符号 */
 static uintptr_t ahb_repl_for(const char *name) {
@@ -1545,7 +2241,42 @@ static uintptr_t ahb_repl_for(const char *name) {
      *
      * 只为记日志、却能在宿主退出时崩掉的东西，收益为负。全部撤掉。
      */
+    /*
+     * 退出入口重新接管（只记录 + 阻止，见 exit_probe.h 的说明）。
+     * 上一版因为"在退出路径上 fopen/dlsym"把进程崩了而整组撤掉；
+     * 现在改成零解析、零落盘，可以安全接管。
+     */
+    if (strcmp(name, "exit") == 0)            return (uintptr_t)ep_exit;
+    if (strcmp(name, "_exit") == 0)           return (uintptr_t)ep__exit;
+    if (strcmp(name, "kill") == 0)            return (uintptr_t)ep_kill;
+    if (strcmp(name, "raise") == 0)           return (uintptr_t)ep_raise;
+    if (strcmp(name, "abort") == 0)           return (uintptr_t)ep_abort;
+    if (strcmp(name, "tgkill") == 0)          return (uintptr_t)ep_tgkill;
+    if (strcmp(name, "exit_group") == 0)      return (uintptr_t)ep_exit_group;
     if (strcmp(name, "syscall") == 0)         return (uintptr_t)maps_syscall_wrap;
+    /*
+     * fd 元数据伪装（对据可查：目标 so 里有 checkFileIsLegal / fstat64 /
+     * "Found inconsistent inode" / readlink 这些字符串）。
+     * 不伪装的话，交出去的 memfd 在 inode 与文件系统类型上与 procfs 不符，
+     * 对方一比对就判定篡改。
+     */
+    if (strcmp(name, "fstat") == 0)           return (uintptr_t)ahb_fstat_wrap;
+    if (strcmp(name, "fstat64") == 0)         return (uintptr_t)ahb_fstat64_wrap;
+    if (strcmp(name, "__fstat64") == 0)       return (uintptr_t)ahb___fstat64_wrap;
+    if (strcmp(name, "fstatat") == 0)         return (uintptr_t)ahb_fstatat_wrap;
+    if (strcmp(name, "fstatat64") == 0)       return (uintptr_t)ahb_fstatat64_wrap;
+    if (strcmp(name, "__fstatat64") == 0)     return (uintptr_t)ahb___fstatat64_wrap;
+    if (strcmp(name, "stat") == 0)            return (uintptr_t)ahb_stat_wrap;
+    if (strcmp(name, "stat64") == 0)          return (uintptr_t)ahb_stat64_wrap;
+    if (strcmp(name, "__stat64") == 0)        return (uintptr_t)ahb___stat64_wrap;
+    if (strcmp(name, "lstat") == 0)           return (uintptr_t)ahb_lstat_wrap;
+    if (strcmp(name, "lstat64") == 0)         return (uintptr_t)ahb_lstat64_wrap;
+    if (strcmp(name, "statfs") == 0)          return (uintptr_t)ahb_statfs_wrap;
+    if (strcmp(name, "statfs64") == 0)        return (uintptr_t)ahb_statfs64_wrap;
+    if (strcmp(name, "fstatfs") == 0)         return (uintptr_t)ahb_fstatfs_wrap;
+    if (strcmp(name, "fstatfs64") == 0)       return (uintptr_t)ahb_fstatfs64_wrap;
+    if (strcmp(name, "readlink") == 0)        return (uintptr_t)ahb_readlink_wrap;
+    if (strcmp(name, "readlinkat") == 0)      return (uintptr_t)ahb_readlinkat_wrap;
     /*
      * dlopen 一族：这是"新库映射完成、JNI_OnLoad 还没执行"的唯一确定时刻。
      *
@@ -1559,6 +2290,8 @@ static uintptr_t ahb_repl_for(const char *name) {
      *
      * 这个点与"哪个库"无关，任何新加载的库都会经过它，所以是通用的。
      */
+    if (strcmp(name, "dlsym") == 0)           return (uintptr_t)ahb_dlsym_wrap;
+    if (strcmp(name, "xdl_sym") == 0)         return (uintptr_t)ahb_xdl_sym_wrap;
     if (strcmp(name, "dlopen") == 0)          return (uintptr_t)ahb_dlopen_wrap;
     if (strcmp(name, "android_dlopen_ext") == 0)
                                               return (uintptr_t)ahb_android_dlopen_ext_wrap;
@@ -2319,8 +3052,157 @@ typedef void *(*ahb_dlopen_fn)(const char *, int);
 static ahb_dlopen_fn g_real_dlopen = NULL;
 static int g_tr_in_dlopen = 0;
 
+/* ================================================================== */
+/* 拒绝加载 JVMTI 调试代理                                              */
+/* ================================================================== */
+
+/*
+ * 依据（实测调用栈，不是推测）
+ * ---------------------------
+ * com.zhenxi.hunter 的主进程 abort，栈是这样的：
+ *
+ *   jit_code_cache.cc:1309  Check failed: !ContainsElement(zombie_code_, code_ptr)
+ *   JitCodeCache::AddZombieCodeInternal
+ *   JitCodeCache::AddZombieCode
+ *   Instrumentation::InstallStubsForClass
+ *   ClassLinker::VisitClasses -> VisitClassesInternal
+ *   Instrumentation::UpdateEntrypointsForDebuggable
+ *   openjdkjvmti::DeoptManager::FinishSetup
+ *   ArtPlugin_Initialize
+ *   libhunter.so            <-- 目标自己去加载了 JVMTI 代理
+ *
+ * 也就是说：目标把 libopenjdkjvmti 拉进进程，将运行时切到
+ * "debuggable" 语义，然后对**每一个类**重装入口 stub。
+ * 而 LSPosed 的 lsplant 已经把大量方法的入口寄存器改成了自己的跳板，
+ * ART 在为这些方法登记 zombie code 时与既有记录撞车，直接 abort。
+ *
+ * 这不是本模块做了什么，而是"框架 hook"与"JVMTI 调试代理"天生冲突：
+ * 只要框架在，目标一旦上 JVMTI 就会踩这个断言。
+ *
+ * 因此对 libopenjdkjvmti 的加载请求返回失败。目标拿不到 JVMTI，
+ * 就不会走 UpdateEntrypointsForDebuggable，也就没有这次 abort。
+ * 这与隐藏 maps 是同一类手段：让它拿不到那件东西，而不是改它的结论。
+ */
+#ifndef AHB_BLOCK_JVMTI
+#define AHB_BLOCK_JVMTI 1
+#endif
+
+static int ahb_is_jvmti_path(const char *name) {
+    if (!name) return 0;
+    /*
+     * 只认明确属于 JVMTI / 调试代理的库。
+     * 不用宽泛匹配：误拦别的库会直接让目标功能缺失。
+     */
+    if (strstr(name, "libopenjdkjvmti.so")) return 1;
+    if (strstr(name, "libjdwp.so")) return 1;
+    if (strstr(name, "libdt_jdwp.so")) return 1;
+    if (strstr(name, "libperfetto_hprofd.so")) return 1;
+    return 0;
+}
+
+/* ================================================================== */
+/* 让 JVMTI 的能力探测拿不到入口                                        */
+/* ================================================================== */
+
+/*
+ * 依据（实测字符串 + 实测调用栈，不是推测）
+ * ----------------------------------------
+ * libhunter.so 里有这些字符串：
+ *
+ *   ZhenxiRuntime::JvmTi::init xdl_open ERROR
+ *   JvmTi::init ArtPlugin_Initialize == null
+ *   ArtPlugin_Initialize
+ *   ZhenxiRuntime::JvmTi::init success !
+ *   ZhenxiRuntime::JvmTi::Choose clazz == null
+ *   ZhenxiRuntime::JvmTi::getMethodByteCode fail
+ *   ro.debuggable
+ *
+ * 它用的是 **xDL**（xdl_open/xdl_sym）去加载并解析库，自己走 linker 内部
+ * 结构，不经过 dlopen —— 实测拦 dlopen 一次都没命中，正是这个原因。
+ *
+ * 崩溃栈则明确显示它成功拿到了 ArtPlugin_Initialize 并调用：
+ *
+ *   Instrumentation::UpdateEntrypointsForDebuggable
+ *   openjdkjvmti::DeoptManager::FinishSetup
+ *   ArtPlugin_Initialize
+ *   libhunter.so
+ *
+ * 之后 ART 把运行时当成 debuggable，对每个类重装入口 stub，
+ * 与 lsplant 已改写的入口撞车，`zombie_code_` 断言失败并 abort。
+ *
+ * 好的一面：它自己就有 ArtPlugin_Initialize == null 的失败分支，
+ * 也就是"拿不到入口"是被它正常处理的情形，不会崩。
+ *
+ * 因此这里让 dlsym/xdl_sym 对这一个符号返回 NULL。
+ * 只拦这一个符号 —— 不做宽泛匹配，避免破坏目标的其它功能。
+ */
+#ifndef AHB_BLOCK_JVMTI_SYM
+#define AHB_BLOCK_JVMTI_SYM 1
+#endif
+
+static int ahb_is_blocked_sym(const char *n) {
+    if (!n) return 0;
+    /*
+     * ArtPlugin_Initialize 是 JVMTI 插件的唯一入口。
+     * 另外把 JDWP 的 agent 入口一并挡掉：它们同样会把运行时切到
+     * debuggable 语义，走同一条 UpdateEntrypointsForDebuggable 路径。
+     */
+    if (strcmp(n, "ArtPlugin_Initialize") == 0) return 1;
+    if (strcmp(n, "Agent_OnAttach") == 0) return 1;
+    if (strcmp(n, "Agent_OnLoad") == 0) return 1;
+    return 0;
+}
+
+typedef void *(*ahb_dlsym_fn)(void *, const char *);
+
+static void *ahb_dlsym_wrap(void *handle, const char *symbol) {
+    static ahb_dlsym_fn real = NULL;
+#if AHB_BLOCK_JVMTI_SYM
+    if (ahb_is_blocked_sym(symbol)) {
+        LOGI("JVMTI 符号屏蔽: %s", symbol);
+        return NULL;
+    }
+#endif
+    if (!real) real = (ahb_dlsym_fn)dlsym(RTLD_NEXT, "dlsym");
+    if (!real) return NULL;
+    return real(handle, symbol);
+}
+
+/* xDL 走自己的实现，但导出名就是 xdl_sym / xdl_open，一并接管 */
+static void *ahb_xdl_sym_wrap(void *handle, const char *symbol, void *size) {
+    typedef void *(*xf)(void *, const char *, void *);
+    static xf real = NULL;
+#if AHB_BLOCK_JVMTI_SYM
+    if (ahb_is_blocked_sym(symbol)) {
+        LOGI("JVMTI 符号屏蔽(xdl): %s", symbol);
+        return NULL;
+    }
+#endif
+    if (!real) real = (xf)dlsym(RTLD_NEXT, "xdl_sym");
+    if (!real) return NULL;
+    return real(handle, symbol, size);
+}
+
 void *ahb_dlopen_wrap(const char *name, int flags) {
     void *h;
+    {
+        static int n = 0;
+#if AHB_DIAG
+        if (n < 24) {
+            n++;
+            LOGI("DLOPEN[%d] stage=%d jvmti=%d diag=%d art=%d elf=%d %s", n,
+                 ahb_early_stage_get(), ahb_jvmti_result_get(),
+                 ahb_jvmti_diag_get(), ahb_libart_diag_get(),
+                 ahb_elf_diag_get(), name ? name : "(null)");
+        }
+#endif
+    }
+#if AHB_BLOCK_JVMTI
+    if (ahb_is_jvmti_path(name)) {
+        LOGE("JVMTI 拒绝加载: %s", name);
+        return NULL;
+    }
+#endif
     if (!g_real_dlopen) g_real_dlopen = (ahb_dlopen_fn)dlsym(RTLD_NEXT, "dlopen");
     if (!g_real_dlopen) g_real_dlopen = (ahb_dlopen_fn)dlsym(RTLD_DEFAULT, "dlopen");
     if (!g_real_dlopen) return NULL;
@@ -2336,7 +3218,18 @@ void *ahb_dlopen_wrap(const char *name, int flags) {
 void *ahb_android_dlopen_ext_wrap(const char *name, int flags, const void *extinfo) {
     typedef void *(*ext_fn)(const char *, int, const void *);
     static ext_fn real = NULL;
+    static int n2 = 0;
     void *h;
+    if (n2 < 24) {
+        n2++;
+        LOGI("DLOPEN_EXT[%d] %s", n2, name ? name : "(null)");
+    }
+#if AHB_BLOCK_JVMTI
+    if (ahb_is_jvmti_path(name)) {
+        LOGE("JVMTI 拒绝加载(ext): %s", name);
+        return NULL;
+    }
+#endif
     if (!real) real = (ext_fn)dlsym(RTLD_NEXT, "android_dlopen_ext");
     if (!real) return NULL;
     h = real(name, flags, extinfo);
