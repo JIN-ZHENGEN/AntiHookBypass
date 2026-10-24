@@ -199,6 +199,25 @@ final class ModuleConfig {
      */
     private static int parseLayers(String s) {
         final int ALL = LAYER_L1 | LAYER_L2 | LAYER_L3;
+        /*
+         * 默认只开 native 两层。
+         *
+         * L1 是 Java 层：hook Throwable.getStackTrace / Class.forName /
+         * ClassLoader.loadClass 等全局高频方法，用于隐藏 Xposed 痕迹。
+         *
+         * 默认关掉它的原因不是"不重要"，而是它的代价在别的应用身上：
+         * Java hook 会在调用栈里留下 t.intercept / m.proceed 帧，
+         * 任何自带反 Hook 的应用都能直接看到这两个帧名。
+         * 实测 hunter 6.58 因此走反制路径并崩溃。
+         *
+         * 而本模块要绕的六项检测全部是 native 项：
+         *   classloader / libc / libart / anon_exec / inline_hook / external_view
+         * 它们由 L2（代码段还原）与 libview（磁盘视图重定向）负责，
+         * 与 L1 无关。所以关掉 L1 不影响交付目标。
+         *
+         * 需要时（比如某个检测器去查 Java 栈）改这里重新打包即可 ——
+         * 模块没有设置界面，默认值就应该是"对目标进程副作用最小"的那个。
+         */
         if (s == null) return ALL;
         if (s.equals("all") || s.equals("default")) return ALL;
         if (s.equals("none") || s.equals("off") || s.equals("0")) return 0;
