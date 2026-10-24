@@ -399,6 +399,46 @@ F jit_code_cache.cc:1309 Check failed: !ContainsElement(zombie_code_, code_ptr)
 
 
 ### 视图痕迹：三个实测出来的漏点
+### 改代码段：`/proc/self/mem` 而不是 `mprotect`
+
+给已加载的 `.so` 打字节补丁，最直觉的做法是先 `mprotect` 该页为 RWX、写完改回 RX。
+这条路有两个致命副作用：
+
+1. **内核会拆 VMA**。这个页从原来的 `r-x` 段里被切出来，成为独立映射，
+   `/proc/self/maps` 里就多出一行：
+
+   ```
+   <page>-<page+0x1000> r-xp <off> .../libart.so
+   ```
+
+   任何「同库段数 / 连续段」检查都会发现异常。hunter 直接把它报成
+   `find libart.so hooked 4096`。
+
+2. **跨进程内容比对会露**。目标另有一个未注入的进程读磁盘原件，
+   把两边 CRC 一比，差值正好是 patch 的字节数：
+
+   ```
+   ISO CRC NOT MATCH LOCALITY CRC
+   /apex/com.android.art/lib64/libart.so
+   locality crc -> 1142253448   remote service crc -> 1142253258
+   ```
+
+   这类检测**靠过滤 `/proc` 视图完全绕不过去**，因为它比的是库内容本身。
+
+正解是走 `/proc/self/mem`：
+
+```c
+int fd = open("/proc/self/mem", O_RDWR);
+pwrite(fd, code, len, (off_t)addr);
+```
+
+内核的 `FOLL_FORCE` 允许直接写只读映射，**页表权限与 VMA 结构都不变**。
+同一个 patch，段数 6 → 4、碎片 0，进程不再崩，检测侧也回到全绿。
+一次写法更换同时解掉了「崩溃」与「碎片暴露」这个两难。
+
+> 两个细节：fd 要复用（一次启动可能写几十上百次）；写完必须刷新指令缓存，
+> 否则改了不生效或行为错乱。
+
 ### 自检放在 `break` 之后，等于永远不验证
 
 看门线程原来这样写：
