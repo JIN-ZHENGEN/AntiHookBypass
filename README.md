@@ -365,6 +365,39 @@ F jit_code_cache.cc:1309 Check failed: !ContainsElement(zombie_code_, code_ptr)
 
 现在刷缓存走 `.inst` 硬编码的 `dc cvau` / `ic ivau`，纯 CPU 指令，不经过内核。
 
+### 匿名可执行段：两个相反方向都失败过
+
+同一份视图要同时满足两个检测方，而它们的判据是互斥的：
+
+| 版本 | 做法 | 结果 |
+|---|---|---|
+| 1 | 改成 `[anon:dalvik-jit-code-cache]` | 检测器数不出匿名段了，但 hunter 恰恰按这个前缀判「Found suspicious anonymous memory」——`[anon:` 本身就是「无归属」的标记 |
+| 2 | 伪装成真实 boot.oat，配 stat 出来的 dev/inode | 路径 60 字节，目标按定长缓冲解析直接炸 `FORTIFY: strcpy: prevented 8-byte write into 5-byte buffer` |
+| 3 | 原样输出 | 检测器 `native_anon_exec` 立刻从 SAFE 掉到 RISK |
+| 4 | 起止地址/权限/偏移/dev/inode 一个字节不动，末尾追加 33 字节系统短路径 | 两边都过 |
+
+结论：**长度本身就是可被检测的属性**。任何改变字段数量或字段长度的伪装，
+都可能让按定长缓冲解析的目标直接溢出；而完全不改又过不了数「无路径段」的检测器。
+
+### ClassLoader 路径：final 字段为什么改了没用
+
+`o1.a` / `o1.e` 两个 final String 字段用反射 set 成功了，get 出来确实是
+`framework.jar`，但 `toString()` 依然输出原来的 base.apk 路径。
+
+原因是 **ART 把 final 字段的值常量折叠进了编译后的方法体**——拼接处已是字面量，
+不再回读字段。对照证据：同一个类里 `nativeLibraryDirectories` 那一段**能**改成功，
+因为它运行时读 ArrayList 容器，没有折叠。
+
+排查方法（可复用）：逐层展开对象图，每层打印 ①该层 toString 的实际输出
+②每个字段的类型与值（含容器元素各自的运行时类型）③所有无参方法（含 private）的返回值。
+当「读出来是干净值但 toString 仍脏」时，即可确认是折叠。
+
+> **这条没有解决，如实记录。** 目标的 native 层用 `process_vm_readv` 直接读
+> ART 结构（它自己的字符串里就有 `checkPtraceIsStart main pid`），
+> Java 层的任何钩子对它无效——摘掉线程 `contextClassLoader` 后它照样能拿到路径。
+> 只能从 native 内存层解决。
+
+
 ### 视图痕迹：三个实测出来的漏点
 
 在 hunter 进程里做「内核原文 vs 包装视图」的双路对比，才把漏点一个个找出来：
