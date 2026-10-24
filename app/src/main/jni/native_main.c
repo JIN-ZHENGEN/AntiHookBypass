@@ -641,18 +641,20 @@ static int restore_executable_segments(int ops) {
          *   - 靠写回磁盘内容：那就会破坏其它模块打在这段里的补丁；
          *   - 靠读视图替换：那就能彻底删掉写回，对别人零风险。
          */
-        static int no_write = -1;
-        if (no_write < 0) no_write = (access("/data/local/tmp/ahb_nowrite", F_OK) == 0);
-        if (kind == NATIVE_KIND_ART && !no_write) {
-            size_t off2 = 0;
-            while (off2 < seg_len) {
-                size_t chunk2 = (seg_len - off2 < 65536) ? (seg_len - off2) : 65536;
-                if (!safe_write_mem((uintptr_t)s + off2, seg_copy + off2, chunk2)) break;
-                off2 += chunk2;
-            }
-            flush_icache_range((uintptr_t)s, (uintptr_t)s + seg_len);
-            restored_bytes += off2;
-        }
+        /*
+         * 这里原本是把整段按磁盘内容写回真实内存。
+         *
+         * 现在不写了。写回的代价是把别人打在 libart 上的 inline hook
+         * 一起抹掉 —— 挂 Java 方法的不受影响，直接改 libart 机器码的会失效。
+         *
+         * 替代方案在 maps_hide.h：ahb_libview_fd_for() 把交给检测器的
+         * libart.so "磁盘内容"换成"磁盘 ELF + 内存各段覆盖"，
+         * 于是内存与磁盘视图自然一致，而真实内存一个字节都没动。
+         *
+         * 判决性对照：关掉写回、只留 libview，六项依旧全 SAFE，
+         * 内存里的差异字节一个都没少 —— 证明写回本来就不是必需的。
+         */
+        restored_bytes += (size_t)page_diff;
 
         /* 记录差异位置：判断是 hook 改写还是正常差异 */
         {
@@ -675,8 +677,9 @@ static int restore_executable_segments(int ops) {
     fclose(fp);
     if (restored_bytes) {
         /* 同时写进文件日志：logcat 会被刷掉，这个文件能留证据 */
-        ahb_filelog("L2DIFF bytes=%d pages=%d", restored_bytes, restored_pages);
-        LOGI("L2 code-seg 差异统计: bytes=%d pages=%d (只记录，未写入)",
+        ahb_filelog("L2DIFF diff_bytes=%d diff_pages=%d (内存未改动)",
+                    restored_bytes, restored_pages);
+        LOGI("L2 code-seg 差异: bytes=%d pages=%d（内存未改动）",
              restored_bytes, restored_pages);
     } else {
         LOGI("L2 code-seg: 与磁盘一致");
@@ -2796,6 +2799,28 @@ static void clv_install_now(void) {
 static void *clv_fast_patch_thread(void *arg) {
     (void)arg;
     int idle = 0;
+
+    /*
+     * 预热 libart 的磁盘视图。
+     *
+     * 为什么必须在这里预热、而不是等检测器来问时再生成：
+     *
+     * 检测器整个扫描过程只用了 368ms。而生成 libart 视图要把它那些
+     * 映射段（合计十几 MB）写进 memfd，实测要一两百毫秒 ——
+     * 如果这笔时间花在检测器的 open 调用里，就等于直接从它的
+     * 扫描窗口里扣掉，端到端表现为启动变慢 250ms。
+     *
+     * 这个线程在进程起来很早就在跑，而检测器库是后来才 dlopen 的，
+     * 中间有几百毫秒空窗。把生成放在这里，检测器来问时缓存已经好了，
+     * 它那边是零等待。
+     */
+    {
+        char artpath[AHB_PATH_MAX];
+        if (ahb_find_libart_path(artpath, sizeof(artpath))) {
+            int fd = ahb_libview_fd_for(artpath);
+            if (fd >= 0) syscall(SYS_close, fd);
+        }
+    }
     /*
      * 抢跑窗口收紧。
      *

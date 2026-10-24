@@ -900,6 +900,9 @@ static void maps_lazy_rescan(void) {
 void *ahb_dlopen_wrap(const char *name, int flags);
 void *ahb_android_dlopen_ext_wrap(const char *name, int flags, const void *extinfo);
 
+int ahb_libview_fd_for(const char *path);
+static int ahb_is_libview_target(const char *path);
+
 static int maps_open_wrap(const char *path, int flags, mode_t mode) {
     struct timespec _ts0, _ts1;
     clock_gettime(CLOCK_MONOTONIC, &_ts0);
@@ -914,6 +917,10 @@ static int maps_open_wrap(const char *path, int flags, mode_t mode) {
         if (dbg_left > 0 && path && strstr(path, "/maps")) {
             dbg_left--;
         }
+    }
+    if (ahb_is_libview_target(path)) {
+        int lv = ahb_libview_fd_for(path);
+        if (lv >= 0) return lv;
     }
     if (maps_path_is_self(path)) {
         struct timespec _s0, _s1;
@@ -1951,6 +1958,191 @@ static int maps_patch_got_all_locked(void) {
         ahb_patch_one_so(&g_so_tab[i]);
     }
     return g_maps_got_patched - before;
+}
+
+
+/* ================================================================== */
+/* 库文件视图重定向：让"磁盘上的 libart.so"看起来就是内存当前的样子      */
+/* ================================================================== */
+
+/*
+ * 方向与"把内存写回磁盘内容"正好相反：
+ *
+ *   旧做法：改真实内存去匹配磁盘  → 抹掉别人打在 libart 上的 inline hook
+ *   新做法：改磁盘视图去匹配内存  → 真实内存一个字节都不动
+ *
+ * 依据（实测）：
+ *   - 检测器会 open libart.so / libc.so 的磁盘文件，自己算 CRC；
+ *   - LSPosed 注入后 libart 代码段有 191 字节与磁盘不同，
+ *     关掉本模块 L1 之后差异量完全不变，说明它来自框架注入本身；
+ *   - 所以只要交给检测器的"磁盘内容"带上这些字节，两边 CRC 自然一致。
+ */
+
+static int g_libview_fd = -1;
+static char g_libview_path[AHB_PATH_MAX];
+static int g_libview_busy = 0;
+
+int ahb_libview_fd_for(const char *path) {
+    char *raw = NULL;
+    size_t cap = 0;
+    int n, sfd;
+    size_t fsize = 0;
+    int mfd = -1;
+    int hit = 0;
+
+    if (!path) return -1;
+    if (g_libview_busy) return -1;
+
+    /*
+     * 同一路径在进程生命周期内只生成一次。
+     *
+     * 实测教训：最初加了 2 秒时间窗口，结果检测器分多次读、间隔超过窗口，
+     * 同一个 23MB 文件被完整移植了 7 次，白多花几百毫秒。
+     * libart 的代码段补丁在启动期一次装好后基本不变，可以永久复用。
+     */
+    if (g_libview_fd >= 0 && strcmp(g_libview_path, path) == 0) {
+        return dup(g_libview_fd);
+    }
+
+    g_libview_busy = 1;
+
+    sfd = (int)syscall(SYS_openat, AT_FDCWD, path, O_RDONLY | O_CLOEXEC, 0);
+    if (sfd < 0) { g_libview_busy = 0; return -1; }
+    {
+        struct stat st;
+        if (fstat(sfd, &st) != 0 || st.st_size <= 0 || st.st_size > (64 << 20)) {
+            syscall(SYS_close, sfd);
+            g_libview_busy = 0;
+            return -1;
+        }
+        fsize = (size_t)st.st_size;
+    }
+
+    mfd = (int)syscall(SYS_memfd_create, "ahb-libview", 0);
+    if (mfd < 0) { syscall(SYS_close, sfd); g_libview_busy = 0; return -1; }
+
+    /*
+     * 直接写"内存内容"，不做磁盘拷贝。
+     *
+     * 设计要点：这个视图的用途就是"让磁盘看起来等于内存"，
+     * 所以每个映射段直接 pwrite 内存里的字节即可 —— 既不需要先
+     * pread 磁盘内容，也不需要逐页比对"哪里不同"。
+     *
+     * 实测依据：v2.6 的写回量是 36864 字节，而 libart.so 整个文件
+     * 有 23MB。之前按"整文件拷贝 + 逐页比对差异"实现，每启动一次
+     * 要搬 23MB（读+写 46MB），实测拖慢 400ms，纯属自己给自己加戏。
+     *
+     * 现在：ftruncate 成稀疏文件（瞬间，不占物理页），
+     * 只把 maps 里实际映射的段写进去（通常 8-12MB，一次 pwrite 每段），
+     * 未映射的区域保持稀疏 0 —— 检测器按段校验，不会读到那里。
+     */
+    if (syscall(SYS_ftruncate, mfd, (long long)fsize) != 0) {
+        syscall(SYS_close, mfd); syscall(SYS_close, sfd);
+        g_libview_busy = 0;
+        return -1;
+    }
+
+    n = maps_read_all(&raw, &cap);
+    if (n > 0) {
+        char *line = raw, *end = raw + n;
+        size_t plen = strlen(path);
+        while (line < end) {
+            char *nl = (char *)memchr(line, '\n', (size_t)(end - line));
+            size_t L = nl ? (size_t)(nl - line) : (size_t)(end - line);
+            unsigned long long lo = 0, hi = 0, off = 0;
+            char perm[8] = {0};
+            if (L > plen && memmem(line, L, path, plen) &&
+                sscanf(line, "%llx-%llx %7s %llx", &lo, &hi, perm, &off) == 4) {
+                size_t seg = (size_t)(hi - lo);
+                if (seg > 0 && off < fsize && off + seg <= fsize) {
+                    /*
+                     * 一次 pwrite 写整段。pwrite 会阻塞到写完，
+                     * 单次几 MB 在这个场景下是几十毫秒量级。
+                     */
+                    size_t put = 0;
+                    while (put < seg) {
+                        size_t chunk = (seg - put < (4 << 20)) ? (seg - put) : (4 << 20);
+                        ssize_t w = syscall(SYS_pwrite64, mfd,
+                                            (void *)(uintptr_t)(lo + put),
+                                            chunk, (long long)(off + put));
+                        if (w <= 0) break;
+                        put += (size_t)w;
+                    }
+                    if (put > 0) hit = 1;
+                }
+            }
+            if (!nl) break;
+            line = nl + 1;
+        }
+        free(raw);
+    }
+
+    if (!hit) {
+        syscall(SYS_close, mfd); syscall(SYS_close, sfd);
+        g_libview_busy = 0;
+        return -1;
+    }
+
+    syscall(SYS_close, sfd);
+    syscall(SYS_lseek, mfd, 0, SEEK_SET);
+    if (g_libview_fd >= 0) syscall(SYS_close, g_libview_fd);
+    g_libview_fd = mfd;
+    snprintf(g_libview_path, sizeof(g_libview_path), "%s", path);
+    ahb_filelog("LIBVIEW ready %s size=%zu", path, fsize);
+
+    {
+        int out = dup(g_libview_fd);
+        g_libview_busy = 0;
+        return out;
+    }
+}
+
+/*
+ * 只重定向 libart.so。
+ * 六项检测里只有它做代码段 CRC；libc 段本来就与磁盘一致，不需要处理。
+ */
+static int ahb_is_libview_target(const char *path) {
+    if (!path) return 0;
+    return strstr(path, "libart.so") != NULL;
+}
+
+void ahb_libview_invalidate(void);
+void ahb_libview_invalidate(void) {
+    g_libview_path[0] = 0;
+}
+
+/* 在 maps 里找出 libart.so 的路径，供视图预热使用 */
+int ahb_find_libart_path(char *out, size_t outlen);
+int ahb_find_libart_path(char *out, size_t outlen) {
+    char *raw = NULL;
+    size_t cap = 0;
+    int n;
+    int ok = 0;
+    n = maps_read_all(&raw, &cap);
+    if (n > 0) {
+        char *line = raw, *end = raw + n;
+        while (line < end) {
+            char *nl = (char *)memchr(line, '\n', (size_t)(end - line));
+            size_t L = nl ? (size_t)(nl - line) : (size_t)(end - line);
+            if (L > 9 && memmem(line, L, "libart.so", 9)) {
+                char *slash = memchr(line, '/', L);
+                if (slash) {
+                    size_t pl = L - (size_t)(slash - line);
+                    while (pl > 0 && (slash[pl-1] == ' ' || slash[pl-1] == '\r')) pl--;
+                    if (pl > 0 && pl < outlen) {
+                        memcpy(out, slash, pl);
+                        out[pl] = 0;
+                        ok = 1;
+                        break;
+                    }
+                }
+            }
+            if (!nl) break;
+            line = nl + 1;
+        }
+        free(raw);
+    }
+    return ok;
 }
 
 #endif /* AHB_MAPS_HIDE_H */
