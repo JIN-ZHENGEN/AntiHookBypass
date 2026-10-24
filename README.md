@@ -210,9 +210,10 @@ Zygote: Process 25927 exited due to signal 6 (Aborted)
 现在它默认**不安装**，只有 `/data/local/tmp/ahb_verbose` 存在时才装。
 隐藏痕迹本身不需要它（那是 native 层做的），生产路径必须关掉。
 
-同时保留一条对照结论：把各层全关（`none`）后，hunter 依然给出同一个
-JIT 断言 —— 说明那个崩溃不是本模块的层造成的，是它与注入环境本身的
-交互问题，需要另行处理。
+这里也保留一条对照结论：把各层全关（`none`）后，hunter 当时依然给出
+同一个 JIT 断言 —— 说明那个崩溃不是本模块的某一层造成的，而是它与
+注入环境本身的交互问题。该问题已在 3.4 解决，做法见下面
+「关于 hunter 的实测结论」。
 
 ### 运行时零文件：不写、也不读
 
@@ -307,8 +308,8 @@ AHB_KEYSTORE=/path/to/release.jks bash tools/build.sh
 | 检测完全在 native 闭环，用内联汇编 `svc` 直接杀进程 | 要拦得改代码字节，那会触发完整性校验，反而暴露 |
 | 结果发到服务器二次校验 | 客户端改不了 |
 | 检测器比模块更早加载并完成扫描 | 时序竞态，本模块已经抢到最早时机，但不能保证对所有实现都赢 |
-| 宿主自身存在与注入无关的崩溃 | 例如 hunter 在本机会 `jit_code_cache.cc:1309 Check failed: !ContainsElement(zombie_code_, code_ptr)` abort —— 见下节实测 |
-| 宿主把「检测到自己被 hook」当成致命错误主动退出 | hunter 属这一类：任何 hook 都让它更快退出（1.1 秒），完全不 hook 反而能活 2.8–7.5 秒 |
+| 宿主用 seccomp 把非白名单系统调用变成 SIGSYS 杀进程 | 这类进程里刷指令缓存不能用 `__ARM_NR_cacheflush`，得走纯 CPU 指令 |
+| 宿主用 ptrace 从子进程外部读主进程内存 | 所有 `open`/`read`/`process_vm_readv` 层面的伪装都会被绕过，只能让痕迹在内存里真的不存在 |
 
 ### 关于模块声明：两套格式都要给
 
@@ -325,19 +326,71 @@ LSPosed 2.x 同时存在两套模块声明机制：
 
 ### 关于 hunter 的实测结论
 
-hunter（`com.zhenxi.hunter`）在本机会在 1–3 秒内退出，这个现象**不是本模块造成的**，三条对照实验可以定性：
+hunter（`com.zhenxi.hunter`）6.58 在本机能正常启动并跑完全部检测，三个进程
+（`hunter_main_process`、`hunter_server_twin`、`hunter_server_iso`）全部存活，
+`jit_code_cache` / `SIGSEGV` / `SIGSYS` / `signal 6` 四类崩溃计数全为 0，
+tombstone 未新增。
 
-| 配置 | hunter 主进程存活 |
+它此前会在 1–3 秒内 abort，报的是 ART 的断言：
+
+```
+F jit_code_cache.cc:1309 Check failed: !ContainsElement(zombie_code_, code_ptr)
+  #13 Instrumentation::InstallStubsForClass
+  #15 Instrumentation::UpdateEntrypointsForDebuggable
+  #16 openjdkjvmti::DeoptManager::FinishSetup
+  #17 ArtPlugin_Initialize
+  #18 libhunter.so
+```
+
+根因是**它自己把 JVMTI 插件拉起来**：ART 于是按 debuggable 语义遍历所有类
+重装入口 stub，而 lsplant 已经改写过大量方法入口，两边在 `zombie_code_` 表上
+撞车。这与模块做了什么无关——模块完全空转（只注入、不装任何 hook）同样崩。
+
+拦截 `dlopen` 没用：实测该进程 `dlopen` 只调 1 次（模块自己的 libc），
+`android_dlopen_ext` 0 次；它用静态编进 `libhunter.so` 的 xDL 手工映射，
+绕开了 libc 的加载入口。而且「库被映射」到「入口被调用」只隔微秒级，
+轮询抢不到。
+
+真正的修法是在冲突点本身断开：用 `dl_iterate_phdr` 拿 libart 的 load bias
+与 phdr，自己走 `.dynamic → .dynsym → .dynstr` 找到导出的
+`Instrumentation::UpdateEntrypointsForDebuggable`，把首指令改成 `ret`。
+整条遍历链从顶端断掉，走不到 `AddZombieCode`。
+
+配套踩到两个坑，都已修：
+
+| 坑 | 症状 |
 |---|---|
-| 模块完全不动作（仅注入，不装任何 hook） | 2.8–7.5 秒 |
-| 只开 L1（Java 层） | 1.1 秒 |
-| 只开 L3（native 层） | 1.1 秒 |
-| 全开 | 1.1 秒 |
-| 模块不在作用域内（原版环境） | 约 1 秒 |
+| 用 `__ARM_NR_cacheflush`（`0x0F0002`）刷指令缓存 | 目标自带 seccomp，直接 `Fatal signal 31 (SIGSYS) syscall 983042` 杀进程 |
+| 用 `__builtin___clear_cache` | 会编成对 `__clear_cache` 的外部调用，bionic 没这个符号，`dlopen` 直接失败、整个 native 层静默不生效 |
 
-即：**装了 hook 反而让它死得更快**。它的退出栈落在 ART 的 `InstallStubsForClass → JitCodeCache::AddZombieCode`，断言 `!ContainsElement(zombie_code_, code_ptr)` 失败——这是 ART 给同一方法反复安装 stub 时的内部一致性检查，任何 Xposed 类模块在它身上都会触发。换句话说，它与「被 hook」这件事本身不兼容，与本模块的具体实现无关。
+现在刷缓存走 `.inst` 硬编码的 `dc cvau` / `ic ivau`，纯 CPU 指令，不经过内核。
 
-上一版本 README 提到过 `FORTIFY: strcpy` abort，那条已经修掉了（根因是 maps 视图里两行被拼在一起，导致它按字段解析时把 34 字节写进 5 字节缓冲区）。现在剩下的退出原因与 maps 视图无关。
+### 视图痕迹：三个实测出来的漏点
+
+在 hunter 进程里做「内核原文 vs 包装视图」的双路对比，才把漏点一个个找出来：
+
+| 漏点 | 症状 | 根因 |
+|---|---|---|
+| maps 过滤像在跑、痕迹一条没改 | 视图含 3 行本模块 apk 路径 | 找路径起点时字段计数写成 6（应为 5），数到 6 时路径已被整段吃掉，走「没有路径」分支把整行原样抄出去 |
+| `find libart.so hooked 4096` | libart 多出一个 4KB `r-xp` 碎片 | 本模块为让入口可写对该页做过 `mprotect`，内核因此拆开 VMA；段合并原来只认 `linker64` |
+| `Check Find Root In Mounts` | `/proc/<pid>/mounts` 里 10 处 `/data/adb` | 路径判断只做精确比较，带 pid 的形式一条都没匹配上 |
+
+修完之后在 hunter 进程内自测：
+
+```
+CMP 内核 len=287130 痕迹=3 | 包装 len=286584 痕迹=0
+VIEWART seg=4 frag=0            ← libart 原来 6 段带 1 个碎片
+VIEWMNT len=64482 adb=0         ← 原来 10 处
+```
+
+另外补了两条针对 ClassLoader 文本的隐藏：
+
+- `fake_readlink` 支持任意 pid 形式，并照抄请求里的 pid（原来只认
+  `/proc/self/fd/`，且返回自己进程的 pid，目标在子进程里查主进程时直接漏过）
+- 新增 `PathHiding`：拦 `getLdLibraryPath`，并抹除本模块 ClassLoader
+  对象图里的路径 —— 因为目标有子进程用 ptrace 从外部读内存，
+  所有 IO 层伪装都绕过，只能让这个字符串在内存里真的不存在
+
 
 ## 关于性能
 
