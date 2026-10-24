@@ -724,6 +724,16 @@ static int ahb_fd_fake_readlink(const char *path, char *buf, size_t sz) {
         return -1;
     }
 
+    /*
+     * 支持两种形态：
+     *     <pid>/fd/N
+     *     <pid>/task/<tid>/fd/N        <- 实测目标用的是这种
+     */
+    if (strncmp(fdp, "task/", 5) == 0) {
+        const char *slash = strchr(fdp + 5, '/');
+        if (!slash) return -1;
+        fdp = slash + 1;
+    }
     if (strncmp(fdp, "fd/", 3) != 0) return -1;
     fd = atoi(fdp + 3);
 
@@ -732,8 +742,36 @@ static int ahb_fd_fake_readlink(const char *path, char *buf, size_t sz) {
 
     {
         static const char *const nm[4] = { "maps", "smaps", "mounts", "modules" };
+        /*
+         * 必须**原样保留 task 段**，不能只回 /proc/<pid>/<name>。
+         *
+         * 实测教训：目标请求的是
+         *     /proc/24708/task/25061/maps
+         * 而我们只回
+         *     /proc/24708/maps
+         * 两者一比对就不一致，它直接报
+         *     "检测到APK存在沙箱内部(readlink异常)"
+         * 也就是说：readlink 伪装的重点不是"内容对不对"，
+         * 而是"是否与对方请求的那条路径逐字一致"。
+         *
+         * 所以这里把请求里的 "task/<tid>/" 原样抄过去。
+         */
+        const char *taskp = strstr(fdp, "task/");
+        if (taskp) {
+            /* fdp 形如 "fd/N" 或 "task/<tid>/fd/N"，后者要提取 "<tid>" */
+            const char *slash = strchr(taskp + 5, '/');
+            if (slash) {
+                int tid_len = (int)(slash - (taskp + 5));
+                if (tid_len > 0 && tid_len < 24) {
+                    n = snprintf(tmp, sizeof(tmp), "/proc/%d/task/%.*s/%s",
+                                 pid, tid_len, taskp + 5, nm[kind]);
+                    goto built;
+                }
+            }
+        }
         n = snprintf(tmp, sizeof(tmp), "/proc/%d/%s", pid, nm[kind]);
     }
+built:
     if (n <= 0 || (size_t)n >= sz) return -1;
     memcpy(buf, tmp, (size_t)n + 1);
     return n;
@@ -884,10 +922,15 @@ static size_t maps_emit_masked_line(char *out, size_t w, size_t cap,
     size_t i = 0;
     int fields = 0;
     size_t path_at = len;
+    size_t dev_at = 0, dev_end = 0;
+    size_t ino_at = 0, ino_end = 0;
     while (i < len) {
         if (line[i] == ' ' || line[i] == '\t') { i++; continue; }
         fields++;
+        size_t fstart = i;
         while (i < len && line[i] != ' ' && line[i] != '\t') i++;
+        if (fields == 4) { dev_at = fstart; dev_end = i; }
+        if (fields == 5) { ino_at = fstart; ino_end = i; }
         /*
          * 字段次序：addr(1) perm(2) offset(3) dev(4) inode(5) path(6)。
          *
@@ -918,11 +961,20 @@ static size_t maps_emit_masked_line(char *out, size_t w, size_t cap,
         return w;
     }
 
-    /* 先原样抄到路径起点 */
-    memcpy(out + w, line, path_at);
-    w += path_at;
-
-    /* 再写入替换路径 */
+    /*
+     * 决定替换路径，并**同时换掉 dev 与 inode**。
+     *
+     * ===== 为什么必须一起换（实测教训）=====
+     * 只换路径、留下原来的 "00:00 0"，目标会拿新路径去 stat，
+     * 然后把 stat 到的 dev/inode/size 与行内值对比，一旦不符就报：
+     *     (inode不匹配)inode mismatching ->
+     *     /system/framework/framework.jar 21619546 8356463
+     * 也就是说"路径合理但身份字段造假"比"路径可疑"更容易被抓，
+     * 因为它把两处信息交叉验证了一次。
+     *
+     * 所以这里取被替换文件的**真实** dev/inode（stat 一次后缓存），
+     * 让整行自洽：路径、dev、inode 三者互相印证。
+     */
     const char *rep;
     if (path_at + 4 <= len && memcmp(line + path_at, "/dev", 4) == 0) {
         rep = "/dev/ashmem";
@@ -931,6 +983,51 @@ static size_t maps_emit_masked_line(char *out, size_t w, size_t cap,
     } else {
         rep = "/system/framework/framework.jar";
     }
+
+    /* 先原样抄到 dev 字段起点 */
+    size_t copy_to = (dev_at > 0 && dev_at < path_at) ? dev_at : path_at;
+    memcpy(out + w, line, copy_to);
+    w += copy_to;
+
+    if (copy_to == dev_at) {
+        /*
+         * 取被替换路径的真实身份。
+         * stat 结果缓存：这条路径固定，没必要每次重取。
+         */
+        static int    cached = 0;
+        static char   dev_s[16];
+        static char   ino_s[24];
+        static size_t dev_l = 0, ino_l = 0;
+        if (!cached) {
+            struct stat st;
+            cached = 1;
+            if (stat(rep, &st) == 0) {
+                unsigned maj = (unsigned)((st.st_dev >> 8) & 0xfff);
+                unsigned min = (unsigned)((st.st_dev & 0xff) |
+                                          ((st.st_dev >> 12) & 0xfff00));
+                dev_l = (size_t)snprintf(dev_s, sizeof(dev_s), "%02x:%02x",
+                                         maj, min);
+                ino_l = (size_t)snprintf(ino_s, sizeof(ino_s), "%llu",
+                                         (unsigned long long)st.st_ino);
+            }
+        }
+        if (dev_l && ino_l) {
+            if (w + dev_l + (ino_end - ino_at) + 2 > cap) return w;
+            memcpy(out + w, dev_s, dev_l);       w += dev_l;
+            /* dev 与 inode 之间的空白沿用原样 */
+            memcpy(out + w, line + dev_end, ino_at - dev_end);
+            w += ino_at - dev_end;
+            memcpy(out + w, ino_s, ino_l);       w += ino_l;
+            /* inode 到路径之间的空白沿用原样 */
+            memcpy(out + w, line + ino_end, path_at - ino_end);
+            w += path_at - ino_end;
+        } else {
+            /* stat 失败：保持原字段，只换路径（至少不比原来差） */
+            memcpy(out + w, line + dev_at, path_at - dev_at);
+            w += path_at - dev_at;
+        }
+    }
+
     size_t rl = strlen(rep);
     if (w + rl + 2 > cap) return w;
     memcpy(out + w, rep, rl);
@@ -1409,6 +1506,9 @@ static void maps_lazy_rescan(void) {
 
 /* 前置声明：GOT 补丁表要引用，实体在文件末尾 */
 void *ahb_dlopen_wrap(const char *name, int flags);
+
+/* 真实 dlopen，绕开本文件的包装。自用。 */
+void *ahb_real_dlopen_raw(const char *name);
 void *ahb_android_dlopen_ext_wrap(const char *name, int flags, const void *extinfo);
 
 int ahb_libview_fd_for(const char *path);
@@ -1666,12 +1766,24 @@ static int ahb_filtered_fd_for(const char *path) {
     return -1;
 }
 
+static void ahb_jvmti_tick_from_open(void);
+
 static int maps_open_wrap(const char *path, int flags, mode_t mode) {
     struct timespec _ts0, _ts1;
     clock_gettime(CLOCK_MONOTONIC, &_ts0);
     g_c_open++;
     maps_resolve_reals();
     ahb_probe_path(path);
+    /*
+     * 用 open 这条高频主线程路径驱动 JVMTI 中和。
+     *
+     * 为什么不用专门线程：实测本进程里 pthread_create 在 JNI_OnLoad
+     * 阶段整体不可用（JWSTART 恒开探针 0 条、FASTPATCH 日志 0 条），
+     * 所有"起线程轮询"的方案都不成立。
+     * 而 open 包装在主线程同步执行、启动期被调几百次，
+     * 是天然且可靠的挂载点。
+     */
+    ahb_jvmti_tick_from_open();
     /*
      * JVMTI 插件：在 open 层直接拒绝。
      *
@@ -3306,6 +3418,13 @@ static void *ahb_xdl_sym_wrap(void *handle, const char *symbol, void *size) {
     if (!real) real = (xf)dlsym(RTLD_NEXT, "xdl_sym");
     if (!real) return NULL;
     return real(handle, symbol, size);
+}
+
+void *ahb_real_dlopen_raw(const char *name) {
+    if (!g_real_dlopen) g_real_dlopen = (ahb_dlopen_fn)dlsym(RTLD_NEXT, "dlopen");
+    if (!g_real_dlopen) g_real_dlopen = (ahb_dlopen_fn)dlsym(RTLD_DEFAULT, "dlopen");
+    if (!g_real_dlopen) return NULL;
+    return g_real_dlopen(name, RTLD_NOW);
 }
 
 void *ahb_dlopen_wrap(const char *name, int flags) {

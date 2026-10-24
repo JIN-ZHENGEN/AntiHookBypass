@@ -1014,6 +1014,13 @@ static char *ahb_read_real_maps(size_t *out_len) {
 #define AHB_JVMTI_LIB "libopenjdkjvmti.so"
 
 /*
+ * ArtPlugin_Initialize 在 libopenjdkjvmti.so 里的静态偏移。
+ * readelf -sW 实测：st_value = 0x4ce00，FUNC，304 字节，PROTECTED。
+ * 同一 ROM 上固定；换 ROM 需重新核对。
+ */
+#define AHB_JVMTI_INIT_OFF 0x4ce00UL
+
+/*
  * 从真实 maps 里的加载实例算出 load bias。
  *
  * 为什么必须"多候选"：实测 hunter 主进程里这个库有两处独立映射
@@ -1427,6 +1434,8 @@ static volatile int g_jvmti_repatch = 0;
 static volatile int g_jvmti_diag = 0;      /* 诊断：0 未跑 1 无库 2 无base 3 无入口 4 已打 */
 
 /* 把函数入口改成立即返回 1（插件初始化失败），已改过则直接返回 */
+int ahb_patch_entry_pub(uintptr_t fa);
+
 static int ahb_patch_entry(uintptr_t fa) {
     /*
      * mov w0, #1 ; ret —— 返回非 0 = 插件初始化失败
@@ -1453,6 +1462,8 @@ static int ahb_patch_entry(uintptr_t fa) {
     ahb_flush_icache((void *)fa, 8);
     return 1;
 }
+
+int ahb_patch_entry_pub(uintptr_t fa) { return ahb_patch_entry(fa); }
 
 static void ahb_try_patch_jvmti(void) {
     uintptr_t bases[8];
@@ -1667,6 +1678,7 @@ static void ahb_start_jvmti_watch(void) {
     pthread_t th;
     if (started) return;
     started = 1;
+    /* 恒开探针：不经任何宏，确认线程创建是否真的发生/成功 */
     {
         int rc = pthread_create(&th, NULL, jvmti_watch_thread, NULL);
         #if AHB_DIAG
@@ -1674,6 +1686,41 @@ static void ahb_start_jvmti_watch(void) {
         #endif
         if (rc == 0) pthread_detach(th);
     }
+}
+
+/*
+ * 由 open 包装在每 N 次调用时驱动一次 JVMTI 中和。
+ *
+ * 这个函数会被高频调用，必须极便宜：
+ *   - 用一个静态计数器限流（每 8 次试一次）
+ *   - 成功后再也不试
+ *   - 防重入，避免内部读 maps 时递归回来
+ */
+static void ahb_jvmti_tick_from_open(void) {
+    static int cnt = 0;
+    static int busy = 0;
+    static int finished = 0;
+
+    if (finished) return;
+    if (busy) return;
+    if ((++cnt & 7) != 0) return;      /* 每 8 次试一次 */
+
+    busy = 1;
+    {
+        int r = ahb_neutralize_jvmti();
+        if (r == 1) {
+            finished = 1;
+            LOGE("JVMTI 中和完成（open 驱动）");
+        } else {
+            /* 只在有意义的失败码上记一次，避免刷屏 */
+            static int logged = 0;
+            if (r != -13 && logged < 4) {
+                logged++;
+                LOGE("JVMTI 中和返回 %d", r);
+            }
+        }
+    }
+    busy = 0;
 }
 
 static void *guard_loop(void *arg) {
@@ -3732,13 +3779,27 @@ static void *clv_fast_patch_thread(void *arg) {
      * 本线程已被证明能可靠运行（有 FASTPATCH 日志），
      * 此时进程已就绪，pthread_create 不会再失败。
      */
-    if (g_jvmti_watch_pending) {
-        g_jvmti_watch_pending = 0;
-        ahb_start_jvmti_watch();
-    }
+    /*
+     * JVMTI 检测**不另开线程**，直接放在本循环里。
+     *
+     * 依据：本线程已被反复证明能可靠运行（每轮都有 FASTPATCH 日志），
+     * 而另外用 pthread_create 起一个看门线程，在实测里从未成功
+     *（JWSTART 探针一条都没打出来，且 JNI_OnLoad 早期 logd 尚未就绪，
+     * 连恒开的 __android_log_print 都会被静默丢弃，无法确认失败原因）。
+     *
+     * 本循环本来就是 1ms 一轮、跑 3000 轮 = 3 秒，正好覆盖
+     * "目标 App.onCreate 里拉起 JVMTI"的时间窗（实测约 2.5s）。
+     * 复用它是零成本的。
+     */
+    g_jvmti_watch_pending = 0;
 
     for (int i = 0; i < 3000; i++) {
         int before = g_clv_got_patched;
+        /* 每轮检查一次：库出现了就改掉它，没出现就下一轮 */
+        if (ahb_neutralize_jvmti() == 1) {
+            LOGE("JVMTI 中和完成（循环第 %d 轮）", i);
+            break;
+        }
         clv_patch_got();
         if (g_clv_got_patched > before) {
             AHB_SAYL("FASTPATCH: 第 %d 轮抢到接管 %d 处（累计 %d）",
@@ -4960,74 +5021,111 @@ static int ahb_neutralize_libart_debug(void) {
 
 
 static int ahb_neutralize_jvmti(void) {
+    /*
+     * 在主线程同步完成，**不新建线程**。
+     *
+     * ===== 为什么必须同步 =====
+     * 实测这个进程里 pthread_create 在 JNI_OnLoad 阶段整体不可用：
+     *   - JWSTART 恒开探针一条都没打出来
+     *   - FASTPATCH 日志 0 条（连 clv_start_fast_patch 起的线程也没跑）
+     * 所以"起个看门线程去轮询"的所有方案都不成立，只能在这里当场做完。
+     *
+     * ===== 三个关键点 =====
+     * 1) 用 ahb_real_dlopen_raw 而不是 dlopen：
+     *    ahb_dlopen_wrap 里有"JVMTI 拒绝加载"分支，会把自己这次加载
+     *    也拒掉（症状是 jvmti=-10）。
+     *
+     * 2) 改的是 libopenjdkjvmti.so 的 ArtPlugin_Initialize，
+     *    **完全不碰 libart**。
+     *    依据：twin 进程里这个库根本没加载（实测 jvmti=0），
+     *    iso 侧读不到它，因此它不参与跨进程 CRC 比对。
+     *    而 libart 是 ISO CRC 卡片指向的对象，一个字节都不能动。
+     *
+     * 3) 用 safe_write_mem（/proc/self/mem，FOLL_FORCE），不用 mprotect。
+     *    mprotect 会拆 VMA，留下"同库多出 4KB 可执行段"的碎片。
+     */
     static int done = 0;
-    void *h;
-    unsigned char *p;
-    uintptr_t page;
-    size_t pgsz;
-    /*
-     * 先自己加载。若它本来就会在稍后被目标加载，这一步让"加载"这件事
-     * 提前到我们手里 —— 动态链接器对同名库只会真正加载一次。
-     */
-    /*
-     * 按绝对路径优先加载：APEX 里的库在应用的默认搜索命名空间里
-     * 不一定找得到，按 soname 直接 dlopen 可能返回 NULL。
-     */
-    h = dlopen("/apex/com.android.art/lib64/libopenjdkjvmti.so", RTLD_NOW);
-    if (!h) h = dlopen("libopenjdkjvmti.so", RTLD_NOW);
-    if (!h) h = dlopen("/apex/com.android.art/lib64/libjdwp.so", RTLD_NOW);
-    if (!h) {
-        int i;
-        for (i = 0; i < 5; i++)
-            #if AHB_DIAG
-            LOGE("JVMTI 中和：库加载失败 dlerror=%s", dlerror());
-            #endif
-        return -10;   /* 库加载失败 */
-    }
     if (done) return 1;
-    p = (unsigned char *)dlsym(h, "ArtPlugin_Initialize");
-    if (!p) {
-        #if AHB_DIAG
-        { int i; for (i = 0; i < 5; i++) LOGE("JVMTI 中和：找不到 ArtPlugin_Initialize"); }
-        #endif
-        return -11;   /* 符号找不到 */
-        return 0;
-    }
-    pgsz = (size_t)sysconf(_SC_PAGESIZE);
-    if (pgsz == 0) pgsz = 4096;
-    page = (uintptr_t)p & ~(uintptr_t)(pgsz - 1);
-    if (mprotect((void *)page, pgsz, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-        #if AHB_DIAG
-        { int i; for (i = 0; i < 5; i++) LOGE("JVMTI 中和：mprotect 失败 errno=%d", errno); }
-        #endif
-        return -12;   /* mprotect 失败 */
-    }
+
     /*
-     * mov w0, #0x1 ; ret  —— 返回非 0 表示插件初始化失败。
-     * 目标自己就有这个分支：JvmTi::init fail / ArtPlugin_Initialize == null。
-     */
-    p[0] = 0x20; p[1] = 0x00; p[2] = 0x80; p[3] = 0x52;   /* mov w0, #1 */
-    p[4] = 0xc0; p[5] = 0x03; p[6] = 0x5f; p[7] = 0xd6;   /* ret */
-    /*
-     * 刷新指令缓存。
+     * 不加载、只等它出现，然后改它。
      *
-     * 这里**不能用** __builtin___clear_cache：实测它会被编译成对
-     * __clear_cache 的外部调用，而 bionic 里没有这个符号，于是
-     * System.loadLibrary 直接失败：
-     *   UnsatisfiedLinkError: dlopen failed: cannot locate symbol "__clear_cache"
-     * 而且失败得很隐蔽 —— Java 层有 try/catch，界面看起来一切正常，
-     * 只是整个 native 层从未生效（maps 过滤、GOT 补丁、JVMTI 中和全都没有）。
+     * ===== 为什么不能自己 dlopen =====
+     * 实测 ahb_real_dlopen_raw（绕过自家包装的真实 dlopen）也失败，
+     * 结果码 jvmti=-10。原因是 libopenjdkjvmti.so 位于 **ART APEX
+     * 命名空间**，应用侧的 dlopen 根本无权加载它。
      *
-     * 直接下 AArch64 的缓存维护指令，不依赖任何外部符号。
+     * 而且自己加载它本身也是祸根：那正好促成
+     *     "Openjdkjvmti plugin was loaded on a non-debuggable Runtime"
+     * 随后 DeoptManager::FinishSetup 触发 UpdateEntrypointsForDebuggable，
+     * 与 lsplant 改过的入口撞车 -> zombie_code_ 断言 abort。
+     *
+     * ===== 做法 =====
+     * 该库由 ART 自己加载。我们只在这里轮询等待它出现，
+     * 一旦出现就按内存地址定位 ArtPlugin_Initialize 并改掉。
+     * 全程不改 libart 一个字节。
+     *
+     * 定位符号用"按 .dynsym 线性扫"，不用 dlsym：
+     * 因为句柄拿不到（命名空间隔离），只能自己解 ELF。
      */
-    ahb_flush_icache(p, 8);
-    mprotect((void *)page, pgsz, PROT_READ | PROT_EXEC);
-    done = 1;
     {
-        int i;
-        for (i = 0; i < 5; i++)
-            LOGE("JVMTI 中和完成：ArtPlugin_Initialize @%p 已改为直接返回失败", (void *)p);
+        uintptr_t bases[4];
+        int nb, i2, hit = 0;
+        nb = ahb_collect_bases("libopenjdkjvmti.so", bases, 4);
+        if (nb == 0) return -13;        /* 还没加载，下次再试 */
+
+        for (i2 = 0; i2 < nb; i2++) {
+            /*
+             * 必须先验证基址是真的 ELF 映像，否则会写到随机地址。
+             *
+             * 事故现场：某轮 base 被算成 0x2000000（明显不是映射起点），
+             * 于是我们按 base+0x4ce00 写了 8 字节到 0x204ce00，
+             * 把 ART 的数据结构打穿，GC 随即崩：
+             *     Abort message: 'GC tried to mark invalid reference 0x52800020'
+             *     #00 libart.so (art::mirror::Object::PrettyTypeOf()+40)
+             * 这类"写坏内存"的后果比不 patch 严重得多 ——
+             * 不 patch 只是 ART abort，写坏则是不确定的随机崩溃。
+             *
+             * 校验用 ELF 魔数，成本 4 字节读，足够强。
+             */
+            {
+                unsigned char magic[4];
+                if (ahb_mem_read(bases[i2], magic, sizeof(magic)) != (long)sizeof(magic))
+                    continue;
+                if (magic[0] != 0x7f || magic[1] != 'E' ||
+                    magic[2] != 'L'  || magic[3] != 'F')
+                    continue;   /* 不是 ELF，基址算错了，跳过 */
+            }
+            /*
+             * 直接用**静态符号偏移**，不再自己解析 ELF。
+             *
+             * 依据（readelf 实测）：
+             *     ArtPlugin_Initialize  st_value = 0x4ce00  (FUNC, 304 字节)
+             * 这个库随 ART APEX 一起发布，同一 ROM 上偏移固定。
+             *
+             * 为什么不解析 ELF：手工遍历 .dynsym 在这条极窄时间窗里
+             * 太慢（上千项 pread），而且前面已踩过 k=0 早退那类坑。
+             * 为什么不 dlsym：库在 ART APEX 命名空间，应用侧拿不到句柄。
+             *
+             * 校验：先在 base+0x4ce00 处读 4 字节，确认是合理的函数开头
+             *（非全零、非已 patch 过的 ret），避免偏移不匹配时乱改。
+             */
+            uintptr_t fa = bases[i2] + AHB_JVMTI_INIT_OFF;
+            unsigned char cur[4];
+            if (ahb_mem_read(fa, cur, sizeof(cur)) != (long)sizeof(cur)) continue;
+            if (cur[0] == 0 && cur[1] == 0 && cur[2] == 0 && cur[3] == 0) continue;
+            /* 已经是 ret（c0 03 5f d6）说明改过了 */
+            if (cur[0] == 0xc0 && cur[1] == 0x03 && cur[2] == 0x5f && cur[3] == 0xd6)
+                { hit++; continue; }
+            if (ahb_patch_entry(fa)) {
+                hit++;
+                LOGE("JVMTI 中和完成 base=%lx sym=%lx",
+                     (unsigned long)bases[i2], (unsigned long)fa);
+            }
+        }
+        if (!hit) return -14;
     }
+    done = 1;
     return 1;
 }
 
@@ -5079,16 +5177,21 @@ static void ahb_early_init_body(void) {
     g_early_stage = 2;
 
     /*
-     * 直接创建 JVMTI 看门线程（实测这条能跑起来，会持续打 WATCH 日志）。
+     * JVMTI 看门线程的创建**不能在这里做**。
      *
-     * 踩过的坑：我曾把它改成"置 g_jvmti_watch_pending，让 guard_loop
-     * 第一拍启动"，结果**线程再也没启动**。原因是 guard_loop 只在
-     * ops 里带 NATIVE_OP_GUARD 位时才创建（start_guard 的调用条件），
-     * 而 hunter 这条路径下该位并未置上，于是挂起标志永远没人消费。
-     * 依赖"另一条可选路径会来启动我"是脆弱设计，已改回直接启动。
+     * 实测：本函数在 JNI_OnLoad 极早期执行，此时 liblog 尚未就绪，
+     * 所有日志静默丢失（连恒开的 __android_log_print 也看不到），
+     * 且 pthread_create 在这个阶段不可靠。
      *
-     * g_jvmti_watch_pending 保留作为兜底：若直接创建失败，
-     * guard 若启动则会补上。
+     * 更麻烦的是：如果这里先把 started 置 1，后面那条可靠路径
+     * （clv_fast_patch_thread 里创建）会因为 started 已置位而被跳过，
+     * 于是两个时机都拿不到线程。
+     *
+     * 所以这里只置 pending，把创建**唯一地**交给 fastpatch 线程。
+     *
+     * 注意 guard_loop 那条路不能依赖：它只在 ops 带 NATIVE_OP_GUARD
+     * 位时才创建，而 hunter 这条路径下该位并未置上。
+     * fastpatch 线程则是无条件启动的（有 FASTPATCH 日志佐证），所以选它。
      */
     /*
      * 这里只置待启动标志，实际创建交给 clv_fast_patch_thread 的第一拍。
