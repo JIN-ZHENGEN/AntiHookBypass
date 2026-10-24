@@ -1672,6 +1672,27 @@ static int maps_open_wrap(const char *path, int flags, mode_t mode) {
     g_c_open++;
     maps_resolve_reals();
     ahb_probe_path(path);
+    /*
+     * JVMTI 插件：在 open 层直接拒绝。
+     *
+     * 为什么必须在 open 层：hunter 的 xDL 是自己 open + mmap 手工加载，
+     * 全程不经过 dlopen / android_dlopen_ext（实测 android_dlopen_ext
+     * 调用 0 次），所以打在 dlopen 上的拦截一次都命中不到。
+     *
+     * 它有 "xdl_open ERROR" 的优雅失败分支，拿不到句柄不会崩。
+     *
+     * 这条替代了原来「改 libart 代码段」的做法 —— 那个做法会被跨进程
+     * CRC 比对抓出来（见 AHB_ART_NEUTRALIZE 的注释）。
+     */
+#if AHB_BLOCK_JVMTI
+    if (ahb_is_jvmti_path(path)) {
+#if AHB_SAY
+        AHB_SAYL("JVMTI 拒绝 open: %s", path);
+#endif
+        errno = ENOENT;
+        return -1;
+    }
+#endif
     if (ahb_is_hidden_file(path)) {
         LOGE("隐藏文件: %s", path);
         maps_ensure_raw_syscall();
