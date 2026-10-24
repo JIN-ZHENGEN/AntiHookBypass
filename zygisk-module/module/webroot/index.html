@@ -149,6 +149,16 @@ code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;background
   var query = '';
   var loaded = false;
 
+  /*
+   * 增量渲染。
+   *
+   * 这台机器上有 1087 个可列出的包。一次性把它们全塞进 DOM，
+   * 真机 WebView 会明显卡顿（布局与绘制都是 O(n)）。
+   * 所以先渲染一屏，剩下的点"显示更多"再追加。
+   */
+  var PAGE = 60;
+  var shown = PAGE;
+
   var $ = function (id) { return document.getElementById(id); };
 
   function hasKsu() {
@@ -354,12 +364,26 @@ code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;background
    * 为什么中间要 sleep：ams 收进程是异步的。force-stop 之后立刻 start，
    * 有可能命中的是还在退出中的旧进程，等于没重启。
    */
+  /*
+   * 查启动入口的 shell 片段。
+   *
+   * resolve-activity 找不到入口时返回的不是空，而是 "No activity found" 这样的句子
+   * （实测）。直接把它交给 am start -n 会报错。所以用 case 校验它得像组件名
+   * ——必须含斜杠，且不以 No 开头。
+   */
+  function actOf(pkg) {
+    var q = shq(pkg);
+    return 'ACT=$(cmd package resolve-activity --brief -c android.intent.category.LAUNCHER ' + q +
+           ' 2>/dev/null | tail -n 1); ' +
+           'case "$ACT" in ' +
+           '*/?*) am start -n "$ACT" >/dev/null 2>&1 ;; ' +
+           'esac; ';
+  }
+
   function buildRestartCmd(pkg) {
     var q = shq(pkg);
     return 'am force-stop ' + q + '; sleep 1; ' +
-           'ACT=$(cmd package resolve-activity --brief -c android.intent.category.LAUNCHER ' + q +
-           ' 2>/dev/null | tail -n 1); ' +
-           'if [ -n "$ACT" ]; then am start -n "$ACT" >/dev/null 2>&1; fi; ' +
+           actOf(pkg) +
            'sleep 1; ' +
            'if pidof ' + q + ' >/dev/null 2>&1; then echo AHBUP; else echo AHBGONE; fi';
   }
@@ -399,12 +423,7 @@ code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;background
     var cmd = '';
     todo.forEach(function (p) { cmd += 'am force-stop ' + shq(p) + '; '; });
     cmd += 'sleep 1; ';
-    todo.forEach(function (p) {
-      var q = shq(p);
-      cmd += 'ACT=$(cmd package resolve-activity --brief -c android.intent.category.LAUNCHER ' + q +
-             ' 2>/dev/null | tail -n 1); ' +
-             '[ -n "$ACT" ] && am start -n "$ACT" >/dev/null 2>&1; ';
-    });
+    todo.forEach(function (p) { cmd += actOf(p); });
     cmd += 'sleep 1; echo AHBDONE';
 
     exec(cmd).then(function (r) {
@@ -413,8 +432,16 @@ code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;background
       var skipped = self.length ? ('，跳过 ' + self.map(labelOf).join('、')) : '';
       if (r.stdout.indexOf('AHBDONE') >= 0) {
         toast('已重启 ' + todo.length + ' 个应用' + skipped, 'ok', 3400);
+      } else if (r.code !== 0) {
+        /* 真失败：命令本身报错了，把 stderr 给用户 */
+        toast('重启失败：' + String(r.stderr || ('code ' + r.code)).slice(0, 100), 'err', 4000);
       } else {
-        toast('重启失败：' + (r.stderr || 'code ' + r.code).slice(0, 100), 'err', 4000);
+        /*
+         * code 0 却没有结束标记，说明命令跑完了但输出被截断或没走到最后一行。
+         * 这时不能报"失败：code 0"——那句话对用户没有任何信息量。
+         * 应用该重启的已经重启了，如实说明即可。
+         */
+        toast('已下发重启命令，但没有收到完成回执。请看一下那些应用是否已重新打开。', 'warn', 4000);
       }
       refreshFoot();
     });
@@ -433,10 +460,26 @@ code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;background
       list.appendChild(e);
       return;
     }
+
+    var cut = rows.slice(0, shown);
     var wrap = document.createElement('div');
     wrap.className = 'list';
-    rows.forEach(function (a) { wrap.appendChild(row(a)); });
+    cut.forEach(function (a) { wrap.appendChild(row(a)); });
     list.appendChild(wrap);
+
+    /* 还有没渲染完的，给个按钮继续 */
+    if (rows.length > cut.length) {
+      var more = document.createElement('button');
+      more.id = 'more';
+      more.type = 'button';
+      more.textContent = '显示更多（还剩 ' + (rows.length - cut.length) + ' 个）';
+      more.style.cssText = 'width:100%;margin-top:10px;padding:12px;font-size:14px';
+      more.addEventListener('click', function () {
+        shown += PAGE * 4;   /* 点一次多给一些，免得点几十次 */
+        render();
+      });
+      list.appendChild(more);
+    }
   }
 
   function dirty() {
@@ -531,6 +574,7 @@ code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;background
       });
 
       loaded = true;
+      shown = PAGE;
       if (!scope.length) filter = 'all';
       syncTabs();
       render();
@@ -550,6 +594,7 @@ code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;background
   Array.prototype.forEach.call(document.querySelectorAll('.tab'), function (t) {
     t.addEventListener('click', function () {
       filter = t.getAttribute('data-f');
+      shown = PAGE;
       syncTabs();
       render();
     });
@@ -557,6 +602,7 @@ code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;background
 
   $('q').addEventListener('input', function (e) {
     query = e.target.value.trim();
+    shown = PAGE;
     render();
   });
 
