@@ -33,6 +33,82 @@ so 里同时包含三部分：
 - `engine_glue.c` — 把既有引擎接到 Zygisk 生命周期上
 - `native_main.c` + `maps_hide.h` — 原封不动复用的引擎（8800 行）
 
+## WebUI：在 KernelSU 里点选作用域
+
+模块目录下的 `webroot/index.html` 就是 KernelSU 管理器里那个「打开」按钮的落地页。
+
+### 桥接口
+
+KernelSU 的 WebUI 用的是 WebView + 注入的 JS 桥，本机实测可用的只有两个：
+
+| 接口 | 用途 |
+|---|---|
+| `window.ksu.exec(cmd, opts, cbName)` | 执行 root 命令。**回调式**：把函数名作为字符串传进去，命令结束后 KernelSU 反过来调 `window[cbName](code, stdout, stderr)` |
+| `window.ksu.getPackagesInfo(jsonArray)` | 批量取应用中文名，返回 JSON 字符串 |
+
+`ksu.exec` 的写法容易踩坑：它不是返回 Promise，也不是直接收函数。
+
+```js
+var cb = 'ahb_' + Date.now();
+window[cb] = function (code, stdout, stderr) {
+  delete window[cb];
+  resolve({ code: +code, stdout: stdout, stderr: stderr });
+};
+window.ksu.exec('pm list packages -3', JSON.stringify({}), cb);
+```
+
+一定要自己加超时兜底，桥不回话的情况下不兜底就会永远转圈。
+
+### 两个重启入口
+
+作用域改了要重开应用才生效，所以每条已选应用旁边加了 `↻`，底部还有一个「重启已选」做批量。
+
+生成命令时有两个坑：
+
+**不要用 `monkey -p`。** 它确实能把应用带起来，但 monkey 是随机事件生成器，顺带会往界面上打点按事件，可能误触。而且它的退出码不代表应用真起来了。改用：
+
+```sh
+ACT=$(cmd package resolve-activity --brief -c android.intent.category.LAUNCHER <pkg> | tail -n 1)
+am start -n "$ACT"
+```
+
+**`force-stop` 与 `am start` 之间要 sleep。** ams 收进程是异步的，立刻 start 有可能命中的是还在退出中的旧进程，等于没重启。
+
+**批量重启要排除自己。** 作用域里如果含 `com.dsharnessmobile.shell`（也就是运行这个 WebUI 的 dsh 自己），批量重启会把它杀掉，界面当场消失。代码里用 `SELF_PKGS` 显式跳过。
+
+### `window.ksu` 可能整个不存在
+
+浏览器里直接打开这个页面时（不是在 KernelSU 里），`window.ksu` 是 `undefined`。所以：
+
+```js
+// 错：直接取属性会抛 TypeError
+if (typeof window.ksu.getPackagesInfo !== 'function') return {};
+
+// 对：先确认 window.ksu 本身
+if (!window.ksu || typeof window.ksu.getPackagesInfo !== 'function') return {};
+```
+
+这个错误在真机浏览器里实测撞到过，页面会显示「读取失败: TypeError」。
+
+### 写入用临时文件 + 原子替换
+
+```sh
+printf %s '<内容>' > /data/local/tmp/.ahb_scope.$$
+cp /data/local/tmp/.ahb_scope.$$ <scope.txt>
+chmod 644 <scope.txt>
+rm -f /data/local/tmp/.ahb_scope.$$
+```
+
+包名里的单引号用 `'\''` 转义，实测 `com.test.with'quote` 这种边界能正确写入并回读。
+
+写完必须**回读比对**，不能只信命令退出码——退出码 0 只说明命令跑了，不说明内容对。
+
+### 测试方式
+
+页面逻辑用一个 DOM 桩在 node 里跑真实的 `<script>` 块（不是重写一份等价逻辑），共 35 条断言：空作用域、注释解析、点选交互、保存回读、搜索过滤、重启命令生成、自身排除、无桥降级。全部通过。
+
+真机验证则用假 `window.ksu` 桥注入一份 `ksu.exec` / `getPackagesInfo` 的模拟实现，在真实 WebView 里确认渲染正确。
+
 ## Java 层迁移：不需要全量翻译
 
 原 Java 层 4133 行，但逐项核对（运行时实测，不是看文档）后，真正需要在 Zygisk 下重建的只有两项。
