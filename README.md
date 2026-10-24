@@ -399,6 +399,35 @@ F jit_code_cache.cc:1309 Check failed: !ContainsElement(zombie_code_, code_ptr)
 
 
 ### 视图痕迹：三个实测出来的漏点
+### 痕迹判据用白名单，不用黑名单
+
+原先按「已知框架」逐个列举：`/data/adb/modules/zygisk_lsposed`、`liblsplant.so`、`libpine.so`……
+
+根本问题是黑名单永远滞后——没被列进去的模块照样一眼被看穿。实测本机就装着 `hma_oss_zygisk`、`inline_hook_spoof`、`oh_my_keymint` 三个 Zygisk 模块，它们一条都不在名单里。
+
+改成两条通用判据：
+
+**一、任何 `/data/adb` 下的路径都判为痕迹。** 正常应用进程不该有任何 `/data/adb` 的映射——那是 root 的目录。能出现在 app 的 maps 里只有一种解释：模块注入。这条既通用又不误伤，还不依赖具体模块名。
+
+**二、非 ART 的 memfd 映射都判为痕迹。** 依据是全机实测统计，不是猜：
+
+| memfd 名字 | 出现次数 | 性质 |
+|---|---|---|
+| `/memfd:jit-cache` | 228 | ART JIT 代码缓存 |
+| `/memfd:jit-zygote-cache` | 114 | ART zygote JIT 缓存 |
+| `/memfd:perfetto_shmem` | 2 | perfetto 跟踪缓冲 |
+| `/memfd:bitmap` | 1 | 图形 |
+| `/memfd:payload` | 8 | **注入载荷** |
+| `/memfd:upx` | 2 | **UPX 压缩壳** |
+
+必须用白名单而不是黑名单：注入方可以随机命名，事先无法枚举；但系统正常用的那几个名字是固定的。
+
+### 混合两套构建产物做验证 = 拿旧代码测新逻辑
+
+中途我改完判据后用 `build_native.sh`（LSPosed 版脚本）编译，却链接了 `zygisk-module/out` 下的旧 `.o` 去跑测试，得出「判据不生效」的错误结论，白查了一阵。
+
+两套构建各自的中间产物目录不同，混用就等于测的是一份并不存在的代码。验证前先确认产物时间戳。
+
 ### 替换路径必须连 dev/inode 一起换
 
 把痕迹行的路径换成 `/system/framework/framework.jar` 之后，目标报了这条：
