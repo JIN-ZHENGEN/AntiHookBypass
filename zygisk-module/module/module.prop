@@ -1,6 +1,6 @@
 id=antihookbypass_zygisk
 name=AntiHook Bypass (Zygisk)
-version=v0.1.0
-versionCode=100
+version=v0.2.0
+versionCode=200
 author=Sharl210
 description=Native-only Zygisk host for the AntiHook Bypass engine. No LSPosed, no APK, no in-memory dex.
