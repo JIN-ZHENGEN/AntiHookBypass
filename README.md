@@ -399,6 +399,53 @@ F jit_code_cache.cc:1309 Check failed: !ContainsElement(zombie_code_, code_ptr)
 
 
 ### 视图痕迹：三个实测出来的漏点
+### 一个我自己引入的堆竞态
+
+`maps_emit_*` 这条路径原来挂着一个 TTL 缓存（120ms 内复用上次过滤结果），
+用一个裸全局指针保存。目标应用是多线程的（`RxCachedThreadS`、
+`tee_check_thread`），于是会出现两个线程同时 `free` 同一个指针，
+或者一个在读、另一个已 `free`。
+
+崩溃栈很能说明问题——它炸在**我们自己的 `free`** 里：
+
+```
+#03 ... base.apk (maps_make_clean_fd_ex+2960)
+#02 libc je_free -> #01 je_arena_dalloc_large -> #00 arena_run_dalloc
+```
+
+这是堆元数据被破坏后的二次爆炸，不是直接越界写。特点是三轮一中。
+
+**两次加锁尝试都更坏**：
+
+| 尝试 | 结果 |
+|---|---|
+| 把生成 fd 的调用放进锁内 | 它内部会注册 fd → 可能再触发 maps 读取 → 递归申请非递归锁 → 死锁 → 看门线程卡住 → ART 断开没执行 → `jit_code_cache` abort 回来，每轮必崩 |
+| 锁内只 memcpy 快照，锁外写 fd | 仍然每轮必崩 |
+
+结论是：**这把锁在这条路径上本身就是不可接受的代价**。目标启动期读 300+ 次 maps，
+而看门线程必须持续运行才能压住 JVMTI 插件，任何阻塞都会让断开超时。
+
+最终选择**整体删除缓存**：每次重新过滤。代价是每次多一次 malloc + 3000 行扫描
+（微秒量级），换来零共享状态、零锁、零竞态。连续 7 轮全稳。
+
+### 路径判定要认任意 pid
+
+`/proc/<pid>/maps` 的判定原来只认 `self`、本 pid、父 pid。
+但目标的检测输出里明确出现过：
+
+```
+find libart.so hooked 4096
+/proc/18023/maps
+```
+
+`18023` 是它自己主进程的 pid——它从另一个进程（twin / iso）读**指定 pid** 的 maps。
+那条读法一条都匹配不上，等于完全没过滤。`smaps` / `smaps_rollup` 是同样的问题，
+而且 smaps 更敏感（带 Pss/Swap 逐段统计）。现在统一识别任意 pid，含 task 形式。
+
+> 附带一个教训：自检要问**真实的那个分发函数**（这里是 `ahb_path_would_filter`），
+> 不要问某个内部分支。原来自检直接问 `maps_path_is_self`，而 smaps 走的是
+> 另一个函数，于是自检报「漏」而线上其实是好的——**给错结论的自检比不测更糟**。
+
 
 在 hunter 进程里做「内核原文 vs 包装视图」的双路对比，才把漏点一个个找出来：
 
