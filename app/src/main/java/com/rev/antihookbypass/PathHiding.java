@@ -66,7 +66,21 @@ final class PathHiding {
         hookToString("java.lang.ClassLoader");
         hookFieldGet();
         hookActualClassToString();
-        selfCheck();
+        /*
+         * 这里曾经试图给 BaseDexClassLoader / ClassLoader 的**所有方法**
+         * 挂返回值 scrub，想一网打尽。实测不可行，已撤：
+         *
+         * 日志打印本身就要做 String 操作，而这些类的方法被大量调用，
+         * 钩子内部再触发钩子 -> 递归 -> 模块初始化在打第一条日志前就中断，
+         * 表现成"模块日志一条都没有"。
+         *
+         * 结论：整类拦截代价不可控，只能针对具体方法。
+         */
+        scrubAllLoaders();
+        detachFromThreads();
+        if (com.rev.antihookbypass.ExpFlags.UIPEEK) {
+            selfCheckAll();
+        }
     }
 
     /** 拦 getLdLibraryPath：把模块 so 目录换回系统路径。 */
@@ -415,9 +429,25 @@ final class PathHiding {
             for (int i = 0; i < n && budget[0] > 0; i++) {
                 Object e;
                 try { e = lst.get(i); } catch (Throwable t) { break; }
+                /*
+                 * 元素可能是 String，也可能是 java.io.File。
+                 *
+                 * 实测漏的正是后者：probeModule 打出来的是
+                 *   o1.b (ArrayList) 元素: [0]java.io.File =
+                 *       /data/app/~~xxx==/com.rev.antihookbypass-yyy==/base.apk!/lib/arm64-v8a
+                 * 第一版只判 String，File 元素被当成"普通对象"继续往下递归，
+                 * 而 File 内部的 path 字段属于 java.io 包，被包名规则跳过，
+                 * 于是这条路径一直留着。
+                 */
                 if (e instanceof String && ((String) e).contains(SELF)) {
                     try {
                         ((java.util.List) lst).set(i, REPLACE);
+                        changed[0]++;
+                    } catch (Throwable ignored) { }
+                } else if (e instanceof java.io.File
+                        && ((java.io.File) e).getPath().contains(SELF)) {
+                    try {
+                        ((java.util.List) lst).set(i, new java.io.File(REPLACE));
                         changed[0]++;
                     } catch (Throwable ignored) { }
                 } else if (e != null) {
@@ -433,6 +463,10 @@ final class PathHiding {
                     Object e = arr[i];
                     if (e instanceof String && ((String) e).contains(SELF)) {
                         arr[i] = REPLACE;
+                        changed[0]++;
+                    } else if (e instanceof java.io.File
+                            && ((java.io.File) e).getPath().contains(SELF)) {
+                        arr[i] = new java.io.File(REPLACE);
                         changed[0]++;
                     } else if (e != null) {
                         scrubDeep0(e, seen, budget, changed, depth + 1);
@@ -464,6 +498,20 @@ final class PathHiding {
          * 普通对象：只走"看起来像框架/应用自己的类"，
          * 跳过 JDK 核心类。JDK 内部结构深且不该动，
          * 走过去只会白耗预算还可能踩到并发修改。
+         */
+        /*
+         * 跳过 JDK/Android 核心类的内部结构 —— 但**不能因此跳过容器**。
+         *
+         * 踩过的坑：这里原本对所有 java./javax./android. 开头的类直接返回。
+         * 而实测那个带路径的容器是个 ArrayList，它是 java.util.ArrayList，
+         * 于是被这条规则挡在门外，一个元素都没洗到。
+         *
+         * 证据（probeModule 打出来的）：
+         *   o1.b (ArrayList) = [/data/app/~~xxx==/com.rev.antihookbypass-yyy==
+         *                       /base.apk!/lib/arm64-v8a]
+         *
+         * 正确做法：容器类（List/Map/数组）无论属于哪个包都要递归，
+         * 只有真正的"普通对象"才按包名跳过。
          */
         String cn = o.getClass().getName();
         if (cn.startsWith("java.") || cn.startsWith("javax.")
@@ -562,6 +610,344 @@ final class PathHiding {
                     + " :: " + raw.substring(0, Math.min(raw.length(), 300)));
         } catch (Throwable t) {
             HookEntry.log("SELFCL 失败: " + t);
+        }
+    }
+
+
+
+    /**
+     * 把所有「可能返回路径」的类加载器方法统统一层返回值 scrub。
+     *
+     * <h2>为什么必须挂整类</h2>
+     * 已经查明：本模块 ClassLoader 的 toString 输出里带
+     * {@code module=/data/app/~~xxx==/com.rev.antihookbypass-yyy==/base.apk}，
+     * 但那个路径
+     * <ul>
+     *   <li>不在字段里（String/File 字段已改成 framework.jar）</li>
+     *   <li>不在容器里（ArrayList 元素已改）</li>
+     *   <li>对象图递归也搜不到</li>
+     * </ul>
+     * 说明它是 toString 内部<b>调某个 getter</b> 现取的。
+     *
+     * 所以不去猜是哪个 getter，直接给这些类的所有方法挂上 after 钩子，
+     * 返回 String 的一律过一遍 scrub。这样无论它走哪条路都绕不过去。
+     *
+     * <h2>为什么挂在父类上就够</h2>
+     * toString 是 inner 方法（lsplant 拒绝挂载），但它内部取路径
+     * 只能通过继承来的公开方法。父类方法被钩住后，
+     * 子类覆写版本之外的调用都会被拦。
+     */
+    private static void hookAllReturns(String className) {
+        try {
+            Class<?> c = Class.forName(className);
+            de.robv.android.xposed.XposedBridge.hookAllMethods(c, null,
+                    new de.robv.android.xposed.XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            Object r = param.getResult();
+                            if (r instanceof String && ((String) r).contains(SELF)) {
+                                param.setResult(REPLACE);
+                            } else if (r instanceof java.io.File
+                                    && ((java.io.File) r).getPath().contains(SELF)) {
+                                param.setResult(new java.io.File(REPLACE));
+                            }
+                        }
+                    });
+            HookEntry.log("PathHiding 已挂 " + className + " 全部方法");
+        } catch (Throwable t) {
+            HookEntry.log("PathHiding " + className + " 挂载失败: " + t);
+        }
+    }
+
+    /**
+     * 把进程里所有能枚举到的 ClassLoader 都洗一遍。
+     *
+     * <h2>为什么不能只洗自己那一个</h2>
+     * 前面只处理 {@code PathHiding.class.getClassLoader()}，实测 hunter 照样
+     * 报出 {@code module=/data/app/~~xxx==/com.rev.antihookbypass-yyy==/base.apk}。
+     * 说明它拿到的不是这个实例 —— LSPosed 给模块建的 ClassLoader 可能有多个，
+     * 或者它从别的线程/别的入口取到的是另一份。
+     *
+     * <h2>枚举哪些</h2>
+     * 不依赖任何框架私有结构，只用标准的公开入口：
+     * <ol>
+     *   <li>当前线程的 contextClassLoader</li>
+     *   <li>系统 ClassLoader</li>
+     *   <li>所有线程的 contextClassLoader（进程里其它线程可能挂着不同的）</li>
+     * </ol>
+     * 每个都顺着 {@code parent} 链往上走一遍。
+     *
+     * <h2>为什么还要顺着别的线程找</h2>
+     * 目标的检测跑在它自己的工作线程里，那个线程的 contextClassLoader
+     * 与主线程不是一个。只查主线程会漏。
+     */
+    static void scrubAllLoaders() {
+        java.util.IdentityHashMap<ClassLoader, Boolean> seen =
+                new java.util.IdentityHashMap<ClassLoader, Boolean>();
+        java.util.ArrayList<ClassLoader> all = new java.util.ArrayList<ClassLoader>();
+
+        try {
+            all.add(PathHiding.class.getClassLoader());
+            all.add(Thread.currentThread().getContextClassLoader());
+            all.add(ClassLoader.getSystemClassLoader());
+        } catch (Throwable ignored) { }
+
+        /* 所有线程的 contextClassLoader */
+        try {
+            Thread[] ts = new Thread[Thread.activeCount() * 2 + 16];
+            int n = Thread.enumerate(ts);
+            for (int i = 0; i < n; i++) {
+                if (ts[i] == null) continue;
+                try {
+                    all.add(ts[i].getContextClassLoader());
+                } catch (Throwable ignored) { }
+            }
+        } catch (Throwable t) {
+            HookEntry.log("SELFCL 枚举线程失败: " + t);
+        }
+
+        int total = 0;
+        for (ClassLoader cl : all) {
+            while (cl != null && seen.put(cl, Boolean.TRUE) == null) {
+                total += scrubDeep(cl);
+                try {
+                    cl = cl.getParent();
+                } catch (Throwable t) {
+                    break;
+                }
+            }
+        }
+        HookEntry.log("SELFCL 全量清洗 实例=" + seen.size() + " 元素=" + total);
+    }
+
+    /** 自证：把每个能枚举到的 ClassLoader 的 toString 都打出来，看还剩几个带路径。 */
+    static void selfCheckAll() {
+        java.util.IdentityHashMap<ClassLoader, Boolean> seen =
+                new java.util.IdentityHashMap<ClassLoader, Boolean>();
+        java.util.ArrayList<ClassLoader> all = new java.util.ArrayList<ClassLoader>();
+        try {
+            all.add(PathHiding.class.getClassLoader());
+            all.add(Thread.currentThread().getContextClassLoader());
+            all.add(ClassLoader.getSystemClassLoader());
+            Thread[] ts = new Thread[Thread.activeCount() * 2 + 16];
+            int n = Thread.enumerate(ts);
+            for (int i = 0; i < n; i++) {
+                if (ts[i] != null) all.add(ts[i].getContextClassLoader());
+            }
+        } catch (Throwable ignored) { }
+        int bad = 0, total = 0;
+        for (ClassLoader cl : all) {
+            while (cl != null && seen.put(cl, Boolean.TRUE) == null) {
+                total++;
+                String str;
+                try {
+                    str = String.valueOf(cl);
+                } catch (Throwable t) {
+                    str = "";
+                }
+                if (str.contains(SELF)) {
+                    bad++;
+                    HookEntry.log("SELFCLBAD " + str.substring(0, Math.min(str.length(), 200)));
+                }
+                try {
+                    cl = cl.getParent();
+                } catch (Throwable t) {
+                    break;
+                }
+            }
+        }
+        HookEntry.log("SELFCL 实例总数=" + total + " 仍带路径=" + bad);
+        /* 把带路径那个实例的 module 字段逐层扒开，看清路径真正存在哪 */
+        for (ClassLoader cl : all) {
+            if (cl != null && String.valueOf(cl).contains(SELF)) {
+                probeModule(cl);
+                break;
+            }
+        }
+    }
+
+
+
+    /**
+     * 把所有线程的 contextClassLoader 里指向本模块的那个摘掉。
+     *
+     * <h2>为什么改字段没用</h2>
+     * 已经查明：{@code o1.a} / {@code o1.e} 两个 final String 字段
+     * 读出来确实是 {@code /system/framework/framework.jar}（set 成功了），
+     * 但 {@code toString()} 依然输出原来的 base.apk 路径。
+     *
+     * 原因是 ART 把 final 字段的值**常量折叠**进了编译后的方法体：
+     * toString 里那句拼接实际已变成字面量，不再回读字段。
+     * 这也解释了为什么 nativeLibraryDirectories 那一段能改成功
+     * —— 它是运行时读容器，没有折叠。
+     *
+     * <h2>所以改思路</h2>
+     * 不再动那个实例内部，而是让目标**枚举不到它**。
+     * 目标要在 Java 层拿到某个 ClassLoader，最常用的入口就是
+     * 遍历线程的 contextClassLoader。把这些入口里指向我们的引用摘掉。
+     *
+     * <h2>为什么不破坏模块</h2>
+     * 我们的类此时已经加载完成，模块自身执行不依赖
+     * contextClassLoader 再去找自己。摘的只是外部可见的入口。
+     */
+    static void detachFromThreads() {
+        int cleared = 0;
+        try {
+            Thread[] ts = new Thread[Thread.activeCount() * 2 + 32];
+            int n = Thread.enumerate(ts);
+            for (int i = 0; i < n; i++) {
+                Thread th = ts[i];
+                if (th == null) continue;
+                try {
+                    ClassLoader cl = th.getContextClassLoader();
+                    if (cl != null && isOurs(cl)) {
+                        th.setContextClassLoader(ClassLoader.getSystemClassLoader());
+                        cleared++;
+                    }
+                } catch (Throwable ignored) { }
+            }
+        } catch (Throwable t) {
+            HookEntry.log("SELFCL 摘除失败: " + t);
+        }
+        if (cleared > 0) {
+            HookEntry.log("SELFCL 已摘除 contextClassLoader x" + cleared);
+        }
+    }
+
+    /** 这个 ClassLoader 是不是本模块那个（按 toString 里是否带本模块包名判断）。 */
+    private static boolean isOurs(ClassLoader cl) {
+        try {
+            String str = String.valueOf(cl);
+            return str != null && str.contains(SELF);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * 逐层扒开带路径的那个对象，打印每一层的全部字段。
+     *
+     * <p>为什么要这么做：字段、容器、对象图都洗过之后
+     * {@code toString} 仍输出 {@code module=/data/app/~~xxx==/.../base.apk}，
+     * 说明那个路径藏在某个我们没走到的位置。
+     * 与其继续猜，不如把这个对象逐层展开，直接看是哪一层的哪个字段带着它。
+     */
+    private static void probeModule(ClassLoader cl) {
+        Object cur = cl;
+        for (int d = 0; d < 6 && cur != null; d++) {
+            HookEntry.log("PRB[" + d + "] type=" + cur.getClass().getName());
+            /* 这一层自身的 toString，看路径是不是在这里就出来了 */
+            try {
+                String ts = String.valueOf(cur);
+                HookEntry.log("PRBSTR[" + d + "] " + (ts.length() > 220
+                        ? ts.substring(0, 220) + "..." : ts));
+            } catch (Throwable ignored) { }
+            /*
+             * 扫描**所有**无参方法（含 private）的返回值。
+             *
+             * 前面只扫了 public（getMethods），没找到。而字段里一个都命不中，
+             * 说明 module= 那个值是某个方法现算的，很可能在 private 里。
+             */
+            for (Class<?> c4 = cur.getClass(); c4 != null && c4 != Object.class;
+                 c4 = c4.getSuperclass()) {
+                for (java.lang.reflect.Method m4 : c4.getDeclaredMethods()) {
+                    if (m4.getParameterTypes().length != 0) continue;
+                    Class<?> rt4 = m4.getReturnType();
+                    if (rt4 != String.class && rt4 != java.io.File.class
+                            && rt4 != Object.class) continue;
+                    if (!m4.isAccessible()) {
+                        try { m4.setAccessible(true); } catch (Throwable t) { continue; }
+                    }
+                    try {
+                        Object r4 = m4.invoke(cur);
+                        String rs4 = (r4 instanceof java.io.File)
+                                ? ((java.io.File) r4).getPath() : String.valueOf(r4);
+                        if (rs4 != null && rs4.contains(SELF)) {
+                            HookEntry.log("PRBM " + c4.getSimpleName() + "."
+                                    + m4.getName() + " -> "
+                                    + (rs4.length() > 130
+                                       ? rs4.substring(0, 130) + "..." : rs4));
+                        }
+                    } catch (Throwable ignored) { }
+                }
+            }
+            /* 扫描所有 String 字段，看哪个还带着路径 */
+            for (Class<?> c3 = cur.getClass(); c3 != null && c3 != Object.class;
+                 c3 = c3.getSuperclass()) {
+                for (java.lang.reflect.Field f3 : c3.getDeclaredFields()) {
+                    try {
+                        f3.setAccessible(true);
+                        Object v3 = f3.get(cur);
+                        if (v3 instanceof String && ((String) v3).contains(SELF)) {
+                            HookEntry.log("PRBHIT " + c3.getSimpleName() + "."
+                                    + f3.getName() + " = " + v3);
+                        }
+                        if (v3 instanceof java.io.File
+                                && ((java.io.File) v3).getPath().contains(SELF)) {
+                            HookEntry.log("PRBHIT " + c3.getSimpleName() + "."
+                                    + f3.getName() + " (File) = " + v3);
+                        }
+                    } catch (Throwable ignored) { }
+                }
+            }
+            /* 容器类字段：把每个元素的运行时类型也打出来 */
+            for (Class<?> c2 = cur.getClass(); c2 != null && c2 != Object.class;
+                 c2 = c2.getSuperclass()) {
+                for (java.lang.reflect.Field f2 : c2.getDeclaredFields()) {
+                    try {
+                        f2.setAccessible(true);
+                        Object v2 = f2.get(cur);
+                        if (v2 instanceof java.util.List) {
+                            java.util.List<?> l2 = (java.util.List<?>) v2;
+                            StringBuilder eb = new StringBuilder();
+                            for (int i2 = 0; i2 < l2.size() && i2 < 4; i2++) {
+                                Object e2 = l2.get(i2);
+                                eb.append('[').append(i2).append(']')
+                                  .append(e2 == null ? "null"
+                                        : e2.getClass().getName())
+                                  .append(" = ")
+                                  .append(String.valueOf(e2).length() > 70
+                                        ? String.valueOf(e2).substring(0, 70) + "..."
+                                        : String.valueOf(e2))
+                                  .append(" ; ");
+                            }
+                            HookEntry.log("PRBEL " + c2.getSimpleName() + "."
+                                    + f2.getName() + " ("
+                                    + v2.getClass().getName() + ") 元素: " + eb);
+                        }
+                    } catch (Throwable ignored) { }
+                }
+            }
+            Object next = null;
+            for (Class<?> c = cur.getClass(); c != null && c != Object.class;
+                 c = c.getSuperclass()) {
+                java.lang.reflect.Field[] fs;
+                try {
+                    fs = c.getDeclaredFields();
+                } catch (Throwable t) {
+                    continue;
+                }
+                for (java.lang.reflect.Field f : fs) {
+                    try {
+                        f.setAccessible(true);
+                        Object v = f.get(cur);
+                        String sv = (v instanceof String) ? ("\"" + v + "\"")
+                                : String.valueOf(v);
+                        if (sv != null && sv.length() > 110) {
+                            sv = sv.substring(0, 110) + "...";
+                        }
+                        HookEntry.log("PRB[" + d + "]   " + c.getSimpleName() + "."
+                                + f.getName() + " (" + f.getType().getSimpleName()
+                                + ") = " + sv);
+                        if (next == null && v != null
+                                && f.getName().toLowerCase().contains("module")) {
+                            next = v;
+                        }
+                    } catch (Throwable ignored) { }
+                }
+            }
+            if (next == null || next == cur) break;
+            cur = next;
         }
     }
 

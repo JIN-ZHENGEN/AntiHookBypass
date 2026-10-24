@@ -774,7 +774,7 @@ static int restore_executable_segments(int ops) {
             int found = 0;
             for (b = 0; b < seg_len && found < 3; b++) {
                 if (mem_ptr[b] != seg_copy[b]) {
-                    LOGI("L2 diff %s +%#zx mem=%02x disk=%02x",
+                    AHB_SAYL("L2 diff %s +%#zx mem=%02x disk=%02x",
                          strrchr(p, '/') ? strrchr(p, '/') + 1 : p, b,
                          mem_ptr[b], seg_copy[b]);
                     first = b; (void)first;
@@ -791,10 +791,10 @@ static int restore_executable_segments(int ops) {
         /* 同时写进文件日志：logcat 会被刷掉，这个文件能留证据 */
         ahb_keylog("L2DIFF diff_bytes=%d diff_pages=%d (内存未改动)",
                     restored_bytes, restored_pages);
-        LOGI("L2 code-seg 差异: bytes=%d pages=%d（内存未改动）",
+        AHB_SAYL("L2 code-seg 差异: bytes=%d pages=%d（内存未改动）",
              restored_bytes, restored_pages);
     } else {
-        LOGI("L2 code-seg: 与磁盘一致");
+        AHB_SAYL("L2 code-seg: 与磁盘一致");
     }
     return 1;
 }
@@ -1441,7 +1441,7 @@ static void ahb_start_jvmti_watch(void) {
 
 static void *guard_loop(void *arg) {
     int ops = (int)(intptr_t)arg;
-    LOGI("L4 guard_loop 启动 interval=250ms ops=%#x", ops);
+    AHB_SAYL("L4 guard_loop 启动 interval=250ms ops=%#x", ops);
     ahb_filelog("L4 guard_loop start ops=%#x", ops);
 
     while (g_guard_running) {
@@ -1475,7 +1475,7 @@ static void *guard_loop(void *arg) {
                 char buf[1024]; int off = 0;
                 for (int i = 0; i < g_dbg_i && off < 900; i++)
                     off += snprintf(buf + off, sizeof(buf) - off, "%lx,", (unsigned long)g_dbg_addr[i]);
-                LOGI("RAWREAD: %s", buf);
+                AHB_SAYL("RAWREAD: %s", buf);
                 g_dbg_i = 0;
             }
             AHB_SAYL("VIEWPROOF calls=%lu hits=%lu sys=%lu slots=%d hb=%d",
@@ -1553,7 +1553,7 @@ static void *guard_loop(void *arg) {
                 int n = maps_patch_got_all();
                 last_mod = mod;
                 if (n > 0) {
-                    LOGI("MAPS: 新增接管 %d 处，累计 %d 处（模块数 %d）",
+                    AHB_SAYL("MAPS: 新增接管 %d 处，累计 %d 处（模块数 %d）",
                          n, g_maps_got_patched, mod);
                     ahb_filelog("MAPS hb new=%d total=%d mod=%d",
                                 n, g_maps_got_patched, mod);
@@ -1582,7 +1582,7 @@ static void *guard_loop(void *arg) {
         }
         nanosleep(&ts, NULL);
     }
-    LOGI("L4 guard_loop 退出");
+    AHB_SAYL("L4 guard_loop 退出");
     return NULL;
 }
 
@@ -2721,7 +2721,7 @@ static ssize_t clv_pvr(pid_t pid, const struct iovec *local, unsigned long liovc
             clv_install_now();
 #endif
             if (g_clv_n != before) {
-                LOGI("RESCAN: 第 %d 次补扫 slots %d -> %d", rescans, before, g_clv_n);
+                AHB_SAYL("RESCAN: 第 %d 次补扫 slots %d -> %d", rescans, before, g_clv_n);
                 ahb_filelog("RESCAN %d: %d -> %d", rescans, before, g_clv_n);
             }
         }
@@ -3486,7 +3486,7 @@ static void *clv_fast_patch_thread(void *arg) {
         int before = g_clv_got_patched;
         clv_patch_got();
         if (g_clv_got_patched > before) {
-            LOGI("FASTPATCH: 第 %d 轮抢到接管 %d 处（累计 %d）",
+            AHB_SAYL("FASTPATCH: 第 %d 轮抢到接管 %d 处（累计 %d）",
                  i, g_clv_got_patched - before, g_clv_got_patched);
         }
         if (g_clv_got_patched >= 2) {
@@ -3553,7 +3553,7 @@ static int trim_class_loaders(JNIEnv *env, uintptr_t head, int keep) {
     /* 同步元素个数 */
     if (!write_raw_ptr(head + CL_SIZE_OFF, (uintptr_t)keep)) return 0;
 
-    LOGI("L3 trim_class_loaders: %d -> %d nodes (no jni refs touched)", n, keep);
+    AHB_SAYL("L3 trim_class_loaders: %d -> %d nodes (no jni refs touched)", n, keep);
     return 1;
 }
 
@@ -3580,21 +3580,21 @@ static int preserve_art_classloaders(JNIEnv *env) {
      * "能读到 runtime 却定位不到链表"的真正原因。
      */
     uintptr_t vm_addr = UNTAG_PTR((uintptr_t)vm);
-    LOGI("L3 vm=%p (untagged=%#lx)", (void *)vm, (unsigned long)vm_addr);
+    AHB_SAYL("L3 vm=%p (untagged=%#lx)", (void *)vm, (unsigned long)vm_addr);
 
     uintptr_t runtime = 0;
     if (!read_ptr_untagged(vm_addr + sizeof(uintptr_t), &runtime) || runtime == 0) {
         LOGE("L3 runtime 定位失败 (vm=%p) —— 无法继续 ClassLoader 计数", (void *)vm);
         return 0;
     }
-    LOGI("L3 runtime=%p", (void *)runtime);
+    AHB_SAYL("L3 runtime=%p", (void *)runtime);
 
     uintptr_t art_start = 0, art_end = 0;
     if (!collect_libart_range(&art_start, &art_end)) {
         LOGE("L3 libart 范围收集失败");
         return 0;
     }
-    LOGI("L3 libart=%#lx-%#lx", (unsigned long)art_start, (unsigned long)art_end);
+    AHB_SAYL("L3 libart=%#lx-%#lx", (unsigned long)art_start, (unsigned long)art_end);
     const size_t step = sizeof(uintptr_t);
     for (size_t cl_off = 0; cl_off < 0x500; cl_off += step) {
         uintptr_t cand = 0;
@@ -3632,7 +3632,7 @@ static int preserve_art_classloaders(JNIEnv *env) {
              * 其 +0x10 是打了 TBI 标签的 jobject（高字节 b4/d4 等）。
              * 别的同名双向链表不会有这个特征。抽查前若干节点即可。
              */
-            LOGI("L3 candidate clo=%#zx lo=%#zx head=%#lx count=%d", cl_off, list_off,
+            AHB_SAYL("L3 candidate clo=%#zx lo=%#zx head=%#lx count=%d", cl_off, list_off,
                  (unsigned long)head, count);
 
             /*
@@ -3648,7 +3648,7 @@ static int preserve_art_classloaders(JNIEnv *env) {
              * 剪错一条链的代价是整进程堆损坏，所以这里必须与检测器口径完全一致。
              */
 
-            LOGI("L3 located class_loaders_: Runtime+%#zx ClassLinker+%#zx count=%d",
+            AHB_SAYL("L3 located class_loaders_: Runtime+%#zx ClassLinker+%#zx count=%d",
                  cl_off, list_off, count);
 
             /*
@@ -3676,10 +3676,10 @@ static int preserve_art_classloaders(JNIEnv *env) {
                  * 的规则跳过，于是选中 0x2c0。所以剪链必须放在同一时机做，
                  * 由 L4 守护线程延迟若干秒后调用 l3_trim_when_settled()。
                  */
-                LOGI("L3 init 阶段仅观察: count=%d（剪链交由 L4 延迟执行以对齐检测时机）", count);
+                AHB_SAYL("L3 init 阶段仅观察: count=%d（剪链交由 L4 延迟执行以对齐检测时机）", count);
                 return 1;
             } else {
-                LOGI("L3 class_loaders_ count=%d already within range, no trim", count);
+                AHB_SAYL("L3 class_loaders_ count=%d already within range, no trim", count);
                 return 1;
             }
         }   /* for list_off */
@@ -3846,7 +3846,7 @@ Java_com_rev_antihookbypass_NativeLayer_nativeSanitizeRuntime(JNIEnv *env, jclas
      * 未指定由 Java 侧的 parseNative 负责给默认值，这里只管执行。
      */
 
-    LOGI("L2 begin ops=%#x (art=%d linker=%d tramp=%d)", o,
+    AHB_SAYL("L2 begin ops=%#x (art=%d linker=%d tramp=%d)", o,
          (o & NATIVE_OP_ART) ? 1 : 0,
          (o & NATIVE_OP_LINKER) ? 1 : 0,
          (o & NATIVE_OP_TRAMP) ? 1 : 0);
@@ -4000,7 +4000,7 @@ static void ahb_guard_linker_tail(void) {
         if (r == want) ok++;
         else if (i == 0) break;   /* 首页都拿不到就没必要继续 */
     }
-    LOGI("GUARD: linker64 末尾 0x%lx 补可读页 %d/64", cur, ok);
+    AHB_SAYL("GUARD: linker64 末尾 0x%lx 补可读页 %d/64", cur, ok);
 }
 
 /*
@@ -4637,7 +4637,7 @@ jint JNI_OnLoad(JavaVM *vm, void *reserved) {
     g_vm = vm;
 #if !AHB_NATIVE_ON
     g_enable_maps_hide = 0;
-    LOGI("NATIVEOFF: 不安装任何补丁");
+    AHB_SAYL("NATIVEOFF: 不安装任何补丁");
     return JNI_VERSION_1_6;
 #endif
 
@@ -4670,7 +4670,7 @@ jint JNI_OnLoad(JavaVM *vm, void *reserved) {
      * ClassLoader 项读到真值 32"。
      */
     ahb_early_init();
-    LOGI("JNI_OnLoad: 早期视图安装 slots=%d", g_clv_n);
+    AHB_SAYL("JNI_OnLoad: 早期视图安装 slots=%d", g_clv_n);
 
     /*
      * maps 视图接管。
@@ -4683,7 +4683,7 @@ jint JNI_OnLoad(JavaVM *vm, void *reserved) {
         int n = maps_patch_got_all();
         ahb_filelog("MAPS got patched=%d total=%d calls=%lu",
                     n, g_maps_got_patched, g_maps_open_calls);
-        LOGI("MAPS: 接管 open 一族 %d 处，累计 %d 处", n, g_maps_got_patched);
+        AHB_SAYL("MAPS: 接管 open 一族 %d 处，累计 %d 处", n, g_maps_got_patched);
     }
     return JNI_VERSION_1_6;
 }
@@ -4699,7 +4699,7 @@ NativeOnModuleLoaded native_init(const NativeAPIEntries *entries) {
     if (entries) {
         g_hook = entries->hook_func;
         g_unhook = entries->unhook_func;
-        LOGI("native_init: version=%u hook=%p unhook=%p",
+        AHB_SAYL("native_init: version=%u hook=%p unhook=%p",
              entries->version, (void *)g_hook, (void *)g_unhook);
     }
     /*

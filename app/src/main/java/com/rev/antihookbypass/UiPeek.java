@@ -199,6 +199,21 @@ final class UiPeek {
 
     /** 抓一屏（含 UD 这类自定义 View 的文字）。 */
     static void dumpShot(Activity act, int round) {
+        /*
+         * 顺手把 PathHiding 的自检也跑一遍。
+         *
+         * 为什么放这里：PathHiding.install() 在 handleLoadPackage 最早期执行，
+         * 那个阶段 logd 还没准备好，它内部打的日志会被丢掉 ——
+         * 表现成"一条 PathHiding 日志都没有"，很容易误判成没执行。
+         * 而界面已经画出来的时刻，日志通道完全正常。
+         */
+        if (round == 0) {
+            try {
+                PathHiding.selfCheckAll();
+            } catch (Throwable t) {
+                HookEntry.log("SELFCL 自检失败: " + t);
+            }
+        }
         try {
             View root = act.getWindow() == null ? null
                     : act.getWindow().getDecorView();

@@ -878,18 +878,51 @@ static size_t maps_emit_masked_line(char *out, size_t w, size_t cap,
  * 真实安卓进程里本来就有大量 [anon:dalvik-jit-code-cache] 之类的可执行段，
  * 所以这个名字在这个位置完全合理。关键仍然是**行数不变**。
  */
+/*
+ * 匿名可执行段：**保留全部原字段，只在末尾追加一个短路径**。
+ *
+ * 这一条是两次试错试出来的，两个方向都踩过：
+ *
+ * 1) 先改成 [anon:dalvik-jit-code-cache]，想让"匿名"看起来正常。
+ *    结果检测器确实数不出匿名段了（它只数"无路径的 r-x"），
+ *    但 hunter 6.58 恰恰按这个前缀判：
+ *        Found suspicious anonymous memory :
+ *        name -> [[anon:dalvik-jit-code-cache]]
+ *    "[anon:" 本身就是"无归属"的标记，等于主动告诉对方。
+ *
+ * 2) 再改成伪装成真实的 boot.oat 映射，还给它配了 stat 出来的 dev/inode。
+ *    更糟 —— 那条路径 60 字节，目标按固定长度缓冲解析，直接炸：
+ *        Abort message: 'FORTIFY: strcpy: prevented 8-byte write into 5-byte buffer'
+ *
+ * 现在这版是两条路的最小公约数：
+ *   - 起止地址、权限、偏移、dev、inode **一个字节都不动**，只追加路径
+ *   - 路径用系统本来就有的短名，不含 "[anon:" 前缀
+ *   - 总长度只增加 33 字节，不会让任何按定长缓冲解析的地方溢出
+ *
+ * 为什么要加路径而不是原样输出：com.cshlolss.antihook.detect 的
+ * native_anon_exec 项就是数"无路径的 r-x 段"。原样输出时它判 RISK。
+ */
 static size_t maps_emit_anon_exec_masked(char *out, size_t w, size_t cap,
                                          const char *line, size_t len, int seq) {
-    if (w + len + 40 > cap) return w;
-    memcpy(out + w, line, len);
-    w += len;
-    static const char name[] = " [anon:dalvik-jit-code-cache]";
-    size_t nl = sizeof(name) - 1;
-    if (w + nl + 2 > cap) return w;
-    memcpy(out + w, name, nl);
-    w += nl;
-    out[w++] = '\n';
+    static const char path[] = " /system/framework/framework.jar";
+    size_t pl = sizeof(path) - 1;
+    size_t body = len;
+
     (void)seq;
+    if (w + len + pl + 2 > cap) return w;
+
+    /* 原行末尾可能是 '\n'，也可能没有；把路径插在换行之前 */
+    if (body > 0 && line[body - 1] == '\n') body--;
+
+    memcpy(out + w, line, body);
+    w += body;
+    /* 原行尾若已有空格就不再重复加 */
+    if (body > 0 && line[body - 1] != ' ' && line[body - 1] != '\t') {
+        out[w++] = ' ';
+    }
+    memcpy(out + w, path + 1, pl - 1);   /* 跳过开头那个空格，前面已补 */
+    w += pl - 1;
+    out[w++] = '\n';
     return w;
 }
 

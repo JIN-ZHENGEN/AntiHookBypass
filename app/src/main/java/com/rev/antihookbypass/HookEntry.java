@@ -506,5 +506,21 @@ public class HookEntry implements IXposedHookLoadPackage {
             XposedBridge.log("[" + TAG + "] " + msg);
         } catch (Throwable ignored) {
         }
+        /*
+         * 诊断期旁路：同时写一份到 logcat。
+         *
+         * 为什么要这条旁路：XposedBridge.log 会进 LSPosed 自己的日志系统，
+         * 不直接进 logcat —— 之前排查时一直盯着 logcat 找模块日志，
+         * 一条都看不到，误判成"模块没跑"。
+         *
+         * 只在 ExpFlags.UIPEEK=true（排查期）时开，
+         * 交付版的 XposedBridge.log 是唯一的出口。
+         */
+        if (com.rev.antihookbypass.ExpFlags.UIPEEK) {
+            try {
+                android.util.Log.println(android.util.Log.INFO, TAG, msg);
+            } catch (Throwable ignored) {
+            }
+        }
     }
 }
