@@ -100,6 +100,10 @@ static void ahb_keylog(const char *fmt, ...) {
     }
 }
 
+#ifndef AHB_NATIVE_ON
+#define AHB_NATIVE_ON 1
+#endif
+
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
@@ -3160,11 +3164,153 @@ Java_com_rev_antihookbypass_NativeLayer_nativeSanitizeRuntime(JNIEnv *env, jclas
     return mask;
 }
 
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+
+/*
+ * 把 linker64 最后一个映射的末尾补成一个可读零页。
+ *
+ * 为什么需要：实测目标应用（hunter 6.58）的 native 扫描线程在本机稳定
+ * SIGSEGV，故障地址每次都是同一个值，而该值恰好等于本进程 linker64
+ * 最后一个映射（[anon:.bss]）的**结束地址**，一字节不差；寄存器里另一个
+ * 指针正好落在 linker64 的 r-xp 段起点。也就是说它在按段遍历 linker64，
+ * 用的长度与实际段布局不匹配（本机是 Android 17，linker64 更大），
+ * 走到最后一个映射末尾就踩空。
+ *
+ * 这里不做任何结果改写：只是把那一页变成可读的零页，让越界读返回 0，
+ * 目标应用那条路径会当成"没有数据"跳过，而不是把进程干掉。
+ *
+ * 只在"该处确实还没映射"时补（MAP_FIXED_NOREPLACE），已占用则自动放弃，
+ * 不会覆盖任何已有映射。
+ */
+static unsigned long ahb_maps_parse_lo(const char *line, unsigned long *endout) {
+    unsigned long s = 0, e = 0;
+    const char *q = line;
+    while (*q && *q != '-') {
+        s <<= 4;
+        s |= (unsigned long)(*q <= '9' ? *q - '0' : (((*q) | 0x20) - 'a' + 10));
+        q++;
+    }
+    if (*q != '-') return 0;
+    q++;
+    while (*q && *q != ' ') {
+        e <<= 4;
+        e |= (unsigned long)(*q <= '9' ? *q - '0' : (((*q) | 0x20) - 'a' + 10));
+        q++;
+    }
+    *endout = e;
+    return s;
+}
+
+static void ahb_guard_linker_tail(void) {
+    static char mbuf[1024 * 1024];
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/maps", O_RDONLY, 0);
+    if (fd < 0) return;
+    /*
+     * 必须读满，不能只读一次。
+     *
+     * 实测踩坑：这里原来只 read 一次、缓冲区 256KB，而本机 maps 约 350KB，
+     * read 一次就截断了。linker64 的映射在地址空间的**末尾**，正好落在
+     * 被截掉的那一段里，于是 cur 永远算不出来，补页静默跳过 ——
+     * 日志里一条 GUARD 都没有，我一开始还以为内核不支持。
+     */
+    size_t total = 0;
+    for (;;) {
+        if (total >= sizeof(mbuf) - 1) break;
+        long k = (long)syscall(SYS_read, fd, mbuf + total,
+                               sizeof(mbuf) - 1 - total);
+        if (k <= 0) break;
+        total += (size_t)k;
+    }
+    syscall(SYS_close, fd);
+    if (total == 0) return;
+    mbuf[total] = 0;
+
+    char line[512];
+    unsigned long cur = 0;
+
+    /* 第一遍：linker64 所有映射里最大的结束地址 */
+    for (size_t i = 0; i < total; ) {
+        size_t j = i;
+        while (j < total && mbuf[j] != '\n') j++;
+        size_t len = j - i;
+        if (len >= sizeof(line)) len = sizeof(line) - 1;
+        memcpy(line, mbuf + i, len);
+        line[len] = 0;
+        if (strstr(line, "linker64")) {
+            unsigned long e = 0;
+            if (ahb_maps_parse_lo(line, &e) && e > cur) cur = e;
+        }
+        i = j + 1;
+    }
+    if (!cur) return;
+
+    /* 第二遍：把紧跟其后、覆盖 cur 的 [anon:.bss] 块逐段接上 */
+    for (int round = 0; round < 8; round++) {
+        unsigned long next = cur;
+        for (size_t i = 0; i < total; ) {
+            size_t j = i;
+            while (j < total && mbuf[j] != '\n') j++;
+            size_t len = j - i;
+            if (len >= sizeof(line)) len = sizeof(line) - 1;
+            memcpy(line, mbuf + i, len);
+            line[len] = 0;
+            if (strstr(line, "[anon:.bss]")) {
+                unsigned long e = 0;
+                unsigned long st = ahb_maps_parse_lo(line, &e);
+                if (e && st <= cur && cur < e && e > next) next = e;
+            }
+            i = j + 1;
+        }
+        if (next == cur) break;
+        cur = next;
+    }
+
+    /*
+     * 连续补 64 页（256KB）。
+     *
+     * 补一页不够：目标应用越界读的位置可能不止一页。实测崩溃指令是
+     * 「以 x23 为基址 + 0x410 偏移读 16 字节」，单页勉强够，但不同版本的
+     * 偏移会变，留足余量比精确计算稳妥。整块都是 PROT_READ 的零页，
+     * 对越界读来说效果等同"这块内存存在但没有数据"。
+     *
+     * 逐页用 MAP_FIXED_NOREPLACE 补，遇到已占用就跳过 —— 绝不覆盖已有映射。
+     */
+    int ok = 0;
+    for (int i = 0; i < 64; i++) {
+        void *want = (void *)(cur + (unsigned long)i * 4096UL);
+        void *r = mmap(want, 4096, PROT_READ,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        if (r == want) ok++;
+        else if (i == 0) break;   /* 首页都拿不到就没必要继续 */
+    }
+    LOGI("GUARD: linker64 末尾 0x%lx 补可读页 %d/64", cur, ok);
+}
+
 __attribute__((visibility("default")))
 jint JNI_OnLoad(JavaVM *vm, void *reserved) {
     (void)reserved;
     if (!vm) return JNI_ERR;
     g_vm = vm;
+#if !AHB_NATIVE_ON
+    g_enable_maps_hide = 0;
+    LOGI("NATIVEOFF: 不安装任何补丁");
+    return JNI_VERSION_1_6;
+#endif
+
+    /*
+     * 这里曾经调用 ahb_guard_linker_tail() 给 linker64 末尾补零页，
+     * 用来兜住目标应用的越界读。现在不需要了：
+     *
+     * 真正的修法是在 maps 视图里把 linker64 的碎片段合并成连续段
+     * （见 maps_hide.h 的 linker64 分支），让对方的扫描范围算对。
+     * 补页只是把越界位置往后推 —— 实测推后 0x40000（64 页）后
+     * 它继续在新区间的末尾崩，属于掩盖症状。
+     *
+     * 而且补页有副作用：占用的地址可能落在 ART 的 JIT 分配区附近，
+     * 干扰 JIT 代码缓存管理，反而引出 jit_code_cache 断言。
+     */
 
     /*
      * 先定开关，再开始干活。

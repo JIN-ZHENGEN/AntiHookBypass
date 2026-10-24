@@ -491,6 +491,91 @@ static int maps_parse_line(const char *line, size_t len, struct maps_ent *e) {
  * 用记录的原始字节打底，只替换其中的起始/结束地址（合并段时要做），
  * 其余空格、对齐、路径原样保留 —— 保证字段个数与分隔形式与内核一致。
  */
+/*
+ * 保行改写：把一行里的路径字段换掉，其余字节（地址、权限、偏移、设备、
+ * inode、分隔空格）逐字保留。
+ *
+ * 为什么必须保行：目标应用按行解析 maps 并累加偏移，行数一变它就算错，
+ * 后面按索引取的地址会整体越界。删行看起来"更干净"，实际是把对方的
+ * 解析器搞崩。行数、地址布局、字段个数三者必须与真实视图完全一致。
+ *
+ * 替换目标选 /system/framework/ 下的真实存在的名字，长度不必相等，
+ * 但必须是"这行原本就该长这样"的形态：
+ *   - 设备文件（/dev/...）→ /dev/ashmem
+ *   - 其余 → /system/framework/framework.jar
+ * 这样它在形态上完全正常，不会因为"路径诡异"被单独挑出来。
+ */
+static size_t maps_emit_masked_line(char *out, size_t w, size_t cap,
+                                    const char *line, size_t len, int seq) {
+    (void)seq;
+    if (w + len + 2 > cap) return w;
+
+    /* 找路径字段起点：第 6 个字段（path 可含空格） */
+    size_t i = 0;
+    int fields = 0;
+    size_t path_at = len;
+    while (i < len) {
+        if (line[i] == ' ' || line[i] == '\t') { i++; continue; }
+        fields++;
+        while (i < len && line[i] != ' ' && line[i] != '\t') i++;
+        if (fields == 6) { /* inode 之后就是路径 */
+            while (i < len && (line[i] == ' ' || line[i] == '\t')) i++;
+            path_at = i;
+            break;
+        }
+    }
+
+    if (path_at >= len) {
+        /* 没有路径字段（理论上不会走到，匿名段另有分支） */
+        memcpy(out + w, line, len);
+        w += len;
+        if (w < cap) out[w++] = '\n';
+        return w;
+    }
+
+    /* 先原样抄到路径起点 */
+    memcpy(out + w, line, path_at);
+    w += path_at;
+
+    /* 再写入替换路径 */
+    const char *rep;
+    if (path_at + 4 <= len && memcmp(line + path_at, "/dev", 4) == 0) {
+        rep = "/dev/ashmem";
+    } else if (path_at + 4 <= len && memcmp(line + path_at, "/mem", 4) == 0) {
+        rep = "/memfd:jit-cache (deleted)";
+    } else {
+        rep = "/system/framework/framework.jar";
+    }
+    size_t rl = strlen(rep);
+    if (w + rl + 2 > cap) return w;
+    memcpy(out + w, rep, rl);
+    w += rl;
+
+    out[w++] = '\n';
+    return w;
+}
+
+/*
+ * 匿名可执行段的保行改写：给它一个 JIT 代码缓存的名字。
+ *
+ * 真实安卓进程里本来就有大量 [anon:dalvik-jit-code-cache] 之类的可执行段，
+ * 所以这个名字在这个位置完全合理。关键仍然是**行数不变**。
+ */
+static size_t maps_emit_anon_exec_masked(char *out, size_t w, size_t cap,
+                                         const char *line, size_t len, int seq) {
+    if (w + len + 40 > cap) return w;
+    memcpy(out + w, line, len);
+    w += len;
+    static const char name[] = " [anon:dalvik-jit-code-cache]";
+    size_t nl = sizeof(name) - 1;
+    if (w + nl + 2 > cap) return w;
+    memcpy(out + w, name, nl);
+    w += nl;
+    out[w++] = '\n';
+    (void)seq;
+    return w;
+}
+
 static size_t maps_emit_line(char *out, size_t w, size_t cap, const struct maps_ent *e) {
     char head[80];
     int hn = 0;
@@ -625,8 +710,28 @@ static int maps_make_clean_fd(void) {
             char *nl = strchr(line, '\n');
             size_t len = nl ? (size_t)(nl - line + 1) : strlen(line);
 
+            /*
+             * 命中痕迹的行：不删除，只改写路径。
+             *
+             * 这里曾经是 dropped++ 然后 continue —— 整行删掉。
+             * 那是错的，而且错得很隐蔽：
+             *
+             * 实测目标应用（hunter 6.58）按行解析 /proc/self/maps 并累加偏移，
+             * 它拿到的行数一旦与我们视图不一致，后面所有按索引取的地址就整体
+             * 错位。崩出来的故障地址每次都是本进程 linker64 最后一个映射的
+             * 结束地址（如 0x7422f30000，与该 [anon:.bss] 的末端一字节不差），
+             * 而每次触发时的长度都不同（0xeb / 0x10f / 0xb8）—— 正是"按行
+             * 累加后越过末尾"的指纹。
+             *
+             * 所以规则改成：**行数、地址、字段个数全部保持不变**，
+             * 只把路径那一段换成一个中性的、格式合法的系统路径。
+             * 检测器仍然看到同样多的行、同样的地址布局，不会错位。
+             */
             if (maps_line_is_trace_len(line, nl ? (size_t)(nl - line) : strlen(line))) {
                 dropped++;
+                w = maps_emit_masked_line(out, w, cap, line,
+                                          nl ? (size_t)(nl - line) : strlen(line),
+                                          dropped);
                 if (!nl) break;
                 line = nl + 1;
                 continue;
@@ -643,19 +748,43 @@ static int maps_make_clean_fd(void) {
                      */
                     if (ce.perm[0] == 'r' && ce.perm[1] == '-' &&
                         ce.perm[2] == 'x' && ce.path[0] == '\0') {
+                        /*
+                         * 匿名可执行段：同样不删行，只给它一个看起来正常的
+                         * 名字（JIT 代码缓存本来就会以这种形式出现在真实进程里）。
+                         */
                         dropped++;
+                        w = maps_emit_anon_exec_masked(out, w, cap, line,
+                                                       nl ? (size_t)(nl - line) : strlen(line),
+                                                       dropped);
                         if (!nl) break;
                         line = nl + 1;
                         continue;
                     }
 
-                    if (have_prev &&
+                    /*
+                     * linker64 的相邻可执行碎片段：合并。
+                     *
+                     * 为什么这里必须合并：实测本机 linker64 被拆成了
+                     * 0x7422d9d000 / 0x7422e27000 / 0x7422e28000 等多个
+                     * 4KB~大段的 r-xp 碎片 —— 这是 lsplant 装 inline hook
+                     * 时改页权限留下的 VMA 分裂，属于系统级注入的必然结果，
+                     * 我们改不了。
+                     *
+                     * 目标应用（hunter 6.58）会扫 linker64 找这类碎片，
+                     * 它按段起点加固定窗口算读取地址，碎片一多就算过头，
+                     * 读到最后一个映射的末尾之外 → SIGSEGV。
+                     * 实测：故障地址每次恰好等于最后一段的结束地址。
+                     *
+                     * 合并成连续段后，它看到的 linker64 与未注入时一致，
+                     * 不会算出越界地址。
+                     */
+                    if (have_prev && ce.path[0] &&
+                        strstr(prev_path, "linker64") &&
+                        strstr(ce.path, "linker64") &&
                         strncmp(ce.perm, "r-x", 3) == 0 &&
-                        strcmp(prev_perm, ce.perm) == 0 &&
-                        strcmp(prev_path, ce.path) == 0 &&
+                        strncmp(prev_perm, "r-x", 3) == 0 &&
                         ce.start == prev_e) {
-                        /* 相邻同文件可执行段：只把上一段的结束地址往后延 */
-                        prev_e = ce.end;
+                        prev_e = ce.end;   /* 只延长结束地址，不新增行 */
                         if (!nl) break;
                         line = nl + 1;
                         continue;
