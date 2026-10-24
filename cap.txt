@@ -120086,3 +120086,183 @@
 10-25 00:15:18.997  7045  7045 E AHBENTRY: JNI_OnLoad pid=7045 n=0
 10-25 00:15:18.997  7045  7045 E AHBENTRY: JNI_OnLoad pid=7045 n=1
 10-25 00:15:18.997  7045  7045 E AHBENTRY: JNI_OnLoad pid=7045 n=2
+10-25 00:55:41.805 21447 21447 E AHBENTRY: native_init pid=21447 n=0
+10-25 00:55:41.805 21447 21447 E AHBENTRY: native_init pid=21447 n=1
+10-25 00:55:41.805 21447 21447 E AHBENTRY: native_init pid=21447 n=2
+10-25 00:55:41.805 21447 21447 E AHBENTRY: early_init_body pid=21447 n=0
+10-25 00:55:41.805 21447 21447 E AHBENTRY: early_init_body pid=21447 n=1
+10-25 00:55:41.805 21447 21447 E AHBENTRY: early_init_body pid=21447 n=2
+10-25 00:55:41.924 21447 21447 E AHBENTRY: JNI_OnLoad pid=21447 n=0
+10-25 00:55:41.924 21447 21447 E AHBENTRY: JNI_OnLoad pid=21447 n=1
+10-25 00:55:41.924 21447 21447 E AHBENTRY: JNI_OnLoad pid=21447 n=2
+10-25 00:55:42.572 21723 21723 E AHBENTRY: native_init pid=21723 n=0
+10-25 00:55:42.572 21723 21723 E AHBENTRY: native_init pid=21723 n=1
+10-25 00:55:42.572 21723 21723 E AHBENTRY: native_init pid=21723 n=2
+10-25 00:55:42.572 21723 21723 E AHBENTRY: early_init_body pid=21723 n=0
+10-25 00:55:42.572 21723 21723 E AHBENTRY: early_init_body pid=21723 n=1
+10-25 00:55:42.572 21723 21723 E AHBENTRY: early_init_body pid=21723 n=2
+10-25 00:55:42.837 21723 21723 E AHBENTRY: JNI_OnLoad pid=21723 n=0
+10-25 00:55:42.837 21723 21723 E AHBENTRY: JNI_OnLoad pid=21723 n=1
+10-25 00:55:42.837 21723 21723 E AHBENTRY: JNI_OnLoad pid=21723 n=2
+10-25 00:55:59.545 24287 24287 E AHBENTRY: native_init pid=24287 n=0
+10-25 00:55:59.545 24287 24287 E AHBENTRY: native_init pid=24287 n=1
+10-25 00:55:59.545 24287 24287 E AHBENTRY: native_init pid=24287 n=2
+10-25 00:55:59.545 24287 24287 E AHBENTRY: early_init_body pid=24287 n=0
+10-25 00:55:59.545 24287 24287 E AHBENTRY: early_init_body pid=24287 n=1
+10-25 00:55:59.545 24287 24287 E AHBENTRY: early_init_body pid=24287 n=2
+10-25 00:55:59.658 24287 24287 E AHBENTRY: JNI_OnLoad pid=24287 n=0
+10-25 00:55:59.658 24287 24287 E AHBENTRY: JNI_OnLoad pid=24287 n=1
+10-25 00:55:59.658 24287 24287 E AHBENTRY: JNI_OnLoad pid=24287 n=2
+10-25 00:56:00.133 24376 24376 E AHBENTRY: native_init pid=24376 n=0
+10-25 00:56:00.133 24376 24376 E AHBENTRY: native_init pid=24376 n=1
+10-25 00:56:00.133 24376 24376 E AHBENTRY: native_init pid=24376 n=2
+10-25 00:56:00.133 24376 24376 E AHBENTRY: early_init_body pid=24376 n=0
+10-25 00:56:00.133 24376 24376 E AHBENTRY: early_init_body pid=24376 n=1
+10-25 00:56:00.133 24376 24376 E AHBENTRY: early_init_body pid=24376 n=2
+10-25 00:56:00.313 24376 24376 E AHBENTRY: JNI_OnLoad pid=24376 n=0
+10-25 00:56:00.313 24376 24376 E AHBENTRY: JNI_OnLoad pid=24376 n=1
+10-25 00:56:00.313 24376 24376 E AHBENTRY: JNI_OnLoad pid=24376 n=2
+10-25 00:56:17.347 27442 27442 E AHBENTRY: native_init pid=27442 n=0
+10-25 00:56:17.347 27442 27442 E AHBENTRY: native_init pid=27442 n=1
+10-25 00:56:17.347 27442 27442 E AHBENTRY: native_init pid=27442 n=2
+10-25 00:56:17.347 27442 27442 E AHBENTRY: early_init_body pid=27442 n=0
+10-25 00:56:17.347 27442 27442 E AHBENTRY: early_init_body pid=27442 n=1
+10-25 00:56:17.347 27442 27442 E AHBENTRY: early_init_body pid=27442 n=2
+10-25 00:56:17.464 27442 27442 E AHBENTRY: JNI_OnLoad pid=27442 n=0
+10-25 00:56:17.464 27442 27442 E AHBENTRY: JNI_OnLoad pid=27442 n=1
+10-25 00:56:17.464 27442 27442 E AHBENTRY: JNI_OnLoad pid=27442 n=2
+10-25 00:56:17.899 27758 27758 E AHBENTRY: native_init pid=27758 n=0
+10-25 00:56:17.899 27758 27758 E AHBENTRY: native_init pid=27758 n=1
+10-25 00:56:17.899 27758 27758 E AHBENTRY: native_init pid=27758 n=2
+10-25 00:56:17.899 27758 27758 E AHBENTRY: early_init_body pid=27758 n=0
+10-25 00:56:17.899 27758 27758 E AHBENTRY: early_init_body pid=27758 n=1
+10-25 00:56:17.899 27758 27758 E AHBENTRY: early_init_body pid=27758 n=2
+10-25 00:56:18.084 27758 27758 E AHBENTRY: JNI_OnLoad pid=27758 n=0
+10-25 00:56:18.084 27758 27758 E AHBENTRY: JNI_OnLoad pid=27758 n=1
+10-25 00:56:18.084 27758 27758 E AHBENTRY: JNI_OnLoad pid=27758 n=2
+10-25 00:57:09.721  6113  6113 E AHBENTRY: native_init pid=6113 n=0
+10-25 00:57:09.721  6113  6113 E AHBENTRY: native_init pid=6113 n=1
+10-25 00:57:09.721  6113  6113 E AHBENTRY: native_init pid=6113 n=2
+10-25 00:57:09.721  6113  6113 E AHBENTRY: early_init_body pid=6113 n=0
+10-25 00:57:09.721  6113  6113 E AHBENTRY: early_init_body pid=6113 n=1
+10-25 00:57:09.721  6113  6113 E AHBENTRY: early_init_body pid=6113 n=2
+10-25 00:57:09.942  6113  6113 E AHBENTRY: JNI_OnLoad pid=6113 n=0
+10-25 00:57:09.942  6113  6113 E AHBENTRY: JNI_OnLoad pid=6113 n=1
+10-25 00:57:09.942  6113  6113 E AHBENTRY: JNI_OnLoad pid=6113 n=2
+10-25 00:57:09.956  6113  6113 I AntiHookBypass: L2+L3 native 已通过 System.loadLibrary 加载
+10-25 00:57:09.961  6113  6113 I AntiHookBypass: SELFCL 全量清洗 实例=3 元素=1
+10-25 00:57:09.964  6113  6113 I AntiHookBypass: PathHiding getLdLibraryPath 已挂
+10-25 00:57:09.965  6113  6113 I AntiHookBypass: PathHiding java.lang.ClassLoader 跳过: java.lang.NoSuchMethodException: java.lang.ClassLoader.toString []
+10-25 00:57:09.966  6113  6113 I AntiHookBypass: SELFCL 挂 toString 失败: java.lang.IllegalArgumentException: Do not allow hooking inner methods
+10-25 00:57:09.968  6113  6113 I AntiHookBypass: PathHiding 已挂 StringBuilder.toString
+10-25 00:57:09.970  6113  6113 I AntiHookBypass: PathHiding 已挂 String.concat
+10-25 00:57:09.971  6113  6113 I AntiHookBypass: SELFCLBAD LspModuleClassLoader[module=/data/app/~~tyVoxEGaIY6YPIjJxzPtsA==/com.rev.antihookbypass-GbpuRytzDpFxQ-3XfkJSIQ==/base.apk, o1[DexPathList[[dex file "InMemoryDexFile[cookie=[0, -5476376622084481184]]"]
+10-25 00:57:09.972  6113  6113 I AntiHookBypass: SELFCL 实例总数=3 仍带路径=1
+10-25 00:57:09.973  6113  6113 I AntiHookBypass: SELFCL 全文 LspModuleClassLoader[module=/data/app/~~tyVoxEGaIY6YPIjJxzPtsA==/com.rev.antihookbypass-GbpuRytzDpFxQ-3XfkJSIQ==/base.apk, o1[DexPathList[[dex file "InMemoryDexFile[cookie=[0, -5476376622084481184]]"],nativeLibraryDirectories=[/system/framework/framework.jar, 
+10-25 00:57:09.975  6113  6113 I AntiHookBypass: PRB[0] type=o1
+10-25 00:57:09.976  6113  6113 I AntiHookBypass: PRBSTR[0] LspModuleClassLoader[module=/data/app/~~tyVoxEGaIY6YPIjJxzPtsA==/com.rev.antihookbypass-GbpuRytzDpFxQ-3XfkJSIQ==/base.apk, o1[DexPathList[[dex file "InMemoryDexFile[cookie=[0, -5476376622084481184]]"],nativeLibraryDirect...
+10-25 00:57:09.977  6113  6113 I AntiHookBypass: PRBM o1.toString -> LspModuleClassLoader[module=/data/app/~~tyVoxEGaIY6YPIjJxzPtsA==/com.rev.antihookbypass-GbpuRytzDpFxQ-3XfkJSIQ==/base.apk, o1[DexP...
+10-25 00:57:09.979  6113  6113 I AntiHookBypass: PRBM BaseDexClassLoader.toString -> LspModuleClassLoader[module=/data/app/~~tyVoxEGaIY6YPIjJxzPtsA==/com.rev.antihookbypass-GbpuRytzDpFxQ-3XfkJSIQ==/base.apk, o1[DexP...
+10-25 00:57:09.979  6113  6113 I AntiHookBypass: PRBHIT o1.a = /data/app/~~tyVoxEGaIY6YPIjJxzPtsA==/com.rev.antihookbypass-GbpuRytzDpFxQ-3XfkJSIQ==/base.apk
+10-25 00:57:09.980  6113  6113 I AntiHookBypass: PRBHIT o1.e = com.rev.antihookbypass
+10-25 00:57:09.981  6113  6113 I AntiHookBypass: PRBEL o1.b (java.util.ArrayList) 元素: [0]java.io.File = /system/framework/framework.jar ; [1]java.io.File = /system/lib64 ; [2]java.io.File = /system_ext/lib64 ; 
+10-25 00:57:09.982  6113  6113 I AntiHookBypass: PRBEL o1.f (java.util.ArrayList) 元素: [0]java.io.File = /system/lib64 ; [1]java.io.File = /system_ext/lib64 ; 
+10-25 00:57:09.984  6113  6113 I AntiHookBypass: PRB[0]   o1.a (String) = "/data/app/~~tyVoxEGaIY6YPIjJxzPtsA==/com.rev.antihookbypass-GbpuRytzDpFxQ-3XfkJSIQ==/base.apk"
+10-25 00:57:09.986  6113  6113 I AntiHookBypass: PRB[0]   o1.b (ArrayList) = [/system/framework/framework.jar, /system/lib64, /system_ext/lib64]
+10-25 00:57:09.987  6113  6113 I AntiHookBypass: PRB[0]   o1.c (int) = 82
+10-25 00:57:09.988  6113  6113 I AntiHookBypass: PRB[0]   o1.d (boolean) = true
+10-25 00:57:09.989  6113  6113 I AntiHookBypass: PRB[0]   o1.e (String) = "com.rev.antihookbypass"
+10-25 00:57:09.989  6113  6113 I AntiHookBypass: PRB[0]   o1.f (ArrayList) = [/system/lib64, /system_ext/lib64]
+10-25 00:57:09.991  6113  6113 I AntiHookBypass: PRB[0]   BaseDexClassLoader.pathList (DexPathList) = DexPathList[[dex file "InMemoryDexFile[cookie=[0, -5476376622084481184]]"],nativeLibraryDirectories=[/system/f...
+10-25 00:57:09.992  6113  6113 I AntiHookBypass: PRB[0]   BaseDexClassLoader.reporter (Reporter) = android.app.DexLoadReporter@4bdf353
+10-25 00:57:09.992  6113  6113 I AntiHookBypass: PRB[0]   BaseDexClassLoader.sharedLibraryLoaders (ClassLoader[]) = null
+10-25 00:57:09.993  6113  6113 I AntiHookBypass: PRB[0]   BaseDexClassLoader.sharedLibraryLoadersAfter (ClassLoader[]) = null
+10-25 00:57:09.994  6113  6113 I AntiHookBypass: PRB[0]   ClassLoader.allocator (long) = -5476376622084855808
+10-25 00:57:09.995  6113  6113 I AntiHookBypass: PRB[0]   ClassLoader.classTable (long) = -5476376620418595424
+10-25 00:57:09.996  6113  6113 I AntiHookBypass: PRB[0]   ClassLoader.name (String) = null
+10-25 00:57:09.996  6113  6113 I AntiHookBypass: PRB[0]   ClassLoader.packages (Map) = {}
+10-25 00:57:09.998  6113  6113 I AntiHookBypass: PRB[0]   ClassLoader.parent (ClassLoader) = dalvik.system.PathClassLoader[DexPathList[[directory "."],nativeLibraryDirectories=[/system/lib64, /system_ext...
+10-25 00:57:09.999  6113  6113 I AntiHookBypass: PRB[0]   ClassLoader.proxyCache (Map) = {}
+10-25 00:57:10.003  6113  6113 I AntiHookBypass: 装载配置: L1=[trace=on,kill=on,crash=on] L2=[art=on,linker=on,tramp=on] L3=scrub+guard
+10-25 00:57:10.009  6113  6113 I AntiHookBypass: native 优先加载失败: java.lang.UnsatisfiedLinkError: LspModuleClassLoader[module=/data/app/~~tyVoxEGaIY6YPIjJxzPtsA==/com.rev.antihookbypass-GbpuRytzDpFxQ-3XfkJSIQ==/base.apk, o1[DexPathList[[dex file "InMemoryDexFile[cookie=[0, -5476376622084481184]]"],nativeLibraryDirectories=[/system/framework/framework.jar, /system/lib64, /system_ext/lib64]]]] couldn't find "libantihook_bypass.so"
+10-25 00:57:10.017  6113  6113 I AntiHookBypass: APIPROBE forName de.robv.android.xposed.XposedBridge [拦截] caller=t#intercept
+10-25 00:57:10.022  6113  6113 I AntiHookBypass: 安装包枚举过滤已挂
+10-25 00:57:10.024  6113  6113 I AntiHookBypass: 系统属性屏蔽已挂
+10-25 00:57:10.026  6113  6113 I AntiHookBypass: 运行时命令探测拦截已挂
+10-25 00:57:10.027  6113  6113 I AntiHookBypass: 类加载器可见性收敛已挂
+10-25 00:57:10.053  6113  6113 I AntiHookBypass: L2 nativeSanitizeRuntime 完成 ops=0x1f mask=0xf
+10-25 00:57:10.054  6113  6113 I AntiHookBypass: 已装载: com.cshlolss.antihook.detect (L1[trace=true,kill=true,crash=true] L2+L3[native=true])
+10-25 00:57:10.344  6113  6113 I AntiHookBypass: APIPROBE loadClass de.robv.android.xposed.XC_MethodHook$Unhook [拦截] caller=t#intercept
+10-25 00:57:10.347  6113  6113 I AntiHookBypass: APIPROBE loadClass de.robv.android.xposed.XC_MethodHook$Unhook [拦截] caller=t#intercept
+10-25 00:57:10.352  6113  6113 I AntiHookBypass: APIPROBE loadClass de.robv.android.xposed.XC_MethodHook$Unhook [拦截] caller=t#intercept
+10-25 00:57:10.354  6113  6113 I AntiHookBypass: APIPROBE loadClass de.robv.android.xposed.XC_MethodHook$Unhook [拦截] caller=t#intercept
+10-25 00:57:10.357  6113  6113 I AntiHookBypass: APIPROBE loadClass de.robv.android.xposed.XC_MethodHook$Unhook [拦截] caller=t#intercept
+10-25 00:57:10.361  6113  6113 I AntiHookBypass: APIPROBE loadClass de.robv.android.xposed.XC_MethodHook$Unhook [拦截] caller=t#intercept
+10-25 00:57:10.448  6113  6113 I AntiHookBypass: APIPROBE loadClass de.robv.android.xposed.IXposedHookLoadPackage [拦截] caller=t#intercept
+10-25 00:57:10.450  6113  6113 I AntiHookBypass: APIPROBE loadClass de.robv.android.xposed.IXposedHookLoadPackage [拦截] caller=t#intercept
+10-25 00:57:10.455  6113  6113 I AntiHookBypass: APIPROBE loadClass de.robv.android.xposed.IXposedHookLoadPackage [拦截] caller=t#intercept
+10-25 00:57:10.460  6113  6113 I AntiHookBypass: APIPROBE loadClass de.robv.android.xposed.IXposedHookLoadPackage [拦截] caller=t#intercept
+10-25 00:57:10.465  6113  6113 I AntiHookBypass: APIPROBE loadClass de.robv.android.xposed.IXposedHookLoadPackage [拦截] caller=t#intercept
+10-25 00:57:10.470  6113  6113 I AntiHookBypass: APIPROBE loadClass de.robv.android.xposed.IXposedHookLoadPackage [拦截] caller=t#intercept
+10-25 00:57:10.582  6113  6113 I AntiHookBypass: APIPROBE loadClass de.robv.android.xposed.XposedBridge [拦截] caller=t#intercept
+10-25 00:57:10.596  6113  6113 I AntiHookBypass: APIPROBE loadClass de.robv.android.xposed.XposedBridge [拦截] caller=t#intercept
+10-25 00:57:10.607  6113  6113 I AntiHookBypass: APIPROBE loadClass de.robv.android.xposed.XposedBridge [拦截] caller=t#intercept
+10-25 00:57:10.620  6113  6113 I AntiHookBypass: APIPROBE loadClass de.robv.android.xposed.XposedBridge [拦截] caller=t#intercept
+10-25 00:57:10.630  6113  6113 I AntiHookBypass: APIPROBE loadClass de.robv.android.xposed.XposedBridge [拦截] caller=t#intercept
+10-25 00:57:10.634  6113  6113 I AntiHookBypass: APIPROBE loadClass de.robv.android.xposed.XposedBridge [拦截] caller=t#intercept
+10-25 00:57:11.980  6113  6311 I AntiHookBypass: UISCAN result=[{"id":"native_classloader_count","title":"ART ClassLoader 计数 (Tier 0)","status":"SAFE","category":"Native","detail":"当前 2 个 ClassLoader，处于正常范围（Boot + App + WebView 等）\n[Runtime+0x260 -> ClassLinker, +0x50 -> class_loaders_]"},{"id":"native_elf_libc","title":"libc.so 内存 CRC 校验","status":"SAFE","category":"Native","detail":"内存段与本地库一致 (CRC 0xc699) /apex/com.android.runtime/lib64/bionic/libc.so"},{"id":"native_elf_libart","title":"libart.so 内存 CRC 校验","status":"SAFE","category":"Native","detail":"内存段与本地库一致 (CRC 0x783d) /apex/com.android.art/lib64/libart.so"},{"id":"native_anon_exec","title":"匿名可执行段扫描","status":"SAFE","category":"Native","detail":"未发现无路径名的可执行内存段（trampoline / 隐藏加载特征）"},{"id":"native_inline_hook","title":"Inline Hook 跳转模式扫描","status":"SAFE","category":"Native","detail":"无匿名可执行段，代码段中亦无跳转异常（与「匿名可执行段扫描」结论一致）"},{"id":"native_external_view","title":"子进程外部视角 CRC 校验","status":"SAFE","category":"Native","detail":"fork 子进程经 ptrace 以外部视角读取本进程内存，\n/apex/com.android.runtime/lib64/bionic/libc.so 代码段与磁盘一致（进程内自检读数未被伪造）"}]
+10-25 00:57:14.518  6113  6113 I AntiHookBypass: SELFCL 实例总数=4 仍带路径=0
+10-25 00:58:10.561 11601 11601 E AHBENTRY: native_init pid=11601 n=0
+10-25 00:58:10.561 11601 11601 E AHBENTRY: native_init pid=11601 n=1
+10-25 00:58:10.561 11601 11601 E AHBENTRY: native_init pid=11601 n=2
+10-25 00:58:10.561 11601 11601 E AHBENTRY: early_init_body pid=11601 n=0
+10-25 00:58:10.561 11601 11601 E AHBENTRY: early_init_body pid=11601 n=1
+10-25 00:58:10.561 11601 11601 E AHBENTRY: early_init_body pid=11601 n=2
+10-25 00:58:10.750 11601 11601 E AHBENTRY: JNI_OnLoad pid=11601 n=0
+10-25 00:58:10.750 11601 11601 E AHBENTRY: JNI_OnLoad pid=11601 n=1
+10-25 00:58:10.750 11601 11601 E AHBENTRY: JNI_OnLoad pid=11601 n=2
+10-25 00:58:11.705 11826 11826 E AHBENTRY: native_init pid=11826 n=0
+10-25 00:58:11.705 11826 11826 E AHBENTRY: native_init pid=11826 n=1
+10-25 00:58:11.705 11826 11826 E AHBENTRY: native_init pid=11826 n=2
+10-25 00:58:11.705 11826 11826 E AHBENTRY: early_init_body pid=11826 n=0
+10-25 00:58:11.705 11826 11826 E AHBENTRY: early_init_body pid=11826 n=1
+10-25 00:58:11.705 11826 11826 E AHBENTRY: early_init_body pid=11826 n=2
+10-25 00:58:12.077 11826 11826 E AHBENTRY: JNI_OnLoad pid=11826 n=0
+10-25 00:58:12.077 11826 11826 E AHBENTRY: JNI_OnLoad pid=11826 n=1
+10-25 00:58:12.077 11826 11826 E AHBENTRY: JNI_OnLoad pid=11826 n=2
+10-25 00:58:28.854 14165 14165 E AHBENTRY: native_init pid=14165 n=0
+10-25 00:58:28.854 14165 14165 E AHBENTRY: native_init pid=14165 n=1
+10-25 00:58:28.854 14165 14165 E AHBENTRY: native_init pid=14165 n=2
+10-25 00:58:28.854 14165 14165 E AHBENTRY: early_init_body pid=14165 n=0
+10-25 00:58:28.854 14165 14165 E AHBENTRY: early_init_body pid=14165 n=1
+10-25 00:58:28.854 14165 14165 E AHBENTRY: early_init_body pid=14165 n=2
+10-25 00:58:29.042 14165 14165 E AHBENTRY: JNI_OnLoad pid=14165 n=0
+10-25 00:58:29.042 14165 14165 E AHBENTRY: JNI_OnLoad pid=14165 n=1
+10-25 00:58:29.042 14165 14165 E AHBENTRY: JNI_OnLoad pid=14165 n=2
+10-25 00:58:29.859 14373 14373 E AHBENTRY: native_init pid=14373 n=0
+10-25 00:58:29.859 14373 14373 E AHBENTRY: native_init pid=14373 n=1
+10-25 00:58:29.859 14373 14373 E AHBENTRY: native_init pid=14373 n=2
+10-25 00:58:29.859 14373 14373 E AHBENTRY: early_init_body pid=14373 n=0
+10-25 00:58:29.859 14373 14373 E AHBENTRY: early_init_body pid=14373 n=1
+10-25 00:58:29.859 14373 14373 E AHBENTRY: early_init_body pid=14373 n=2
+10-25 00:58:30.291 14373 14373 E AHBENTRY: JNI_OnLoad pid=14373 n=0
+10-25 00:58:30.291 14373 14373 E AHBENTRY: JNI_OnLoad pid=14373 n=1
+10-25 00:58:30.291 14373 14373 E AHBENTRY: JNI_OnLoad pid=14373 n=2
+10-25 00:58:46.911 16317 16317 E AHBENTRY: native_init pid=16317 n=0
+10-25 00:58:46.911 16317 16317 E AHBENTRY: native_init pid=16317 n=1
+10-25 00:58:46.911 16317 16317 E AHBENTRY: native_init pid=16317 n=2
+10-25 00:58:46.911 16317 16317 E AHBENTRY: early_init_body pid=16317 n=0
+10-25 00:58:46.911 16317 16317 E AHBENTRY: early_init_body pid=16317 n=1
+10-25 00:58:46.911 16317 16317 E AHBENTRY: early_init_body pid=16317 n=2
+10-25 00:58:47.105 16317 16317 E AHBENTRY: JNI_OnLoad pid=16317 n=0
+10-25 00:58:47.105 16317 16317 E AHBENTRY: JNI_OnLoad pid=16317 n=1
+10-25 00:58:47.105 16317 16317 E AHBENTRY: JNI_OnLoad pid=16317 n=2
+10-25 00:58:47.924 16487 16487 E AHBENTRY: native_init pid=16487 n=0
+10-25 00:58:47.924 16487 16487 E AHBENTRY: native_init pid=16487 n=1
+10-25 00:58:47.924 16487 16487 E AHBENTRY: native_init pid=16487 n=2
+10-25 00:58:47.924 16487 16487 E AHBENTRY: early_init_body pid=16487 n=0
+10-25 00:58:47.924 16487 16487 E AHBENTRY: early_init_body pid=16487 n=1
+10-25 00:58:47.924 16487 16487 E AHBENTRY: early_init_body pid=16487 n=2
+10-25 00:58:48.199 16487 16487 E AHBENTRY: JNI_OnLoad pid=16487 n=0
+10-25 00:58:48.199 16487 16487 E AHBENTRY: JNI_OnLoad pid=16487 n=1
+10-25 00:58:48.199 16487 16487 E AHBENTRY: JNI_OnLoad pid=16487 n=2

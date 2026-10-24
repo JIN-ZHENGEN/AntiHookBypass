@@ -48,6 +48,20 @@
  * 这些路径/文件名来自注入框架本身，与被保护的应用无关。
  */
 static const char *const g_trace_markers[] = {
+    /*
+     * 通用判据：**任何** /data/adb 下的路径都是 root 模块。
+     *
+     * 这一条替代了下面一长串"已知框架黑名单"的作用。
+     * 黑名单的根本问题是它永远滞后：没被列进去的模块照样一眼被看穿。
+     * 实测本机就装着 hma_oss_zygisk / inline_hook_spoof / oh_my_keymint
+     * 三个模块，它们都不在黑名单里。
+     *
+     * 而正常应用进程不该有任何 /data/adb 的映射 —— 那是 root 的目录，
+     * 能出现在 app 的 maps 里只有一种解释：模块注入。
+     * 所以这一条既是通用的，也不会有误伤。
+     */
+    "/data/adb",
+    /* 以下保留：它们是不在 /data/adb 下的框架痕迹 */
     "/data/adb/modules/zygisk_lsposed",
     "/data/adb/modules/zygisk_lspatch",
     "/data/adb/modules/zygisk_sui",
@@ -144,6 +158,37 @@ int maps_line_is_trace_len(const char *line, size_t len) {
     const char *const *m;
     for (m = g_trace_markers; *m; m++) {
         if (ahb_memstr(line, len, *m)) return 1;
+    }
+
+    /*
+     * 通用判据：非 ART 的 memfd 映射。
+     *
+     * 依据（全机实测，不是猜）：把本机所有进程的 memfd 名字统计一遍，
+     * 只有下面四种是系统/运行时正常产物：
+     *
+     *     /memfd:jit-cache          228 处   ART JIT 代码缓存
+     *     /memfd:jit-zygote-cache   114 处   ART zygote JIT 缓存
+     *     /memfd:perfetto_shmem       2 处   perfetto 跟踪缓冲
+     *     /memfd:bitmap               1 处   图形
+     *
+     * 除此之外的 memfd 名字（实测见到 /memfd:payload 8 处、
+     * /memfd:upx 2 处）都属于"把代码装进匿名文件再映射"的注入手法。
+     * Zygisk 类框架加载模块也用这条路，因此这条对"别的模块"同样有效。
+     *
+     * 白名单而不是黑名单：注入了什么名字事先无法知道（可以随机），
+     * 但系统正常用的那几个名字是固定的。
+     */
+    {
+        const char *mp = ahb_memstr(line, len, "/memfd:");
+        if (mp) {
+            size_t rest = (size_t)((line + len) - mp);
+            if (!ahb_memstr(mp, rest, "/memfd:jit-cache") &&
+                !ahb_memstr(mp, rest, "/memfd:jit-zygote-cache") &&
+                !ahb_memstr(mp, rest, "/memfd:perfetto_shmem") &&
+                !ahb_memstr(mp, rest, "/memfd:bitmap")) {
+                return 1;
+            }
+        }
     }
 
     /*
@@ -3485,4 +3530,55 @@ void *ahb_android_dlopen_ext_wrap(const char *name, int flags, const void *extin
         g_tr_in_dlopen = 0;
     }
     return h;
+}
+
+/* ================= 供 Zygisk 宿主使用的官方接口桥 ================= */
+
+/*
+ * 这套 GOT 补丁原本是手工实现的：自己读 maps、自己解析 ELF 动态段、
+ * 自己算重定位表偏移、自己 pwrite 改 GOT 槽。
+ *
+ * 它能用，但代价已经实测过好几轮：
+ *   - 曾出现 TTL 缓存堆竞态（double free / use-after-free）
+ *   - 曾因 mprotect 拆出 4KB 碎片被目标判"库被改"
+ *   - 曾因 .dynsym 第 0 项是全零而一进循环就 break，一个符号都没扫到
+ * 这些都是"自己在实现一个已经有官方实现的机制"必然要踩的坑。
+ *
+ * Zygisk 提供了等价能力：
+ *     pltHookRegister(dev, inode, symbol, newFunc, oldFunc)
+ *     pltHookCommit()
+ * 它按 dev+inode 定位库、按符号名替换，重定位表解析由框架负责。
+ *
+ * 所以 Zygisk 宿主下默认走官方接口，本文件的手工实现只作为
+ * 「宿主没提供接口」时的兜底（例如旧版 Zygisk 或纯 LSPosed 环境）。
+ *
+ * 下面两个函数就是给宿主查表用的：符号名清单 + 名字到替换函数的映射。
+ */
+
+/* 所有要接管的符号名，NULL 结尾。与 ahb_repl_for 必须保持一致。 */
+static const char *const g_ahb_got_syms[] = {
+    "open", "openat", "open64", "fopen", "fopen64",
+    "__open_2", "__openat_2", "__open64_2", "popen",
+    "read", "pread", "pread64", "fread",
+    "dl_iterate_phdr", "dlopen", "dlsym", "android_dlopen_ext",
+    "xdl_sym", "syscall", "process_vm_readv",
+    "fstat", "fstat64", "__fstat64", "fstatat", "fstatat64", "__fstatat64",
+    "stat", "stat64", "__stat64", "lstat", "lstat64",
+    "statfs", "statfs64", "fstatfs", "fstatfs64",
+    "readlink", "readlinkat",
+    "exit", "_exit", "exit_group", "kill", "raise", "abort", "tgkill",
+    NULL
+};
+
+const char *const *ahb_got_sym_list(void) { return g_ahb_got_syms; }
+
+/*
+ * 名字到替换函数的映射。
+ *
+ * 直接转调 ahb_repl_for：两处必须始终一致，
+ * 让它成为唯一事实来源，避免清单与分发表漂移。
+ */
+void *ahb_got_repl(const char *name) {
+    uintptr_t p = ahb_repl_for(name);
+    return p ? (void *)p : NULL;
 }

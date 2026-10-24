@@ -18,6 +18,9 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <android/log.h>
+#include <dlfcn.h>
+#include <link.h>
+#include <sys/stat.h>
 #include "zygisk.hpp"
 
 #define LOG_TAG "AHBZYG"
@@ -27,6 +30,9 @@
 extern "C" {
     void ahb_zygisk_engine_init(JNIEnv *env, const char *pkg);
     void ahb_zygisk_engine_set_scope(int on);
+    /* maps_hide.h 暴露的桥：符号清单 + 名字到替换函数的映射 */
+    const char *const *ahb_got_sym_list(void);
+    void *ahb_got_repl(const char *name);
 }
 
 /*
@@ -99,6 +105,79 @@ static int pkg_in_scope(const char *pkg) {
     return 0;
 }
 
+
+/*
+ * 用官方 pltHookRegister 安装 GOT 补丁。
+ *
+ * 与手工实现的差别：
+ *   - 重定位表解析、ELF 动态段遍历由框架负责，不用我们碰
+ *   - 按 dev+inode 定位库，天然不会认错同名库
+ *   - 一次 commit 生效，没有"扫一半崩了"的中间态
+ *
+ * 逐个 ELF 注册的原因：官方接口是按（库, 符号）为单位注册的，
+ * 而我们要对所有已加载库生效，所以每个 ELF 都要过一遍。
+ */
+/* 回调上下文：把 Api 指针和计数传进 dl_iterate_phdr 的回调。
+ * 不能用 lambda capture：这里禁 STL、禁异常，且 dl_iterate_phdr
+ * 的 C 回调签名是裸函数指针。 */
+struct GotCtx {
+    zygisk::Api *api;
+    const char *const *syms;
+    int nreg;
+};
+
+static int got_phdr_cb(struct dl_phdr_info *info, size_t, void *data) {
+    GotCtx *ctx = (GotCtx *)data;
+    const char *name;
+    struct stat st;
+    int i;
+
+    if (!ctx || !ctx->api || !ctx->syms) return 0;
+
+    name = (info && info->dlpi_name && info->dlpi_name[0])
+           ? info->dlpi_name : "/system/bin/app_process64";
+
+    if (stat(name, &st) != 0) return 0;
+
+    for (i = 0; ctx->syms[i]; i++) {
+        void *fn = ahb_got_repl(ctx->syms[i]);
+        if (!fn) continue;
+        ctx->api->pltHookRegister(st.st_dev, st.st_ino, ctx->syms[i], fn, nullptr);
+        ctx->nreg++;
+    }
+    return 0;
+}
+
+/*
+ * 用官方 pltHookRegister 安装 GOT 补丁。
+ *
+ * 与手工实现的差别：
+ *   - 重定位表解析、ELF 动态段遍历由框架负责，不用我们碰
+ *   - 按 dev+inode 定位库，天然不会认错同名库
+ *   - 一次 commit 生效，没有"扫一半崩了"的中间态
+ */
+static int install_got_hooks_via_api(zygisk::Api *api) {
+    const char *const *syms;
+    GotCtx ctx;
+
+    if (!api) return 0;
+    syms = ahb_got_sym_list();
+    if (!syms) return 0;
+
+    ctx.api = api;
+    ctx.syms = syms;
+    ctx.nreg = 0;
+
+    dl_iterate_phdr(got_phdr_cb, &ctx);
+
+    if (!api->pltHookCommit()) {
+        ZLOGE("pltHookCommit 失败，已注册 %d 条", ctx.nreg);
+        return 0;
+    }
+    ZLOGE("官方接口安装完成：注册 %d 条", ctx.nreg);
+    return ctx.nreg;
+}
+
 class AhbModule : public zygisk::ModuleBase {
 public:
     void onLoad(zygisk::Api *api, JNIEnv *env) override {
@@ -139,6 +218,16 @@ public:
             }
         }
         ZLOGE("postAppSpecialize 启动引擎 pkg=%s", pkg ? pkg : "(null)");
+
+        /*
+         * 先走官方 pltHookRegister 装 GOT 补丁，再启动引擎。
+         *
+         * 顺序有讲究：引擎里的视图过滤依赖 open/read 等已被接管，
+         * 所以官方接口必须先 commit 完成。反过来的话，
+         * 引擎先跑起来那几毫秒里读到的是未过滤视图。
+         */
+        install_got_hooks_via_api(api_);
+
         ahb_zygisk_engine_init(env_, pkg);
     }
 
