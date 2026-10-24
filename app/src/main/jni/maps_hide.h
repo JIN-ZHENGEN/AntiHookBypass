@@ -221,7 +221,8 @@ static unsigned long g_maps_filtered   = 0;
 static int g_maps_got_patched = 0;
 static unsigned long g_mapshdr_calls = 0;
 static int g_disable_phdr_hide = 0;   /* 对照实验开关 */
-static int g_disable_all_patch = 0;   /* 对照实验：完全不接管任何槽 */
+static int g_disable_all_patch = 0;
+   /* 对照实验：完全不接管任何槽 */
 /*
  * 默认关闭。
  *
@@ -244,6 +245,21 @@ static int maps_path_is_self(const char *path) {
     if (!strstr(path, "/maps")) return 0;
     if (strcmp(path, "/proc/self/maps") == 0) return 1;
     snprintf(want, sizeof(want), "/proc/%d/maps", (int)getpid());
+    if (strcmp(path, want) == 0) return 1;
+    /*
+     * 父进程的地图也要认。
+     *
+     * 依据：libantihook.so 的导入表里有 fork / pipe / getppid / waitpid —— 
+     * 它会 fork 一个子进程，由子进程去读
+     *     /proc/<父pid>/maps
+     * 做"外部视角"检查。子进程继承了我们补过的 GOT，但原来这里只认
+     * getpid()，在子进程里父 pid 不等于自己，于是那条路**完全没被过滤**，
+     * 子进程看到的是真实地图，里面还有 LSPlant 的匿名跳板段。
+     *
+     * 这正好解释了"该项时好时坏"：取决于那次读是在父进程里做的，
+     * 还是在 fork 出来的子进程里做的。
+     */
+    snprintf(want, sizeof(want), "/proc/%d/maps", (int)getppid());
     if (strcmp(path, want) == 0) return 1;
     snprintf(want, sizeof(want), "/proc/%d/task/%d/maps", (int)getpid(), (int)getpid());
     if (strcmp(path, want) == 0) return 1;
@@ -1176,6 +1192,49 @@ static int ahb_addr_mapped(uintptr_t a, size_t len) {
     return 0;
 }
 
+/* ================================================================== */
+/* 进程内安全读：地址失效时返回 0，绝不崩溃                             */
+/* ================================================================== */
+
+/*
+ * 为什么必须有这一层（tombstone 实录）：
+ *
+ *   signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x742068a000
+ *   #00 pc 0x5ee0  (maps_patch_got_all+1384)
+ *   #01 pc 0x8784  (clv_fast_patch_thread+120)
+ *
+ * 崩溃点那条指令是 ldr w8,[x9]，紧跟着 cmp w8, #0x464c457f ——
+ * 0x464c457f 就是 "\x7fELF"。也就是说它在读 ELF 魔数。
+ *
+ * 而读之前明明调过 ahb_addr_mapped() 并且通过了。问题就在这里：
+ * 那个判断查的是**上一次扫描 maps 留下的段表快照**，而快照会过期。
+ * 从"查到还在"到"真的去读"之间，那个库完全可能被卸载或重新映射
+ * （目标应用启动阶段高频 dlopen/dlclose 自己的库）。
+ * 快照说在、实际已不在，于是直接解引用就崩在宿主进程里。
+ *
+ * 解决思路不是"多查几次"，而是**不要直接解引用**：
+ * 用 process_vm_readv 让内核替我们读。地址无效时它返回 EFAULT，
+ * 我们拿到一个失败返回值，安静跳过这个库。永远不会 SIGSEGV。
+ *
+ * 注意必须用真实的 syscall 指针，不能走 libc 的 syscall/process_vm_readv
+ * —— 那两个已经被本模块自己接管，会绕回来。
+ */
+static int ahb_safe_read(void *dst, uintptr_t src, size_t len) {
+    struct iovec li, ri;
+    long r;
+    if (!dst || !len) return 0;
+    if (src < AHB_USER_PTR_MIN || src >= AHB_USER_PTR_MAX) return 0;
+    maps_ensure_raw_syscall();
+    if (!g_raw_syscall) return 0;
+    li.iov_base = dst;
+    li.iov_len  = len;
+    ri.iov_base = (void *)src;
+    ri.iov_len  = len;
+    r = g_raw_syscall(__NR_process_vm_readv, (long)getpid(),
+                      (long)&li, 1, (long)&ri, 1, 0);
+    return r == (long)len;
+}
+
 static void ahb_so_note(const char *path, uintptr_t seg_start, uintptr_t file_off) {
     uintptr_t b;
     int i;
@@ -1352,9 +1411,9 @@ static uintptr_t ahb_repl_for(const char *name) {
 
 /* 对单个 .so 按重定位表接管 */
 static int ahb_patch_one_so(ahb_so_ent *so) {
-    ElfW(Ehdr) *eh;
-    ElfW(Phdr) *ph;
-    ElfW(Dyn)  *dyn = NULL;
+    ElfW(Ehdr) eh_buf, *eh;
+    ElfW(Phdr) ph_buf[64], *ph;
+    ElfW(Dyn)  dyn_buf[2 * 64], *dyn = NULL;
     const ElfW(Sym)  *symtab = NULL;
     const char       *strtab = NULL;
     const ElfW(Rela) *jmprel = NULL, *rela = NULL;
@@ -1369,26 +1428,39 @@ static int ahb_patch_one_so(ahb_so_ent *so) {
     if (!so->base) return 0;
     if (so->base & 0xfff) return 0;
 
-    if (!ahb_addr_mapped(so->base, sizeof(ElfW(Ehdr)))) return 0;
-    eh = (ElfW(Ehdr) *)so->base;
+    /*
+     * ELF 头一律经 ahb_safe_read 读，绝不直接解引用。
+     *
+     * 崩溃就是这么来的：ahb_addr_mapped() 依据的是上次扫描 maps 的快照，
+     * 而从"快照说还在"到"真正去读"之间，那个库可能已经被卸载。
+     * 快照一过期，下面的 memcmp(e_ident, ELFMAG) 就崩在宿主进程里，
+     * 崩溃地址每次就是那个已失效的基址，栈顶正是 memcmp 的那条 ldr。
+     */
+    if (!ahb_safe_read(&eh_buf, so->base, sizeof(eh_buf))) return 0;
+    eh = &eh_buf;
     if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0) return 0;
     if (eh->e_machine != EM_AARCH64 && eh->e_machine != EM_X86_64) return 0;
     if (eh->e_phentsize != sizeof(ElfW(Phdr))) return 0;
     if (eh->e_phnum == 0 || eh->e_phnum > 64) return 0;
-    if (!ahb_addr_mapped(so->base + eh->e_phoff,
-                         (size_t)eh->e_phnum * sizeof(ElfW(Phdr)))) return 0;
 
-    ph = (ElfW(Phdr) *)(so->base + eh->e_phoff);
+    if (!ahb_safe_read(ph_buf, so->base + eh->e_phoff,
+                       (size_t)eh->e_phnum * sizeof(ElfW(Phdr)))) return 0;
+    ph = ph_buf;
     for (i = 0; i < eh->e_phnum; i++) {
         if (ph[i].p_type == PT_DYNAMIC) {
             dyn_addr = so->base + ph[i].p_vaddr;
-            if (!ahb_addr_mapped(dyn_addr, sizeof(ElfW(Dyn)) * 2)) return 0;
-            dyn = (ElfW(Dyn) *)dyn_addr;
+            if (!ahb_safe_read(dyn_buf, dyn_addr, sizeof(ElfW(Dyn)) * 2)) return 0;
+            dyn = dyn_buf;
             break;
         }
     }
     if (!dyn) return 0;
 
+    /*
+     * 动态段与重定位表同理：先把整块读进本地缓冲，再遍历。
+     * 直接遍历 dyn[i] / r[k] 等于用快照地址反复解引用，
+     * 每个元素都是一次崩溃机会。
+     */
     for (i = 0; i < 512 && dyn[i].d_tag != DT_NULL; i++) {
         uintptr_t raw = (uintptr_t)dyn[i].d_un.d_ptr;
         switch (dyn[i].d_tag) {
@@ -1427,19 +1499,30 @@ static int ahb_patch_one_so(ahb_so_ent *so) {
             size_t n, k;
             if (!r || bytes == 0) continue;
             if (bytes > 4 * 1024 * 1024) continue;      /* 上限，防跑飞 */
-            if (!ahb_addr_mapped((uintptr_t)r, bytes)) continue;
             n = bytes / relaent;
             for (k = 0; k < n; k++) {
                 uint32_t sym, type;
                 const char *nm;
                 uintptr_t repl, slot;
-                sym  = (uint32_t)(r[k].r_info >> 32);
-                type = (uint32_t)(r[k].r_info & 0xffffffffu);
+                ElfW(Rela) re;
+                ElfW(Sym)  sy;
+                char nmbuf[256];
+
+                if (!ahb_safe_read(&re, (uintptr_t)&r[k], sizeof(re))) continue;
+                sym  = (uint32_t)(re.r_info >> 32);
+                type = (uint32_t)(re.r_info & 0xffffffffu);
                 if (type != R_AARCH64_JUMP_SLOT && type != R_AARCH64_GLOB_DAT) continue;
-                /* 符号表项与字符串都要先确认可读 */
-                if (!ahb_addr_mapped((uintptr_t)&symtab[sym], sizeof(ElfW(Sym)))) continue;
-                nm = strtab + symtab[sym].st_name;
-                if (!ahb_addr_mapped((uintptr_t)nm, 2)) continue;
+                if (!ahb_safe_read(&sy, (uintptr_t)&symtab[sym], sizeof(sy))) continue;
+                if (sy.st_name >= 0x10000) continue;
+                if (!ahb_safe_read(nmbuf, (uintptr_t)(strtab + sy.st_name),
+                                   sizeof(nmbuf) - 1)) continue;
+                nmbuf[sizeof(nmbuf) - 1] = 0;
+                {
+                    /* 必须保证读到 NUL，否则不是合法符号名 */
+                    size_t nl = strnlen(nmbuf, sizeof(nmbuf) - 1);
+                    if (nl == sizeof(nmbuf) - 1) continue;
+                    nm = nmbuf;
+                }
                 repl = ahb_repl_for(nm);
                 if (!repl) continue;
                 /*
@@ -1465,8 +1548,11 @@ static int ahb_patch_one_so(ahb_so_ent *so) {
                 if (strstr(so->path, "/libc.so")) {
                     ahb_filelog("MAPS libc-target %s slot=%p", nm, (void *)(so->base + r[k].r_offset));
                 }
-                slot = so->base + (uintptr_t)r[k].r_offset;
-                if (!ahb_addr_mapped(slot, sizeof(uintptr_t))) continue;
+                slot = so->base + (uintptr_t)re.r_offset;
+                {
+                    uintptr_t probe = 0;
+                    if (!ahb_safe_read(&probe, slot, sizeof(probe))) continue;
+                }
                 if (!ahb_write_slot(slot, repl)) continue;
                 patched++;
                 g_maps_got_patched++;
@@ -1520,6 +1606,18 @@ static int ahb_patch_one_so(ahb_so_ent *so) {
         ahb_mark_done(so->path);
     }
     return patched;
+}
+
+/* 已加载模块计数：微秒级，用来判断"有没有新库加载" */
+static int ahb_count_cb(struct dl_phdr_info *info, size_t sz, void *data) {
+    (void)info; (void)sz;
+    (*(int *)data)++;
+    return 0;
+}
+int ahb_loaded_module_count(void) {
+    int n = 0;
+    dl_iterate_phdr(ahb_count_cb, &n);
+    return n;
 }
 
 /* 扫全部已映射的 .so，收集基址与段保护位，再逐个按重定位接管 */

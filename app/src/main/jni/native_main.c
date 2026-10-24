@@ -634,7 +634,16 @@ static int restore_executable_segments(int ops) {
          * 只写 libart：六项检测里只有 libart / libc 有 CRC 校验，
          * 动 linker64 没有收益，却会拆段。
          */
-        if (kind == NATIVE_KIND_ART) {
+        /*
+         * 对照开关：只做读视图、不写内存。
+         *
+         * 目的：判定 libart 的 CRC 通过到底靠哪一半。
+         *   - 靠写回磁盘内容：那就会破坏其它模块打在这段里的补丁；
+         *   - 靠读视图替换：那就能彻底删掉写回，对别人零风险。
+         */
+        static int no_write = -1;
+        if (no_write < 0) no_write = (access("/data/local/tmp/ahb_nowrite", F_OK) == 0);
+        if (kind == NATIVE_KIND_ART && !no_write) {
             size_t off2 = 0;
             while (off2 < seg_len) {
                 size_t chunk2 = (seg_len - off2 < 65536) ? (seg_len - off2) : 65536;
@@ -665,6 +674,8 @@ static int restore_executable_segments(int ops) {
 
     fclose(fp);
     if (restored_bytes) {
+        /* 同时写进文件日志：logcat 会被刷掉，这个文件能留证据 */
+        ahb_filelog("L2DIFF bytes=%d pages=%d", restored_bytes, restored_pages);
         LOGI("L2 code-seg 差异统计: bytes=%d pages=%d (只记录，未写入)",
              restored_bytes, restored_pages);
     } else {
@@ -2323,6 +2334,52 @@ static void clv_patch_got(void) {
          * maps_patch_got_all 内部已经有内联汇编实现的自旋锁（maps_try_lock），
          * 并发安全由它保证。这里直接调用即可。
          */
+        /*
+         * 只在"确实有新库被加载"时才做全量扫描。
+         *
+         * 性能账（实测）：一次全量扫描要读 440 个已映射 .so 的 ELF 动态段
+         * 与重定位表，单次约 10ms 量级；而这条入口在启动阶段被调用几十次
+         * ——日志里一次启动出现 43 行 MAPS scan。43 × 10ms ≈ 400ms，
+         * 正好对上"模块全开比空转慢 250~370ms"那个实测差值。
+         *
+         * 而绝大多数轮次里并没有新库加载，那些扫描是纯浪费。
+         * 用 dl_iterate_phdr 数一下已加载模块数（微秒级，纯内存遍历），
+         * 数量没变就直接返回。
+         *
+         * 为什么不用进程内已有的更"精确"的判断：那些都要读 maps 或解析 ELF，
+         * 成本就是我们要省掉的东西。数模块数是这里最便宜的充分条件 ——
+         * 库只会增加不会减少（Android 不卸载已 dlopen 的库），
+         * 所以"数量没变"就能安全地断定"没有新库"。
+         */
+        {
+            extern int ahb_loaded_module_count(void);
+            static int last_count = -1;
+            static unsigned long last_us = 0;
+            int now = ahb_loaded_module_count();
+            if (now >= 0 && now == last_count) return;
+
+            /*
+             * 再加一道最小间隔。
+             *
+             * 启动阶段库是连着加载的，计数会在几十毫秒内跳好几次，
+             * 每次都全量扫一遍就是重复劳动。实测把扫描从 43 次压到 22 次
+             * 之后，剩下的 22 次里仍有一批挤在极短的窗口内。
+             *
+             * 8ms 的依据：全量扫描本身约 10ms 量级，间隔小于它没有意义；
+             * 而检测器真正读地图要等它自己的 .so 完成加载并开始扫描，
+             * 那个动作在库加载之后，8ms 远不足以让它抢在前面
+             * （实测 6/6 连续多轮稳定，见下面的验证）。
+             */
+            {
+                unsigned long t = ahb_now_us();
+                if (last_us && t - last_us < 8000) {
+                    last_count = now;      /* 记下计数，下次变化时才重新评估 */
+                    return;
+                }
+                last_us = t;
+            }
+            last_count = now;
+        }
         maps_patch_got_all();
     }
 }

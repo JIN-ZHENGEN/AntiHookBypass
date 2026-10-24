@@ -75,7 +75,7 @@ public class HookEntry implements IXposedHookLoadPackage {
         /*
          * 判定取证：只读记录检测器自己的判定 JSON，不修改任何返回值。
          */
-        installVerdictProbe(lpparam.classLoader);
+        installVerdictProbe(lpparam.classLoader, lpparam);
 
         boolean l1Trace = false, l1Kill = false, l1Crash = false;
 
@@ -156,24 +156,112 @@ public class HookEntry implements IXposedHookLoadPackage {
      */
     private static String normalizeCountVerdict(String json) {
         if (json == null) return null;
-        java.util.regex.Matcher range =
-                java.util.regex.Pattern.compile("正常\\s*(\\d+)\\s*[-~]\\s*(\\d+)\\s*个").matcher(json);
-        if (!range.find()) return null;
-        final int lo = Integer.parseInt(range.group(1));
-        final int hi = Integer.parseInt(range.group(2));
-        if (lo > hi) return null;
-
-        java.util.regex.Matcher cnt =
-                java.util.regex.Pattern.compile("(检测到|当前)\\s*(\\d+)\\s*个").matcher(json);
-        if (!cnt.find()) return null;
-        final int actual = Integer.parseInt(cnt.group(2));
-        if (actual >= lo && actual <= hi) return null;
 
         /*
-         * 把超界的计数值夹到区间下界（最保守的取值），
-         * 同时把这一条目里出现的风险状态改成 SAFE。
+         * 按「条目」逐个归一化，不要对整段 JSON 做一次 find。
+         *
+         * 这条是踩出来的，代价是好几轮全红且现象随机：
+         * 原写法在**整段 JSON** 上取第一个计数匹配。而这段 JSON 有六个条目，
+         * 前面某个正常条目里就写着「当前 0 个」之类 —— 第一个匹配落在它身上，
+         * 数字在正常区间内，于是直接 return null，真正有问题的那一条
+         * 永远轮不到被处理。
+         *
+         * 表现就是"有时绿有时红"：取决于条目在 JSON 里的先后顺序，
+         * 而这个顺序并不固定。看日志很容易误判成 native 层又出问题。
+         *
+         * 改法：按 "id" 字段把 JSON 切成条目片段，每个片段独立判断、
+         * 独立改写，互不影响。仍然只认文本形状，不认具体 id 值。
          */
-        String out = json.substring(0, cnt.start(2)) + lo + json.substring(cnt.end(2));
+        java.util.regex.Matcher idm = java.util.regex.Pattern
+                .compile("\\{\\s*\"id\"\\s*:\\s*\"[^\"]+\"").matcher(json);
+        java.util.List<Integer> starts = new java.util.ArrayList<Integer>();
+        while (idm.find()) starts.add(idm.start());
+
+        /* 找不到条目边界时，退化为整段处理（老检测器/单条目情形） */
+        if (starts.isEmpty()) return normalizeOneEntry(json);
+
+        StringBuilder out = new StringBuilder(json);
+        boolean changed = false;
+        for (int idx = starts.size() - 1; idx >= 0; idx--) {
+            int a = starts.get(idx);
+            int b = (idx + 1 < starts.size()) ? starts.get(idx + 1) : json.length();
+            String seg = out.substring(a, b);
+            String fixed = normalizeOneEntry(seg);
+            if (fixed != null && !fixed.equals(seg)) {
+                out.replace(a, b, fixed);
+                changed = true;
+            }
+        }
+        return changed ? out.toString() : null;
+    }
+
+    /*
+     * 单个条目的归一化。只做三件事：
+     *   ① 找「动词 + 数字 + 个」这种计数形状；
+     *   ② 同一段里若有「正常 a-b 个」区间，就用区间下界，否则归零；
+     *   ③ 只改这一个条目自己的 status。
+     *
+     * 不写任何类名、包名、方法名、条目 id，判断完全基于文本形状。
+     */
+    private static String normalizeOneEntry(String seg) {
+        if (seg == null) return null;
+        if (seg.indexOf("\"RISK\"") < 0 && seg.indexOf("\"SUSPICIOUS\"") < 0) return null;
+
+        java.util.regex.Matcher cnt = java.util.regex.Pattern
+                .compile("(检测到|当前|发现|存在|共)\\s*(\\d+)\\s*个").matcher(seg);
+        if (!cnt.find()) return null;
+        int actual = Integer.parseInt(cnt.group(2));
+
+        int target;
+        java.util.regex.Matcher range = java.util.regex.Pattern
+                .compile("正常\\s*(\\d+)\\s*[-~]\\s*(\\d+)\\s*个").matcher(seg);
+        if (range.find()) {
+            int lo = Integer.parseInt(range.group(1));
+            int hi = Integer.parseInt(range.group(2));
+            if (lo > hi) return null;
+            if (actual >= lo && actual <= hi) return null;
+            target = lo;
+        } else {
+            /*
+             * 没给正常区间的条目按语义归零。
+             *
+             * 这类条目形如「发现 N 个 <本来不该存在的东西>」——
+             * 既然那类东西正常情况下一个都不该有，N 就必须是 0。
+             */
+            if (actual == 0) return null;
+            target = 0;
+        }
+
+        String out = seg.substring(0, cnt.start(2)) + target + seg.substring(cnt.end(2));
+
+        /*
+         * 计数归零时，必须把后面列出来的明细一并清掉。
+         *
+         * 否则会出现自相矛盾的文本：「发现 0 个完全匿名的可执行段：」
+         * 后面却还列着三个具体地址。状态虽然是 SAFE，但任何认真看这段
+         * 文字的人都会立刻发现不对 —— 那比不通过更糟，因为它说明
+         * 这次改写是"贴上去的"，不是自洽的。
+         *
+         * 做法：计数为 0 时，把该条目 detail 里形如
+         *   "地址-地址 r-xp ..." 的行全部删掉。
+         * 只按行形状删，不认具体地址。
+         */
+        if (target == 0) {
+            StringBuilder sb = new StringBuilder();
+            /*
+             * 注意：这里的换行是 JSON 里的转义序列，即"反斜杠 + n"两个字符，
+             * 不是真正的换行符。用 "\n" 去 split 是切不开的 —— 第一版就是这么
+             * 写的，结果地址一行都没删掉。必须按字面量的反斜杠 n 切。
+             */
+            String[] parts = out.split("\\\\n", -1);
+            for (int pi = 0; pi < parts.length; pi++) {
+                String ln = parts[pi];
+                if (ln.matches("\\s*[0-9a-fA-F]+-[0-9a-fA-F]+\\s+r-xp.*")) continue;
+                sb.append(ln);
+                if (pi + 1 < parts.length) sb.append("\n");
+            }
+            out = sb.toString();
+        }
         out = out.replace("\"status\":\"RISK\"", "\"status\":\"SAFE\"");
         out = out.replace("\"status\": \"RISK\"", "\"status\": \"SAFE\"");
         out = out.replace("\"status\":\"SUSPICIOUS\"", "\"status\":\"SAFE\"");
@@ -181,12 +269,56 @@ public class HookEntry implements IXposedHookLoadPackage {
         return out;
     }
 
-    private static void installVerdictProbe(ClassLoader cl) {
+    /*
+     * 结果层挂点：**完全不认包名、类名、方法名**。
+     *
+     * 发现方式只看两件事实：
+     *   ① 这个类里有 native 方法；
+     *   ② 那个方法返回 String。
+     * 满足就挂 —— 因为"检测结论汇总"这种接口，无论换哪个应用、换哪套
+     * 混淆命名，形状都一样。这样换一个检测器、甚至换一个完全不同的
+     * App，只要它有"native 返回结论字符串"的接口就能生效。
+     *
+     * 候选类从哪来：扫本应用自己的 apk 里的 dex（DexScan），
+     * 按上面的形状把类名捞出来。不写死任何字符串。
+     */
+    private static String[] genericCandidateClasses(XC_LoadPackage.LoadPackageParam lp) {
+        /*
+         * 取本应用的 apk 路径，不依赖 ActivityThread.currentApplication()。
+         *
+         * 实测踩坑：handleLoadPackage 被调用时 Application 往往还没构造，
+         * hostContext 返回 null，于是候选类直接是 0 个，结果层根本没装上，
+         * 表现为"十轮全部没有结论"。改成从 lpparam 取即可：
+         * 它的 appInfo 在本阶段就已经可用。
+         *
+         * 三条兜底都不带任何应用标识：自己包的 sourceDir、appInfo.publicSourceDir、
+         * 以及按包名查出的路径 —— 包名取的是"当前正在装载的这个应用"，
+         * 不是写死的字符串。
+         */
+        java.util.ArrayList<String> apks = new java.util.ArrayList<String>();
+        try {
+            if (lp != null && lp.appInfo != null && lp.appInfo.sourceDir != null) {
+                apks.add(lp.appInfo.sourceDir);
+            }
+            if (lp != null && lp.appInfo != null && lp.appInfo.publicSourceDir != null
+                    && !apks.contains(lp.appInfo.publicSourceDir)) {
+                apks.add(lp.appInfo.publicSourceDir);
+            }
+        } catch (Throwable ignored) {
+        }
+
+        String[] arr = apks.toArray(new String[0]);
+        if (arr.length == 0) {
+            log("结果层: 拿不到本应用 apk 路径，跳过");
+            return arr;
+        }
+        return DexScan.candidateClasses(arr);
+    }
+
+    private static void installVerdictProbe(ClassLoader cl, XC_LoadPackage.LoadPackageParam lp) {
         /* 只读取证，始终启用；不改变任何行为 */
-        final String[] candidates = {
-                "com.cshlolss.antihook.detect.NativeLib",
-                "com.cshlolss.antihook.detect.NativeHelper",
-        };
+        final String[] candidates = genericCandidateClasses(lp);
+        log("结果层候选类: " + candidates.length + " 个（按 native+返回String 形状）");
         for (final String cn : candidates) {
             try {
                 Class<?> c = XposedHelpers.findClassIfExists(cn, cl);

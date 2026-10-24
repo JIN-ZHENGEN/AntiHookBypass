@@ -33,6 +33,43 @@ final class NativeLayer {
      */
     private static native int nativeSanitizeRuntime(int ops);
 
+    /**
+     * 按需交换 libart 代码段（1=临时换成磁盘字节，0=换回原字节）。
+     * 用于"内存 CRC 与文件 CRC 一致"这类判定：只在计算瞬间成立，
+     * 其他时刻其他模块的 hook 完好无损。
+     */
+    private static native void nativeArtSwap(int on);
+
+    /** 取证：各条 maps 通道的命中次数 */
+    private static native String nativeChannelCounts();
+
+    static String channelCounts() {
+        try {
+            return nativeChannelCounts();
+        } catch (Throwable t) {
+            return "n/a";
+        }
+    }
+
+    /** 是否可用（native 库已加载且差异表非空） */
+    private static volatile boolean s_swapReady = false;
+
+    static boolean swapReady() {
+        return s_swapReady;
+    }
+
+    static void swap(int on) {
+        if (!s_swapReady) return;
+        try {
+            nativeArtSwap(on);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    static void markSwapReady() {
+        s_swapReady = true;
+    }
+
     static boolean installAndSanitize(Context ctx) {
         boolean ok = ensureLoaded(ctx);
         if (ok) {
