@@ -48,106 +48,56 @@
 #define LOG_TAG "AntiHookBypass"
 
 /* 诊断落文件：logcat 环形缓冲会被系统高频输出冲掉，证据必须留盘 */
-static char g_logpath[256] = {0};
-
-/* 用应用自己的数据目录；/data/local/tmp 对 app 身份不可写 */
-static const char *ahb_logpath(void) {
-    if (g_logpath[0]) return g_logpath;
-    char cmd[128] = {0};
-    int fd = open("/proc/self/cmdline", O_RDONLY);
-    if (fd >= 0) {
-        ssize_t r = read(fd, cmd, sizeof(cmd) - 1);
-        close(fd);
-        if (r > 0) cmd[r] = 0;
-    } else {
-        return NULL;
-    }
-    /*
-     * 进程名可能是 "包名:子进程"（如 hunter 的 :hunter_main_process），
-     * 冒号不能直接进目录名。全部冒号及以后的子进程名替换成下划线，
-     * 避免日志写到不存在的路径上而静默丢失。
-     */
-    /*
-     * 进程名里的冒号要截掉。
-     *
-     * 真实数据目录属于**包名**，不是 "包名:子进程"：
-     * hunter 的三个进程分别是 com.zhenxi.hunter:hunter_main_process 之类，
-     * 但数据目录只有一个 /data/user/0/com.zhenxi.hunter。
-     * 之前把整个 cmdline 当目录名，mkdir 在别人家目录下当然失败，
-     * 于是所有文件日志静默丢失，只剩 logcat 这条随时会被冲掉的通道。
-     */
-    /*
-     * 目录取包名（冒号之前），文件名带上完整进程名。
-     *
-     * hunter 同时有 main / twin / iso 三个进程，都会走到这里。
-     * 如果三个进程写同一个文件，后写的会覆盖先写的，
-     * 表现是"明明跑了却找不到行" —— 之前排查一直丢证据就是这个原因。
-     * 每个进程独立一个文件，证据才留得住。
-     */
-    char suffix[128] = {0};
-    {
-        char *colon = strchr(cmd, ':');
-        if (colon) {
-            /* 子进程名做后缀，冒号换成下划线 */
-            snprintf(suffix, sizeof(suffix), "_%s", colon + 1);
-            for (char *c = suffix; *c; c++) if (*c == ':') *c = '_';
-            *colon = 0;
-        }
-    }
-    char dir[256];
-    snprintf(dir, sizeof(dir), "/data/user/0/%s/files", cmd);
-    mkdir(dir, 0755);
-    snprintf(g_logpath, sizeof(g_logpath), "%s/ahb_native%s.log", dir, suffix);
-    return g_logpath;
-}
 
 /*
- * 运行时日志开关：/data/local/tmp/ahb_verbose 存在才写诊断日志。
+ * 日志策略：只走 logcat，绝不落文件。
  *
- * 为什么必须有这个开关：HEAD 版这里是每次都写，一次检测下来 4000+ 行，
- * 每行一次 write 系统调用。在热路径上它会被放大成可测量的延迟，
- * 而诊断时又必须能开到最大。编译期宏做不到"现场切换不重编"，
- * 所以用文件存在性做开关，每 64 次才 stat 一次，探测本身不成热点。
+ * 为什么不能落文件：模块运行在目标应用的进程里，任何文件都创建在
+ * **目标应用自己的私有目录**中。对方只要 listFiles() 看一眼，或者
+ * 读一下自己的 files 目录，就能发现 ahb_native.log 这种异物 ——
+ * 这比类名特征暴露得更直接。所以运行时零文件创建是硬要求。
+ *
+ * 为什么用 logcat 而不是别的通道：LSPosed 会把模块日志汇总到它自己的
+ * 日志界面，logcat 本身也是标准观测面，不需要我们在磁盘上留任何东西。
+ *
+ * 为什么还要分级：高频诊断行一次检测下来几千行，全开会在热路径上
+ * 放大成可测量延迟，也会把 logcat 缓冲区冲掉（实测冲掉后连关键证据
+ * 都读不到）。所以默认只报关键节点，详细诊断由编译期宏 AHB_DEBUG 打开。
+ * 用编译期而不是运行时文件开关：没有用户界面就没有"现场切换"的需求，
+ * 留一个文件开关只会给目标应用多一个可探测点。
  */
-static volatile int g_verbose = -1;
-static int ahb_verbose_on(void) {
-    int v = g_verbose;
-    if (v >= 0) return v;
-    static unsigned long probes = 0;
-    if ((++probes & 0x3f) != 0) return 0;
-    struct stat st;
-    v = (stat("/data/local/tmp/ahb_verbose", &st) == 0) ? 1 : 0;
-    g_verbose = v;
-    return v;
-}
+#ifndef AHB_DEBUG
+#define AHB_DEBUG 0
+#endif
 
 static void ahb_filelog(const char *fmt, ...) {
-    if (!ahb_verbose_on()) return;
-    const char *path = ahb_logpath();
-    if (!path) return;
+#if AHB_DEBUG
     char buf[512];
     va_list ap;
     va_start(ap, fmt);
-    int n = vsnprintf(buf, sizeof(buf) - 2, fmt, ap);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    if (n < 0) return;
-    if (n > (int)sizeof(buf) - 2) n = sizeof(buf) - 2;
-    buf[n++] = '\n';
-    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0666);
-    if (fd < 0) {
-        static int once = 0;
-        if (!once) {
-            once = 1;
-            char eb[128];
-            int m = snprintf(eb, sizeof(eb), "filelog open fail path=%s errno=%d\n", path, errno);
-            int ef = open("/dev/null", O_WRONLY);
-            (void)ef; (void)m; (void)eb;
-        }
-        return;
+    if (n > 0) {
+        __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "%s", buf);
     }
-    ssize_t w = write(fd, buf, (size_t)n);
-    (void)w;
-    close(fd);
+#else
+    (void)fmt;
+#endif
+}
+
+/*
+ * 关键日志：无论是否开启 AHB_DEBUG 都要输出。
+ * 只用于"层是否装上、补丁是否生效、差异多少字节"这类少量节点。
+ */
+static void ahb_keylog(const char *fmt, ...) {
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "%s", buf);
+    }
 }
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
@@ -677,7 +627,7 @@ static int restore_executable_segments(int ops) {
     fclose(fp);
     if (restored_bytes) {
         /* 同时写进文件日志：logcat 会被刷掉，这个文件能留证据 */
-        ahb_filelog("L2DIFF diff_bytes=%d diff_pages=%d (内存未改动)",
+        ahb_keylog("L2DIFF diff_bytes=%d diff_pages=%d (内存未改动)",
                     restored_bytes, restored_pages);
         LOGI("L2 code-seg 差异: bytes=%d pages=%d（内存未改动）",
              restored_bytes, restored_pages);
@@ -2784,7 +2734,7 @@ static void clv_install_now(void) {
 
     LOGI("L3 view: 早期安装完成 候选=%d 条 pvr=%p syscall=%p",
          found, (void *)g_real_pvr, (void *)g_real_syscall);
-    ahb_filelog("VIEW install found=%d slots=%d pvr=%p syscall=%p",
+    ahb_keylog("VIEW install found=%d slots=%d pvr=%p syscall=%p",
                 found, g_clv_n, (void *)g_real_pvr, (void *)g_real_syscall);
 }
 
@@ -3234,19 +3184,15 @@ jint JNI_OnLoad(JavaVM *vm, void *reserved) {
     if (!g_real_pvr)      g_real_pvr      = (pvr_fn)dlsym(RTLD_DEFAULT, "process_vm_readv");
     if (!g_real_syscall)  g_real_syscall  = (syscall_fn)dlsym(RTLD_DEFAULT, "syscall");
 
+    /*
+     * 视图过滤与补丁开关一律取默认值，不再读任何文件。
+     *
+     * 原来这里会去开 /data/local/tmp/ahb_layers 看有没有 nomapshide /
+     * nopatch 之类的字样。那是一条会被目标应用探测到的路径：
+     * 它只要监看本进程 open 过哪些文件，就能发现这个不属于它的路径。
+     * 模块没有设置界面，也就不需要现场切换；要改就改代码重新打包。
+     */
     g_enable_maps_hide = 1;
-    {
-        FILE *cf = fopen("/data/local/tmp/ahb_layers", "r");
-        if (cf) {
-            char ln[256] = {0};
-            if (fgets(ln, sizeof(ln), cf)) {
-                if (strstr(ln, "nomapshide")) g_enable_maps_hide = 0;
-                if (strstr(ln, "nopatch"))    g_disable_all_patch = 1;
-                if (strstr(ln, "nophdr"))     g_disable_phdr_hide = 1;
-            }
-            fclose(cf);
-        }
-    }
 
     /* 最早的可靠时机：vm 已有效，检测器还没开始扫 */
     clv_install_now();

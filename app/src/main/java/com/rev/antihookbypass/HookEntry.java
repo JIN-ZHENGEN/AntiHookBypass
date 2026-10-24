@@ -49,12 +49,17 @@ public class HookEntry implements IXposedHookLoadPackage {
      * <p>所以默认路径必须做到<b>零文件写入</b>，只在开发调试时由
      * shell 手动建这个开关文件才落盘。
      */
+    /**
+     * 编译期常量，运行时不读任何文件。
+     *
+     * <p>默认 {@code false} = 目标进程里零文件写入。需要现场取证时
+     * 改成 true 重新打包。不做运行时文件开关的理由：那个开关本身
+     * 要先 stat 一个不属于目标应用的路径，等于给自己留一个探针点。
+     */
+    static final boolean DEV_WRITES = false;
+
     static boolean devWritesAllowed() {
-        try {
-            return new java.io.File("/data/local/tmp/ahb_verbose").exists();
-        } catch (Throwable t) {
-            return false;
-        }
+        return DEV_WRITES;
     }
 
     /**

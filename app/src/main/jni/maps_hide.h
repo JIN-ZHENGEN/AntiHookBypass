@@ -23,27 +23,6 @@
 #ifndef AHB_MAPS_HIDE_H
 #define AHB_MAPS_HIDE_H
 
-/*
- * 开发开关：只有 /data/local/tmp/ahb_verbose 存在时才允许写任何文件。
- *
- * 默认关闭意味着模块在目标进程里**零文件写入** —— 不产生日志、
- * 不产生 dump、不产生结果快照，目标 App 扫描自己的私有目录看不到任何异物。
- *
- * 用真实 syscall，避免经过我们自己接管过的 access/stat 包装。
- */
-static int ahb_dev_writes_allowed(void);
-static int ahb_dev_writes_allowed(void) {
-    static int cached = -1;
-    if (cached >= 0) return cached;
-    {
-        long r = syscall(SYS_faccessat, AT_FDCWD, "/data/local/tmp/ahb_verbose",
-                         F_OK, 0);
-        cached = (r == 0) ? 1 : 0;
-    }
-    return cached;
-}
-
-
 #include <link.h>
 #include <signal.h>
 
@@ -305,7 +284,6 @@ static int maps_path_is_self(const char *path) {
 #define MAPS_INIT_CAP (256 * 1024)
 #define MAPS_MAX_CAP  (16 * 1024 * 1024)
 
-static char *g_saved_maps_path = NULL;
 
 /* 读全部内容；返回长度，调用方负责 free */
 /*
@@ -566,11 +544,6 @@ static int maps_make_clean_fd(void) {
     char *line;
     long fd;
 
-    if (!g_saved_maps_path) {
-        char p[128];
-        snprintf(p, sizeof(p), "/data/local/tmp/.ahbmaps_%d", (int)getpid());
-        g_saved_maps_path = strdup(p);
-    }
 
     /*
      * 时间窗口缓存，这是性能的关键。
@@ -716,44 +689,13 @@ static int maps_make_clean_fd(void) {
     (void)dropped;
 
     /*
-     * 落一份过滤结果用于离线核对。
-     * 只在头几次生成，避免长期占空间；路径固定，方便直接 diff。
+     * 这里原来有一段诊断 dump：把过滤后的 maps 内容写到目标 App 自己的
+     * files/maps_filtered，用来核对过滤结果长什么样。
+     *
+     * 整段删除，不再保留任何形式的文件写入。
+     * 理由：它写在目标应用的私有目录里，对方 listFiles() 就能发现；
+     * 而且诊断用途完全可以用 logcat 的计数行替代，不需要落盘。
      */
-    /*
-     * 诊断 dump：只在指纹变化时写一次，且最多 4 次。
-     * 用真实 syscall 打开，避免经过自己的包装。
-     */
-    if (g_maps_filtered <= 4 && ahb_dev_writes_allowed()) {
-        /*
-         * 只有在开发开关打开时才落盘。
-         *
-         * 这是审查揪出来的一处痕迹：默认把 maps 过滤结果写进
-         * 目标 App 自己的 files/ 目录，文件名还带着 maps_filtered。
-         * 对方只要 listFiles() 扫一眼自己的私有目录就能发现。
-         *
-         * 现在默认一个字节都不写；开关不存在时这段整个跳过。
-         */
-        char dpath[256];
-        char cmd[128] = {0};
-        int cf = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/cmdline", O_RDONLY, 0);
-        if (cf >= 0) {
-            syscall(SYS_read, cf, cmd, sizeof(cmd) - 1);
-            syscall(SYS_close, cf);
-        }
-        { char *c = strchr(cmd, ':'); if (c) *c = 0; }
-        snprintf(dpath, sizeof(dpath), "/data/user/0/%s/files/maps_filtered", cmd);
-        int dfd = (int)syscall(SYS_openat, AT_FDCWD, dpath,
-                               O_WRONLY | O_CREAT | O_TRUNC, 0666);
-        if (dfd >= 0) {
-            size_t o = 0;
-            while (o < w) {
-                long k = syscall(SYS_write, dfd, out + o, w - o);
-                if (k <= 0) break;
-                o += (size_t)k;
-            }
-            syscall(SYS_close, dfd);
-        }
-    }
 
     fd = syscall(SYS_memfd_create, "maps", 0);
     if (fd < 0) {
@@ -1085,32 +1027,21 @@ static void *maps_popen_wrap(const char *cmd, const char *mode) {
         g_maps_open_calls++;
         int fd = maps_make_clean_fd();
         if (fd >= 0) {
-            /* 把干净内容落成一个匿名可读文件，再让 cat 去读它 */
-            char tmpl[] = "/data/local/tmp/.ahbmapsXXXXXX";
-            (void)tmpl;
-            FILE *f = fdopen(fd, "r");
-            if (f) {
-                if (g_saved_maps_path) {
-                    FILE *out = g_real_fopen ? g_real_fopen(g_saved_maps_path, "w") : NULL;
-                    if (out) {
-                        char buf[8192];
-                        size_t k;
-                        while ((k = fread(buf, 1, sizeof(buf), f)) > 0) {
-                            fwrite(buf, 1, k, out);
-                        }
-                        fclose(out);
-                        char nc[512];
-                        snprintf(nc, sizeof(nc), "cat %s", g_saved_maps_path);
-                        fclose(f);
-                        if (g_real_popen) return g_real_popen(nc, mode);
-                    } else {
-                        fclose(f);
-                    }
-                } else {
-                    fclose(f);
-                }
-            } else {
-                syscall(SYS_close, fd);
+            /*
+             * 让 cat 直接读 /proc/self/fd/<n>，不再往磁盘落临时文件。
+             *
+             * 原因：模块跑在目标应用的进程里，任何落盘文件都写在它自己的
+             * 私有目录或 /data/local/tmp 下，对方扫一眼就能发现。
+             * 而"把内容先写文件、再 cat 这个文件"这条旧路径，
+             * 无论写在哪儿都会留下痕迹。
+             *
+             * 现在这个 fd 本身就是内存里的 memfd（maps_make_clean_fd 返回的），
+             * cat 通过 /proc/self/fd 读它即可 —— 全程不碰磁盘。
+             */
+            {
+                char nc[96];
+                snprintf(nc, sizeof(nc), "cat /proc/self/fd/%d", fd);
+                if (g_real_popen) return g_real_popen(nc, mode);
             }
         }
     }

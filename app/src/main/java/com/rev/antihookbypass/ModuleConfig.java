@@ -58,7 +58,17 @@ final class ModuleConfig {
     static final int L1_CRASH = 1 << 2;
     static final int L1_ALL = L1_TRACE | L1_KILL | L1_CRASH;
 
-    private static final String CFG = "/data/local/tmp/ahb_layers";
+    /*
+     * 层配置改成编译期默认值，不再读任何文件。
+     *
+     * 为什么不保留文件开关：模块没有用户设置界面，也就不存在
+     * "现场切换"的真实需求；而留一个文件路径在运行时被 stat/open，
+     * 等于给目标应用多一个可探测点 —— 它只要监看自己进程打开过
+     * 哪些路径，就能发现 /data/local/tmp/ahb_layers 这种异物。
+     *
+     * 需要换配置时改这里重新打包即可，代价远小于留一个指纹。
+     */
+    private static final String CFG = null;
 
     private static volatile int cachedLayers = -1;
     private static volatile int cachedNative = -1;
@@ -170,23 +180,15 @@ final class ModuleConfig {
     }
 
     private static String readCfgLine() {
-        File f = new File(CFG);
-        if (!f.exists()) return null;
-        BufferedReader r = null;
-        try {
-            r = new BufferedReader(new FileReader(f));
-            String line = r.readLine();
-            if (line == null) return null;
-            line = line.trim();
-            return line.isEmpty() ? null : line.toLowerCase();
-        } catch (Throwable ignored) {
-            return null;
-        } finally {
-            try {
-                if (r != null) r.close();
-            } catch (Throwable ignored) {
-            }
-        }
+        /*
+         * 恒返回 null，表示"用默认值"。
+         *
+         * 保留这个方法签名，是为了让下面各个 parse 分支保持原样：
+         * 传入 null 时它们都会走默认全开路径。这样改动面最小，
+         * 也不会因为删分支而漏掉某条默认值。
+         */
+        if (CFG == null) return null;
+        return null;
     }
 
     /**

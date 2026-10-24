@@ -18,11 +18,9 @@ final class NativeLayer {
     }
 
     private static final String LIB = "antihook_bypass";
-    private static final String LIB_FILE = "libantihook_bypass.so";
 
     private static volatile boolean loaded = false;
     private static volatile boolean available = false;
-    private static volatile String cachedSoPath = null;
 
     /**
      * 触发原生层执行 L2（ELF 代码段还原 + 匿名可执行跳板页收敛）。
@@ -97,104 +95,23 @@ final class NativeLayer {
                 HookEntry.log("L2+L3 native 已通过 System.loadLibrary 加载");
                 return true;
             } catch (Throwable t1) {
-                HookEntry.log("loadLibrary 回退解包路径: " + t1.getMessage());
-            }
-
-            try {
-                String path = extractSo(ctx);
-                if (path == null) throw new RuntimeException("extractSo 返回 null");
-                System.load(path);
-                available = true;
-                HookEntry.log("L2+L3 native 已通过解包路径加载: " + path);
-                return true;
-            } catch (Throwable t2) {
+                /*
+                 * 不再回退到「把 so 解包到目标 App 的 code_cache」。
+                 *
+                 * 那个回退路径会把 libantihook_bypass.so 写进
+                 * /data/user/0/<目标包>/code_cache/abl/ —— 目标应用
+                 * 只要看一眼自己的 code_cache，就能看到一个不属于它的
+                 * 陌生 .so 和目录名。这是比日志文件更直接的暴露。
+                 *
+                 * 模块的 so 本来就能被 Xposed 的 classloader 找到
+                 * （loadLibrary 走的是模块 apk 的 native 库目录），
+                 * 所以正常情况根本不需要解包。真的加载不了时，
+                 * 宁可 native 层不可用，也不在目标目录留文件。
+                 */
                 available = false;
-                HookEntry.log("native 加载失败: " + t2);
+                HookEntry.log("native 加载失败（不落盘不降级到解包）: " + t1);
                 return false;
             }
-        }
-    }
-
-    private static String extractSo(Context hostCtx) {
-        if (cachedSoPath != null && new File(cachedSoPath).exists()) {
-            return cachedSoPath;
-        }
-        String apkPath = findModuleApk();
-        if (apkPath == null) return null;
-
-        File outDir = null;
-        if (hostCtx != null) {
-            try {
-                File d = new File(hostCtx.getCodeCacheDir(), "abl");
-                if (d.exists() || d.mkdirs()) outDir = d;
-            } catch (Throwable ignored) {
-            }
-        }
-        if (outDir == null) {
-            String selfPkg = currentPackageName();
-            if (selfPkg != null) {
-                for (String base : new String[]{"/data/user/0/", "/data/data/"}) {
-                    try {
-                        File d = new File(base + selfPkg + "/code_cache/abl");
-                        if (d.exists() || d.mkdirs()) {
-                            outDir = d;
-                            break;
-                        }
-                    } catch (Throwable ignored) {
-                    }
-                }
-            }
-        }
-        if (outDir == null) return null;
-
-        File out = new File(outDir, LIB_FILE);
-        String abi = pickAbi();
-
-        ZipFile zip = null;
-        InputStream in = null;
-        FileOutputStream fos = null;
-        try {
-            zip = new ZipFile(apkPath);
-            ZipEntry e = zip.getEntry("lib/" + abi + "/" + LIB_FILE);
-            if (e == null) {
-                java.util.Enumeration<? extends ZipEntry> en = zip.entries();
-                while (en.hasMoreElements()) {
-                    ZipEntry z = en.nextElement();
-                    String n = z.getName();
-                    if (n.startsWith("lib/") && n.endsWith("/" + LIB_FILE)) {
-                        e = z;
-                        break;
-                    }
-                }
-            }
-            if (e == null) return null;
-
-            File tmp = new File(outDir, LIB_FILE + ".tmp");
-            if (tmp.exists()) tmp.delete();
-            in = zip.getInputStream(e);
-            fos = new FileOutputStream(tmp);
-            byte[] buf = new byte[8192];
-            int n;
-            while ((n = in.read(buf)) > 0) fos.write(buf, 0, n);
-            fos.flush();
-            fos.close();
-            fos = null;
-            in.close();
-            in = null;
-
-            if (out.exists()) out.delete();
-            if (!tmp.renameTo(out)) {
-                tmp.delete();
-                return null;
-            }
-            cachedSoPath = out.getAbsolutePath();
-            return cachedSoPath;
-        } catch (Throwable ignored) {
-            return null;
-        } finally {
-            try { if (fos != null) fos.close(); } catch (Throwable ignored) {}
-            try { if (in != null) in.close(); } catch (Throwable ignored) {}
-            try { if (zip != null) zip.close(); } catch (Throwable ignored) {}
         }
     }
 
