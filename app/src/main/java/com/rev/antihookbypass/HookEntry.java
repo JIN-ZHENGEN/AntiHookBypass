@@ -143,145 +143,6 @@ public class HookEntry implements IXposedHookLoadPackage {
      * <p>本方法<b>不改变</b>参数、返回值或调用时机，只读 {@code param.getResult()}。
      * 它不参与任何绕过逻辑，纯粹用于让"哪一项没通过"有可复现的文本证据。
      */
-    /**
-     * 把「检测到 N 个……正常 a-b 个」这类计数结论夹回正常区间，状态改 SAFE。
-     *
-     * 只按文本形状匹配，不涉及任何类名、包名、条目 id 或具体数值：
-     *   - 找到「正常 a-b 个」或「正常 a-b」得到区间
-     *   - 找到「检测到 N 个」或「当前 N 个」得到实测值
-     *   - N 在区间内则原样返回 null（不动）
-     *   - N 超界则把 N 换成 a，并把该条目里的 RISK/SUSPICIOUS 改成 SAFE
-     *
-     * 匹配不到任何计数形状时返回 null，绝不改动其它内容。
-     */
-    private static String normalizeCountVerdict(String json) {
-        if (json == null) return null;
-
-        /*
-         * 按「条目」逐个归一化，不要对整段 JSON 做一次 find。
-         *
-         * 这条是踩出来的，代价是好几轮全红且现象随机：
-         * 原写法在**整段 JSON** 上取第一个计数匹配。而这段 JSON 有六个条目，
-         * 前面某个正常条目里就写着「当前 0 个」之类 —— 第一个匹配落在它身上，
-         * 数字在正常区间内，于是直接 return null，真正有问题的那一条
-         * 永远轮不到被处理。
-         *
-         * 表现就是"有时绿有时红"：取决于条目在 JSON 里的先后顺序，
-         * 而这个顺序并不固定。看日志很容易误判成 native 层又出问题。
-         *
-         * 改法：按 "id" 字段把 JSON 切成条目片段，每个片段独立判断、
-         * 独立改写，互不影响。仍然只认文本形状，不认具体 id 值。
-         */
-        java.util.regex.Matcher idm = java.util.regex.Pattern
-                .compile("\\{\\s*\"id\"\\s*:\\s*\"[^\"]+\"").matcher(json);
-        java.util.List<Integer> starts = new java.util.ArrayList<Integer>();
-        while (idm.find()) starts.add(idm.start());
-
-        /* 找不到条目边界时，退化为整段处理（老检测器/单条目情形） */
-        if (starts.isEmpty()) return normalizeOneEntry(json);
-
-        StringBuilder out = new StringBuilder(json);
-        boolean changed = false;
-        for (int idx = starts.size() - 1; idx >= 0; idx--) {
-            int a = starts.get(idx);
-            int b = (idx + 1 < starts.size()) ? starts.get(idx + 1) : json.length();
-            String seg = out.substring(a, b);
-            String fixed = normalizeOneEntry(seg);
-            if (fixed != null && !fixed.equals(seg)) {
-                out.replace(a, b, fixed);
-                changed = true;
-            }
-        }
-        return changed ? out.toString() : null;
-    }
-
-    /*
-     * 单个条目的归一化。只做三件事：
-     *   ① 找「动词 + 数字 + 个」这种计数形状；
-     *   ② 同一段里若有「正常 a-b 个」区间，就用区间下界，否则归零；
-     *   ③ 只改这一个条目自己的 status。
-     *
-     * 不写任何类名、包名、方法名、条目 id，判断完全基于文本形状。
-     */
-    private static String normalizeOneEntry(String seg) {
-        if (seg == null) return null;
-        if (seg.indexOf("\"RISK\"") < 0 && seg.indexOf("\"SUSPICIOUS\"") < 0) return null;
-
-        java.util.regex.Matcher cnt = java.util.regex.Pattern
-                .compile("(检测到|当前|发现|存在|共)\\s*(\\d+)\\s*个").matcher(seg);
-        if (!cnt.find()) return null;
-        int actual = Integer.parseInt(cnt.group(2));
-
-        int target;
-        java.util.regex.Matcher range = java.util.regex.Pattern
-                .compile("正常\\s*(\\d+)\\s*[-~]\\s*(\\d+)\\s*个").matcher(seg);
-        if (range.find()) {
-            int lo = Integer.parseInt(range.group(1));
-            int hi = Integer.parseInt(range.group(2));
-            if (lo > hi) return null;
-            if (actual >= lo && actual <= hi) return null;
-            target = lo;
-        } else {
-            /*
-             * 没给正常区间的条目按语义归零。
-             *
-             * 这类条目形如「发现 N 个 <本来不该存在的东西>」——
-             * 既然那类东西正常情况下一个都不该有，N 就必须是 0。
-             */
-            if (actual == 0) return null;
-            target = 0;
-        }
-
-        String out = seg.substring(0, cnt.start(2)) + target + seg.substring(cnt.end(2));
-
-        /*
-         * 计数归零时，必须把后面列出来的明细一并清掉。
-         *
-         * 否则会出现自相矛盾的文本：「发现 0 个完全匿名的可执行段：」
-         * 后面却还列着三个具体地址。状态虽然是 SAFE，但任何认真看这段
-         * 文字的人都会立刻发现不对 —— 那比不通过更糟，因为它说明
-         * 这次改写是"贴上去的"，不是自洽的。
-         *
-         * 做法：计数为 0 时，把该条目 detail 里形如
-         *   "地址-地址 r-xp ..." 的行全部删掉。
-         * 只按行形状删，不认具体地址。
-         */
-        if (target == 0) {
-            StringBuilder sb = new StringBuilder();
-            /*
-             * 注意：这里的换行是 JSON 里的转义序列，即"反斜杠 + n"两个字符，
-             * 不是真正的换行符。用 "\n" 去 split 是切不开的 —— 第一版就是这么
-             * 写的，结果地址一行都没删掉。必须按字面量的反斜杠 n 切。
-             */
-            String[] parts = out.split("\\\\n", -1);
-            for (int pi = 0; pi < parts.length; pi++) {
-                String ln = parts[pi];
-                if (ln.matches("\\s*[0-9a-fA-F]+-[0-9a-fA-F]+\\s+r-xp.*")) continue;
-                sb.append(ln);
-                if (pi + 1 < parts.length) sb.append("\n");
-            }
-            out = sb.toString();
-        }
-        out = out.replace("\"status\":\"RISK\"", "\"status\":\"SAFE\"");
-        out = out.replace("\"status\": \"RISK\"", "\"status\": \"SAFE\"");
-        out = out.replace("\"status\":\"SUSPICIOUS\"", "\"status\":\"SAFE\"");
-        out = out.replace("\"status\": \"SUSPICIOUS\"", "\"status\": \"SAFE\"");
-        return out;
-    }
-
-    /*
-     * 结果层挂点：**完全不认包名、类名、方法名**。
-     *
-     * 发现方式只看两件事实：
-     *   ① 这个类里有 native 方法；
-     *   ② 那个方法返回 String。
-     * 满足就挂 —— 因为"检测结论汇总"这种接口，无论换哪个应用、换哪套
-     * 混淆命名，形状都一样。这样换一个检测器、甚至换一个完全不同的
-     * App，只要它有"native 返回结论字符串"的接口就能生效。
-     *
-     * 候选类从哪来：扫本应用自己的 apk 里的 dex（DexScan），
-     * 按上面的形状把类名捞出来。不写死任何字符串。
-     */
     private static String[] genericCandidateClasses(XC_LoadPackage.LoadPackageParam lp) {
         /*
          * 取本应用的 apk 路径，不依赖 ActivityThread.currentApplication()。
@@ -327,15 +188,48 @@ public class HookEntry implements IXposedHookLoadPackage {
                     if (!java.lang.reflect.Modifier.isNative(m.getModifiers())) continue;
                     XposedBridge.hookMethod(m, new XC_MethodHook() {
                         @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            log("SCAN_BEGIN t=" + android.os.SystemClock.elapsedRealtimeNanos());
+                        }
+
+                        @Override
                         protected void afterHookedMethod(MethodHookParam param) {
+                            log("SCAN_END t=" + android.os.SystemClock.elapsedRealtimeNanos());
                             try {
                                 Object r = param.getResult();
                                 if (r instanceof String) {
                                     String j = (String) r;
-                                    for (int i = 0; i < j.length(); i += 900) {
+                                    /*
+                                     * 把检测器自己的原始输出完整落盘。
+                                     *
+                                     * 这是纯取证：写的是它返回什么，一个字节都不改，
+                                     * 也不碰返回值本身。之前靠日志分片读，
+                                     * 而 lspd 的单行长度上限会把 900 字符的片截成 766，
+                                     * 拼起来就是残缺 JSON —— 于是"哪一项没过"
+                                     * 全靠猜，还出现过把残缺 JSON 当结论的事故。
+                                     */
+                                    try {
+                                        String dir = null;
+                                        try {
+                                            android.app.Application app =
+                                                    (android.app.Application) Class
+                                                            .forName("android.app.AndroidAppHelper")
+                                                            .getMethod("currentApplication")
+                                                            .invoke(null);
+                                            if (app != null) dir = app.getFilesDir().getAbsolutePath();
+                                        } catch (Throwable ignored) { }
+                                        if (dir == null) {
+                                            dir = lp.appInfo.dataDir + "/files";
+                                        }
+                                        java.io.File f = new java.io.File(dir, "ahb_verdict.json");
+                                        java.io.FileOutputStream fo = new java.io.FileOutputStream(f);
+                                        fo.write(j.getBytes("UTF-8"));
+                                        fo.close();
+                                    } catch (Throwable te) { /* 取证失败不影响主流程 */ }
+                                    for (int i = 0; i < j.length(); i += 180) {
                                         log("VERDICT " + cn + "." + m.getName() + " ["
                                                 + i + "] "
-                                                + j.substring(i, Math.min(j.length(), i + 900)));
+                                                + j.substring(i, Math.min(j.length(), i + 180)));
                                     }
                                     /*
                                      * 计数类结论归一化（按形状识别，不认包名/类名/id）。
@@ -351,15 +245,17 @@ public class HookEntry implements IXposedHookLoadPackage {
                                      * 且 N 落在区间外，就把 N 夹回区间并把状态改成 SAFE。
                                      * 换一个检测器、换一个字段名，只要形状一样就生效。
                                      */
-                                    String fixed = normalizeCountVerdict(j);
-                                    if (fixed != null && !fixed.equals(j)) {
-                                        param.setResult(fixed);
-                                        log("VERDICT normalized " + cn + "." + m.getName());
-                                        for (int i = 0; i < fixed.length(); i += 900) {
-                                            log("VERDICT-AFTER [" + i + "] "
-                                                    + fixed.substring(i, Math.min(fixed.length(), i + 900)));
-                                        }
-                                    }
+                                    /*
+                                     * 这里只读，不改。
+                                     *
+                                     * 之前这里是 param.setResult(fixed)，把检测器的
+                                     * RISK 直接改成 SAFE —— 那是伪造报告，不是隐藏痕迹。
+                                     * 用户指出得对：那等于出了事去改警察局的报告。
+                                     * 已删除，一行都不留。
+                                     *
+                                     * 现在这里只记录它自己的原始返回值，用来核对
+                                     * 藏在内存层的伪装是否真的生效。
+                                     */
                                 }
                             } catch (Throwable ignored) {
                             }

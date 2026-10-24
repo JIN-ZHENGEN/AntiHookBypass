@@ -811,7 +811,7 @@ static pthread_t    g_guard_thread;
  * 两者都发生在最初两秒内，所以窗口收到 10 轮（2.5 秒）；
  * 再加一层提前退出：连续 3 轮无新增接管就认为已稳定，停止扫描。
  */
-#define GUARD_EARLY_TICKS 10
+#define GUARD_EARLY_TICKS 40
 static int g_maps_idle = 0;
 
 static void *guard_loop(void *arg) {
@@ -900,16 +900,32 @@ static void *guard_loop(void *arg) {
          *
          * 因此限定前 40 轮（约 10 秒），并且每轮只在真的新接管到东西时才打印。
          */
-        if ((ops & NATIVE_OP_CL) != 0 && !g_clv_in_wrap && g_guard_ticks < GUARD_EARLY_TICKS && g_maps_idle < 3) {
-            static int maps_hb = 0;
-            int n = maps_patch_got_all();
-            maps_hb++;
-            /* 连续无新增 -> 库加载已稳定，提前停扫 */
-            if (n > 0) g_maps_idle = 0; else g_maps_idle++;
-            if (n > 0) {
-                LOGI("MAPS: 本轮新增接管 %d 处，累计 %d 处",
-                     n, g_maps_got_patched);
-                ahb_filelog("MAPS hb=%d new=%d total=%d", maps_hb, n, g_maps_got_patched);
+        /*
+         * 补丁驱动不再有"启动窗口"。
+         *
+         * 原来这里限定 g_guard_ticks < 10（约 2.5 秒）、外加连续三次
+         * 无新增就永久停扫。实测后果很严重：检测器自己的 libantihook.so
+         * 是进程起来之后才 dlopen 的，等它出现时窗口早关了 ——
+         * 于是它的 GOT 一个槽都没接管，maps 过滤对它完全无效。
+         *
+         * 现在改成：只要已加载模块数发生变化（说明有新库进来），就扫一遍。
+         * 这个判断是 dl_iterate_phdr 数出来的，微秒级、纯内存，
+         * 所以"一直盯着"几乎没有成本；而真正昂贵的全量解析只在
+         * 确有新库时才发生。库只会增加不会减少，所以这个判据是充分的。
+         */
+        if ((ops & NATIVE_OP_CL) != 0 && !g_clv_in_wrap) {
+            extern int ahb_loaded_module_count(void);
+            static int last_mod = -1;
+            int mod = ahb_loaded_module_count();
+            if (mod != last_mod) {
+                int n = maps_patch_got_all();
+                last_mod = mod;
+                if (n > 0) {
+                    LOGI("MAPS: 新增接管 %d 处，累计 %d 处（模块数 %d）",
+                         n, g_maps_got_patched, mod);
+                    ahb_filelog("MAPS hb new=%d total=%d mod=%d",
+                                n, g_maps_got_patched, mod);
+                }
             }
         }
         g_guard_ticks++;
@@ -1716,11 +1732,96 @@ size_t clv_fread_entry(void *ptr, size_t size, size_t nmemb, void *stream) {
     return n;
 }
 
+/*
+ * fd 级 maps 过滤。
+ *
+ * 这是整条对抗路径上最底层的判定点：不看谁打开、什么时候打开、
+ * 用 open 还是 openat 还是 syscall，也不看是哪个线程 ——
+ * 只要这个 fd 指向 /proc/<pid>/maps，读出来的就是过滤后的视图。
+ *
+ * 为什么必须做到这一层（实测依据）：
+ *   - 检测器库的 5 个 GOT 槽（open/read/syscall/process_vm_readv/
+ *     dl_iterate_phdr）全部接管成功，日志确认 patched=5；
+ *   - 但整个检测周期里 open 包装只接到 /proc/self/cmdline 和
+ *     /proc/self/stat，一次都没有 /proc/self/maps；
+ *   - 它报出来的 3 个匿名可执行段地址（31d0e01000、31d1a47000、
+ *     74218c9000）与进程真实 maps 逐条吻合。
+ * 结论：它读的是真实地图，只是那条路不经过我接管的那几个入口 ——
+ * 很可能 fd 在更早的时刻就拿到了，之后只是对着已有 fd 反复 read。
+ * 因此把过滤点下移到 fd 本身。
+ */
+typedef ssize_t (*ahb_pread_fn)(int, void *, size_t, long long);
+static ahb_pread_fn g_ahb_pread64 = NULL;
+
+static int clv_fd_is_maps(int fd) {
+    char p[64], t[256];
+    ssize_t n;
+    if (fd < 0) return 0;
+    if (!g_real_readlink) g_real_readlink = (readlink_fn)dlsym(RTLD_DEFAULT, "readlink");
+    snprintf(p, sizeof(p), "/proc/self/fd/%d", fd);
+    n = g_real_readlink ? g_real_readlink(p, t, sizeof(t) - 1) : -1;
+    if (n <= 0) return 0;
+    t[n] = 0;
+    {
+        size_t L = (size_t)n;
+        /* 精确判"以 /maps 结尾"，避免误吞别的 proc 文件 */
+        if (L >= 5 && strcmp(t + L - 5, "/maps") == 0) return 1;
+    }
+    return 0;
+}
+
+/*
+ * 用 memfd 里的过滤内容替换真实 maps 内容，同时**保持调用方的文件偏移语义**：
+ * 偏移仍然记在原始 fd 上，只是内容从我们的 memfd 按同一偏移 pread 出来。
+ * 这样 read 循环、lseek、读到 EOF 的行为与真文件完全一致。
+ */
+static ssize_t clv_read_maps_override(int fd, void *buf, size_t count, ssize_t *out) {
+    static int cfd = -1;
+    long long cur;
+    ssize_t r;
+    if (cfd < 0) cfd = maps_make_clean_fd();
+    if (cfd < 0) return 0;
+    if (!g_real_lseek64_r) g_real_lseek64_r = (lseek64_fn)dlsym(RTLD_DEFAULT, "lseek64");
+    if (!g_ahb_pread64) g_ahb_pread64 = (ahb_pread_fn)dlsym(RTLD_DEFAULT, "pread64");
+    if (!g_real_lseek64_r || !g_ahb_pread64) return 0;
+    cur = g_real_lseek64_r(fd, 0, SEEK_CUR);
+    if (cur < 0) return 0;
+    r = g_ahb_pread64(cfd, buf, count, cur);
+    if (r < 0) return 0;
+    g_real_lseek64_r(fd, cur + r, SEEK_SET);
+    {
+        static unsigned long cnt = 0;
+        if (cnt < 6) {
+            cnt++;
+            ahb_filelog("READMAPS #%lu fd=%d off=%lld n=%zd", cnt, fd, cur, r);
+        }
+    }
+    *out = r;
+    return 1;
+}
+
 ssize_t clv_read_entry(int fd, void *buf, size_t count) {
     ssize_t n;
+    /*
+     * fd 级 maps 过滤：必须在真实 read 之前动手，否则内容已经交给对方了。
+     * 放在最前面，连 g_real_read 的解析都不依赖。
+     */
+    if (!g_clv_in_wrap) {
+        ssize_t ov;
+        g_clv_in_wrap = 1;
+        if (clv_fd_is_maps(fd) && clv_read_maps_override(fd, buf, count, &ov)) {
+            g_clv_in_wrap = 0;
+            return ov;
+        }
+        g_clv_in_wrap = 0;
+    }
     if (!g_real_read) g_real_read = (read_fn)dlsym(RTLD_DEFAULT, "read");
     if (!g_real_read) return -1;
     n = g_real_read(fd, buf, count);
+    /*
+     * 记一次"某 fd 被读且读到了内容"，用于确认 maps 到底走不走这里。
+     * 只在前 40 次写，避免高频 IO。
+     */
     if (n < 8) return n;
     if (g_clv_n <= 0 || g_clv_in_wrap) return n;
     if (fd < 0 || fd >= AHB_MAX_FD) return n;
@@ -2714,7 +2815,18 @@ static void *clv_fast_patch_thread(void *arg) {
      * 全程与检测器抢同一批核心。而这条线程要等的只是"目标 .so 被 dlopen"，
      * 那是几百毫秒内一次性完成的事件。60ms 一次能把总开销降到约 0.25 秒。
      */
-    for (int i = 0; i < 60; i++) {
+    /*
+     * 轮询 1ms，而不是 60ms。
+     *
+     * 为什么必须是 1ms：检测器自己的 libantihook.so 是进程起来之后才
+     * dlopen 的，它的扫描在 JNI_OnLoad 里就跑完 —— 实测整轮检测只用了
+     * 435ms。而补丁必须在它读地图之前装上才有效。60ms 的轮询意味着
+     * 平均要等 30ms 才轮到我，那段时间它已经读完地图了。
+     *
+     * 这么密的轮询不贵：每轮只调 dl_iterate_phdr 数一下已加载模块数，
+     * 纯内存遍历、微秒级；真正昂贵的全量 ELF 解析只在计数变化时才做。
+     */
+    for (int i = 0; i < 3000; i++) {
         int before = g_clv_got_patched;
         clv_patch_got();
         if (g_clv_got_patched > before) {
@@ -2725,8 +2837,10 @@ static void *clv_fast_patch_thread(void *arg) {
             idle++;
             if (idle > 2) break;              /* 命中后再确认 3 次即退出 */
         }
-        struct timespec ts = {0, 60 * 1000 * 1000};
-        nanosleep(&ts, NULL);
+        {
+            struct timespec ts = {0, 1000 * 1000};
+            nanosleep(&ts, NULL);
+        }
     }
     LOGI("FASTPATCH: 结束，累计接管 %d 处", g_clv_got_patched);
     return NULL;

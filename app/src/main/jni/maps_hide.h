@@ -785,6 +785,9 @@ typedef void *(*popen_fn)(const char *, const char *);
 static open_fn   g_real_open      = NULL;
 static openat_fn g_real_openat    = NULL;
 static fopen_fn  g_real_fopen     = NULL;
+/* maps 快照：由 maps_read_all 走真实 syscall 读入，供补丁扫描逐行解析 */
+static char   *g_maps_snap      = NULL;
+static size_t  g_maps_snap_len  = 0;
 static open_fn   g_real_open64    = NULL;
 static open_fn   g_real_open_2    = NULL;
 static openat_fn g_real_openat_2  = NULL;
@@ -893,6 +896,10 @@ static void maps_lazy_rescan(void) {
     }
 }
 
+/* 前置声明：GOT 补丁表要引用，实体在文件末尾 */
+void *ahb_dlopen_wrap(const char *name, int flags);
+void *ahb_android_dlopen_ext_wrap(const char *name, int flags, const void *extinfo);
+
 static int maps_open_wrap(const char *path, int flags, mode_t mode) {
     struct timespec _ts0, _ts1;
     clock_gettime(CLOCK_MONOTONIC, &_ts0);
@@ -902,10 +909,10 @@ static int maps_open_wrap(const char *path, int flags, mode_t mode) {
     maps_lazy_rescan();
     /* 诊断：记录实际经过的路径，确认目标用什么姿势读 maps */
     {
-        static int dbg_left = 20;   /* 限量：高频调用时反复写日志本身很贵 */
-        if (dbg_left > 0 && path && strstr(path, "/proc/")) {
+        /* 凡是带 /maps 的路径一律记录：这是判断"它到底怎么读地图"的唯一依据 */
+        static int dbg_left = 200;
+        if (dbg_left > 0 && path && strstr(path, "/maps")) {
             dbg_left--;
-            ahb_filelog("OPEN %s", path);
         }
     }
     if (maps_path_is_self(path)) {
@@ -917,6 +924,10 @@ static int maps_open_wrap(const char *path, int flags, mode_t mode) {
         g_t_self += (unsigned long)((_s1.tv_sec - _s0.tv_sec) * 1000000L
                                     + (_s1.tv_nsec - _s0.tv_nsec) / 1000L);
         if (fd >= 0) {
+            {
+                struct timespec _n; clock_gettime(CLOCK_BOOTTIME, &_n);
+                ahb_filelog("CLEAN t=%lld", (long long)_n.tv_sec * 1000000000LL + _n.tv_nsec);
+            }
             clock_gettime(CLOCK_MONOTONIC, &_ts1);
             g_t_open += (unsigned long)((_ts1.tv_sec - _ts0.tv_sec) * 1000000L
                                         + (_ts1.tv_nsec - _ts0.tv_nsec) / 1000L);
@@ -1219,6 +1230,30 @@ static int ahb_addr_mapped(uintptr_t a, size_t len) {
  * 注意必须用真实的 syscall 指针，不能走 libc 的 syscall/process_vm_readv
  * —— 那两个已经被本模块自己接管，会绕回来。
  */
+static int ahb_safe_read(void *dst, uintptr_t src, size_t len);
+
+/*
+ * 读一个以 NUL 结尾的字符串，逐字节读、遇到读失败立即停。
+ *
+ * 为什么不能一次读一大块：符号名紧挨着 strtab 末尾时，一次读 255 字节
+ * 会跨出已映射范围，process_vm_readv 整段失败 —— 于是每一个符号都被判为
+ * "读不到"直接跳过。表现就是 patched=0：ELF 头读得到、重定位表读得到，
+ * 偏偏一个符号名都认不出来。
+ */
+static int ahb_safe_read_str(char *dst, uintptr_t src, size_t cap) {
+    size_t i;
+    if (!dst || cap < 2) return 0;
+    for (i = 0; i + 1 < cap; i++) {
+        if (!ahb_safe_read(dst + i, src + i, 1)) {
+            dst[i] = 0;
+            return i > 0;          /* 已经读到内容就算成功 */
+        }
+        if (dst[i] == 0) return 1;
+    }
+    dst[cap - 1] = 0;
+    return 1;
+}
+
 static int ahb_safe_read(void *dst, uintptr_t src, size_t len) {
     struct iovec li, ri;
     long r;
@@ -1261,6 +1296,27 @@ static int ahb_is_libc(const char *path) {
     return strstr(path, "/libc.so") != NULL;
 }
 
+/*
+ * 只接管应用侧的库（/data/ 下）。
+ *
+ * 血的教训：给 /vendor/lib64/libllvm-glnext.so 打上 open/read/syscall 的
+ * GOT 补丁之后，Vulkan 初始化直接 abort：
+ *     signal 6 (SIGABRT)
+ *     #01 libllvm-glnext.so
+ *     #06 vulkan.adreno.so (qglinternal::vkCreateInstance)
+ * 系统库对这几个函数的调用有自己的假设（返回值、errno、调用约定），
+ * 被我们替换成包装后再返回，图形驱动就崩了。
+ *
+ * 而且从目的上说也不需要：要隐藏的是"有东西注入进了这个进程"，
+ * 读地图的是应用侧的检测库和注入框架，它们全在 /data/ 下。
+ * 系统库自己读 maps 与我们无关。
+ *
+ * 这条边界同时解决三件事：不破坏系统组件、扫描量小、加载快。
+ */
+static int ahb_so_is_app_side(const char *path) {
+    return path && strncmp(path, "/data/", 6) == 0;
+}
+
 static int ahb_so_skip(const char *path) {
     /*
      * 绝不动 libc/libart/linker：那会破坏系统调用层与 ART 自身。
@@ -1270,6 +1326,17 @@ static int ahb_so_skip(const char *path) {
      * ahb_filelog -> open -> maps_open_wrap -> ahb_filelog 无限递归，
      * 表现是日志写不出来、进程卡死或栈溢出。
      */
+    /*
+     * 系统库不再整库跳过 —— 但也不是全都装。
+     *
+     * 取舍：进表之后，是靠符号名逐个决定装不装（见上面 dlopen 那段）。
+     * 纯转发的 dlopen/android_dlopen_ext 系统库也要装，否则收不到
+     * "新库加载"通知；会改写内容的 open/read/syscall 只装应用侧。
+     */
+    if (!ahb_so_is_app_side(path) &&
+        !strstr(path, "/libnativeloader") &&
+        !strstr(path, "/libc.so") &&
+        !strstr(path, "/linker")) return 1;
     /* libc 允许进入（只接管 process_vm_readv，见上面的白名单） */
     return strstr(path, "/libart.so") ||
            strstr(path, "/linker") || strstr(path, "/libbase.so") ||
@@ -1384,6 +1451,22 @@ static uintptr_t ahb_repl_for(const char *name) {
      */
     if (strcmp(name, "syscall") == 0)         return (uintptr_t)maps_syscall_wrap;
     /*
+     * dlopen 一族：这是"新库映射完成、JNI_OnLoad 还没执行"的唯一确定时刻。
+     *
+     * 实测依据（同一轮日志的时间戳，单位 ns）：
+     *   SCAN_BEGIN  79031620197453   ← 检测器开始扫
+     *   补丁落地    79031792118391   ← 我的轮询线程才轮到（晚 172ms）
+     *   SCAN_END    79031988219016   ← 整轮 368ms 结束
+     * 也就是说：靠后台轮询永远赶不上，必须在它开始扫之前就把 GOT 装好。
+     * 而 JNI_OnLoad 是 ART 在 dlopen 返回之后才调的，所以只要在 dlopen
+     * 返回的那一瞬间补一遍，就必然早于它自己的扫描。
+     *
+     * 这个点与"哪个库"无关，任何新加载的库都会经过它，所以是通用的。
+     */
+    if (strcmp(name, "dlopen") == 0)          return (uintptr_t)ahb_dlopen_wrap;
+    if (strcmp(name, "android_dlopen_ext") == 0)
+                                              return (uintptr_t)ahb_android_dlopen_ext_wrap;
+    /*
      * 把 process_vm_readv 也纳入重定位驱动接管。
      *
      * 这样就不需要再"逐段线性扫描每个 .so 的字节找值"——
@@ -1422,6 +1505,13 @@ static int ahb_patch_one_so(ahb_so_ent *so) {
     int patched = 0;
     uintptr_t dyn_addr = 0;
 
+    {
+        /* 诊断：统计各提前返回原因，只记前三次扫描 */
+        static int n = 0;
+        if (n < 200) {
+            n++;
+        }
+    }
     if (so->tried) return 0;
     so->tried = 1;
     if (ahb_already_done(so->path)) return 0;
@@ -1436,20 +1526,36 @@ static int ahb_patch_one_so(ahb_so_ent *so) {
      * 快照一过期，下面的 memcmp(e_ident, ELFMAG) 就崩在宿主进程里，
      * 崩溃地址每次就是那个已失效的基址，栈顶正是 memcmp 的那条 ldr。
      */
-    if (!ahb_safe_read(&eh_buf, so->base, sizeof(eh_buf))) return 0;
+    if (!ahb_safe_read(&eh_buf, so->base, sizeof(eh_buf))) {
+        static int dbg = 0;
+        if (dbg < 3) {
+            dbg++;
+        }
+        return 0;
+    }
     eh = &eh_buf;
     if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0) return 0;
     if (eh->e_machine != EM_AARCH64 && eh->e_machine != EM_X86_64) return 0;
-    if (eh->e_phentsize != sizeof(ElfW(Phdr))) return 0;
-    if (eh->e_phnum == 0 || eh->e_phnum > 64) return 0;
+    if (eh->e_phentsize != sizeof(ElfW(Phdr))) { ahb_filelog("F phentsize %s", so->path); return 0; }
+    if (eh->e_phnum == 0 || eh->e_phnum > 64) { ahb_filelog("F phnum %s", so->path); return 0; }
 
     if (!ahb_safe_read(ph_buf, so->base + eh->e_phoff,
-                       (size_t)eh->e_phnum * sizeof(ElfW(Phdr)))) return 0;
+                       (size_t)eh->e_phnum * sizeof(ElfW(Phdr)))) { ahb_filelog("F phread %s", so->path); return 0; }
     ph = ph_buf;
     for (i = 0; i < eh->e_phnum; i++) {
         if (ph[i].p_type == PT_DYNAMIC) {
             dyn_addr = so->base + ph[i].p_vaddr;
-            if (!ahb_safe_read(dyn_buf, dyn_addr, sizeof(ElfW(Dyn)) * 2)) return 0;
+            /*
+             * 必须读满整个缓冲，不能只读 2 个条目。
+             *
+             * 踩过的坑：缓冲区开了 128 个条目，却只读进 2 个，
+             * 后面却一直遍历到 512 个 —— 读到第 3 个开始全是未初始化的
+             * 栈垃圾，d_tag 是随机值，DT_SYMTAB / DT_STRTAB 永远匹配不上，
+             * 于是每个库都卡在 symtab/strtab 为空，一个都没补上。
+             */
+            if (!ahb_safe_read(dyn_buf, dyn_addr, sizeof(dyn_buf))) {
+                return 0;
+            }
             dyn = dyn_buf;
             break;
         }
@@ -1461,7 +1567,7 @@ static int ahb_patch_one_so(ahb_so_ent *so) {
      * 直接遍历 dyn[i] / r[k] 等于用快照地址反复解引用，
      * 每个元素都是一次崩溃机会。
      */
-    for (i = 0; i < 512 && dyn[i].d_tag != DT_NULL; i++) {
+    for (i = 0; i < sizeof(dyn_buf) / sizeof(dyn_buf[0]) && dyn[i].d_tag != DT_NULL; i++) {
         uintptr_t raw = (uintptr_t)dyn[i].d_un.d_ptr;
         switch (dyn[i].d_tag) {
         case DT_PLTRELSZ: pltrelsz = (size_t)raw; break;
@@ -1471,13 +1577,30 @@ static int ahb_patch_one_so(ahb_so_ent *so) {
         case DT_STRTAB:
         case DT_JMPREL:
         case DT_RELA: {
-            uintptr_t v = raw;
+            uintptr_t v = 0;
             if (!raw) break;
-            /* 已重定位就是绝对地址；没重定位就补上基址。两种都接受，
-               但都必须落在已映射区间内才敢用。 */
-            if (!ahb_addr_mapped(raw, 8)) {
-                if (ahb_addr_mapped(so->base + raw, 8)) v = so->base + raw;
-                else break;
+            /*
+             * 这里的 d_ptr 有两种可能：已重定位的绝对地址，或未重定位的
+             * 相对偏移。用"落没落在某个映射段里"来分辨是错的 —— 一个小的
+             * 相对偏移完全可能正好落在别的段范围内，于是被当成绝对地址，
+             * 后面按它读符号表全部失败。
+             *
+             * 实测后果：每个库都卡在 symtab/strtab 为空这一步，
+             * so_n=430 一个都没补上，maps 过滤形同虚设。
+             *
+             * 改用"能不能真读到"来分辨：先按 ELF 语义试 base+raw（未重定位
+             * 的绝大多数是这种），读不通再试 raw 原值。
+             */
+            {
+                static const char probe[8] = {0};
+                (void)probe;
+                if (ahb_safe_read(&v, so->base + raw, sizeof(uintptr_t))) {
+                    v = so->base + raw;
+                } else if (ahb_safe_read(&v, raw, sizeof(uintptr_t))) {
+                    v = raw;
+                } else {
+                    break;
+                }
             }
             if (dyn[i].d_tag == DT_SYMTAB)      symtab = (const ElfW(Sym) *)v;
             else if (dyn[i].d_tag == DT_STRTAB) strtab = (const char *)v;
@@ -1514,15 +1637,9 @@ static int ahb_patch_one_so(ahb_so_ent *so) {
                 if (type != R_AARCH64_JUMP_SLOT && type != R_AARCH64_GLOB_DAT) continue;
                 if (!ahb_safe_read(&sy, (uintptr_t)&symtab[sym], sizeof(sy))) continue;
                 if (sy.st_name >= 0x10000) continue;
-                if (!ahb_safe_read(nmbuf, (uintptr_t)(strtab + sy.st_name),
-                                   sizeof(nmbuf) - 1)) continue;
-                nmbuf[sizeof(nmbuf) - 1] = 0;
-                {
-                    /* 必须保证读到 NUL，否则不是合法符号名 */
-                    size_t nl = strnlen(nmbuf, sizeof(nmbuf) - 1);
-                    if (nl == sizeof(nmbuf) - 1) continue;
-                    nm = nmbuf;
-                }
+                if (!ahb_safe_read_str(nmbuf, (uintptr_t)(strtab + sy.st_name),
+                                       sizeof(nmbuf))) continue;
+                nm = nmbuf;
                 repl = ahb_repl_for(nm);
                 if (!repl) continue;
                 /*
@@ -1541,7 +1658,27 @@ static int ahb_patch_one_so(ahb_so_ent *so) {
                  * 绝不能顺带接管 libc 的 open/fopen —— 那会让模块自己的
                  * 日志写入递归回包装函数。
                  */
-                if (ahb_is_libc(so->path) && strcmp(nm, "process_vm_readv") != 0) {
+                /*
+                 * dlopen / android_dlopen_ext 是"纯转发"监听点：
+                 * 我们只是等它返回后补一次 GOT，返回值和 errno 原样透传，
+                 * 不改变任何语义，因此可以安全地装在系统库里。
+                 *
+                 * 而 open/read/syscall 这些会改写返回内容，装在系统库里
+                 * 会破坏图形驱动等组件（实测 Vulkan abort），所以只装应用侧。
+                 *
+                 * 这个区分是必要的：加载检测器库的动作正是系统库做的
+                 * （libnativeloader / System.loadLibrary 那条路），
+                 * 如果只在应用侧装 dlopen，就永远收不到那个通知，
+                 * 补丁只能靠轮询，实测晚了 138ms —— 那时检测早已跑完。
+                 */
+                if (strcmp(nm, "dlopen") == 0 || strcmp(nm, "android_dlopen_ext") == 0) {
+                    /* 允许：纯转发，不改语义 */
+                }
+                else if (!ahb_so_is_app_side(so->path)) {
+                    /* 系统库只装 dlopen 监听，其余一律不碰 */
+                    continue;
+                }
+                else if (ahb_is_libc(so->path) && strcmp(nm, "process_vm_readv") != 0) {
                     continue;
                 }
                 so->has_target = 1;
@@ -1557,7 +1694,8 @@ static int ahb_patch_one_so(ahb_so_ent *so) {
                 patched++;
                 g_maps_got_patched++;
                 /* 记录接管的符号名：排查"pvr 到底接没接上"必须看到这一行 */
-                if (strcmp(nm, "process_vm_readv") == 0 || strcmp(nm, "syscall") == 0) {
+                if (strcmp(nm, "process_vm_readv") == 0 || strcmp(nm, "syscall") == 0 ||
+                    strstr(so->path, "libantihook.so") != NULL) {
                     ahb_filelog("MAPS key %s slot=%p path=%s", nm, (void *)slot, so->path);
                 }
                 /*
@@ -1572,7 +1710,11 @@ static int ahb_patch_one_so(ahb_so_ent *so) {
         }
     }
     if (patched) {
-        ahb_filelog("MAPS lib %s patched=%d", so->path, patched);
+        {
+            struct timespec _t; clock_gettime(CLOCK_BOOTTIME, &_t);
+            ahb_filelog("MAPS lib %s patched=%d t=%lld", so->path, patched,
+                        (long long)_t.tv_sec * 1000000000LL + _t.tv_nsec);
+        }
     } else if (so->has_target) {
         /* 有目标符号但一个槽都没写成功：必须留证，这类库会一直重试 */
         ahb_filelog("MAPS lib %s has_target_but_patched=0", so->path);
@@ -1719,9 +1861,26 @@ static int maps_patch_got_all_locked(void) {
     }
 
     maps_resolve_reals();
-    if (!g_real_fopen) return 0;
-    fp = g_real_fopen("/proc/self/maps", "r");
-    if (!fp) return 0;
+    /*
+     * 读 maps 不能依赖 g_real_fopen。
+     *
+     * dlsym(RTLD_NEXT, "fopen") 只在 maps_resolve_reals 里赋值，而这个函数
+     * 本身又可能因为 g_real_fopen 为 NULL 提前返回 —— 自己把自己的门堵上。
+     * 实测后果：整个补丁函数一声不响返回 0，一行 ahb_patch_one_so 都不执行，
+     * 于是所有 GOT 补丁全都没装上，maps 过滤形同虚设。
+     *
+     * 改用 maps_read_all：它走真实的 openat/read/close syscall，不经过
+     * 任何被自己接管的函数，不存在自锁。
+     */
+    {
+        char *mbuf = NULL;
+        size_t mcap = 0;
+        int mlen = maps_read_all(&mbuf, &mcap);
+        if (mlen <= 0) { if (mbuf) free(mbuf); return 0; }
+        free(g_maps_snap);
+        g_maps_snap = mbuf;        /* 交给下面的逐行解析 */
+        g_maps_snap_len = (size_t)mlen;
+    }
 
     if (!g_enable_maps_hide || g_disable_all_patch) return 0;
     before = g_maps_got_patched;
@@ -1738,9 +1897,18 @@ static int maps_patch_got_all_locked(void) {
     g_so_n = 0;
     ahb_seg_reset();
     /* 由调用方决定是否需要本次扫描，这里不再额外判断 */
-    while (fgets(line, sizeof(line), fp)) {
+    {
+    const char *cur = g_maps_snap;
+    const char *lim = g_maps_snap ? g_maps_snap + g_maps_snap_len : NULL;
+    while (cur && lim && cur < lim) {
+        const char *nl = (const char *)memchr(cur, '\n', (size_t)(lim - cur));
+        size_t llen = nl ? (size_t)(nl - cur) : (size_t)(lim - cur);
         unsigned long long s = 0, e = 0, off = 0;
         char perm[16] = {0}, path[AHB_PATH_MAX] = {0};
+        if (llen >= sizeof(line)) llen = sizeof(line) - 1;
+        memcpy(line, cur, llen);
+        line[llen] = 0;
+        cur = nl ? nl + 1 : lim;
         if (sscanf(line, "%llx-%llx %15s %llx %*s %*s %319[^\n]",
                    &s, &e, perm, &off, path) < 4) continue;
         if (path[0] != '/') continue;
@@ -1759,7 +1927,7 @@ static int maps_patch_got_all_locked(void) {
         ahb_seg_add((uintptr_t)s, (uintptr_t)e, perm);
         ahb_so_note(path, (uintptr_t)s, (uintptr_t)off);
     }
-    fclose(fp);
+    }
 
     {
         static int rep = 0;
@@ -1786,3 +1954,71 @@ static int maps_patch_got_all_locked(void) {
 }
 
 #endif /* AHB_MAPS_HIDE_H */
+
+/* 供 native_main.c 的 fd 级过滤使用 */
+int maps_make_clean_fd_public(void) { return maps_make_clean_fd(); }
+
+/* 供 dlopen 包装在"新库映射完成、JNI_OnLoad 尚未执行"这个时刻强制补一遍 */
+void ahb_force_rescan(void);
+
+/*
+ * 在 dlopen 返回点补丁，但**只补刚刚加载进来的那个库**。
+ *
+ * 为什么不做全量重扫：dlopen 会在图形驱动、编解码器等关键路径上被频繁调用，
+ * 每次都在那里遍历几百个库的 ELF 重定位表，既慢又容易在别人的临界区里
+ * 触发重入。实测全量重扫那次直接把 Vulkan 初始化搞崩了。
+ *
+ * 做法：记下调用前的模块数，返回后遍历 phdr，只处理新出现的那个。
+ */
+void ahb_force_rescan(void) {
+    static int in_progress = 0;
+    int old_deb;
+    if (in_progress) return;             /* 防重入 */
+    in_progress = 1;
+    /*
+     * 跳过去抖，让这次一定真扫。
+     *
+     * 真正的增量由 ahb_patch_one_so 的 tried 标记保证：已处理过的库直接
+     * 返回，只有刚 dlopen 进来的那个会真正解析重定位表。所以这里调
+     * 全量入口的开销只是"读一次 maps + 遍历一遍表"，几毫秒量级。
+     */
+    old_deb = g_maps_no_debounce;
+    g_maps_no_debounce = 1;
+    maps_patch_got_all();
+    g_maps_no_debounce = old_deb;
+    in_progress = 0;
+}
+
+/* dlopen 包装：真实加载完成后立刻补 GOT，早于 ART 调用 JNI_OnLoad */
+typedef void *(*ahb_dlopen_fn)(const char *, int);
+static ahb_dlopen_fn g_real_dlopen = NULL;
+static int g_tr_in_dlopen = 0;
+
+void *ahb_dlopen_wrap(const char *name, int flags) {
+    void *h;
+    if (!g_real_dlopen) g_real_dlopen = (ahb_dlopen_fn)dlsym(RTLD_NEXT, "dlopen");
+    if (!g_real_dlopen) g_real_dlopen = (ahb_dlopen_fn)dlsym(RTLD_DEFAULT, "dlopen");
+    if (!g_real_dlopen) return NULL;
+    h = g_real_dlopen(name, flags);
+    if (h && !g_tr_in_dlopen) {
+        g_tr_in_dlopen = 1;
+        ahb_force_rescan();
+        g_tr_in_dlopen = 0;
+    }
+    return h;
+}
+
+void *ahb_android_dlopen_ext_wrap(const char *name, int flags, const void *extinfo) {
+    typedef void *(*ext_fn)(const char *, int, const void *);
+    static ext_fn real = NULL;
+    void *h;
+    if (!real) real = (ext_fn)dlsym(RTLD_NEXT, "android_dlopen_ext");
+    if (!real) return NULL;
+    h = real(name, flags, extinfo);
+    if (h && !g_tr_in_dlopen) {
+        g_tr_in_dlopen = 1;
+        ahb_force_rescan();
+        g_tr_in_dlopen = 0;
+    }
+    return h;
+}

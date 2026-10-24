@@ -23,8 +23,8 @@ def build():
     # 但它是 APK 的身份标识，缺了系统直接报 Failed to parse APK。
     w.start('manifest', [
         ('package', 'com.rev.antihookbypass', 'str'),
-        ('versionCode', 6, 'int'),
-        ('versionName', '2.5', 'str'),
+        ('versionCode', 7, 'int'),
+        ('versionName', '2.6', 'str'),
     ], ns=NS)
 
     # <uses-sdk> —— 显式声明，apksigner 靠它判断 minSdk
