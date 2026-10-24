@@ -29,6 +29,11 @@ build_abi() {
         -I"$SYS/usr/include" -I"$SYS/usr/include/$libdir" \
         -c "$ROOT/module/jni/engine_glue.c" -o "$d/engine_glue.o"
 
+    clang --target="$target" --sysroot="$SYS" \
+        -O2 -fPIC -nostdlib \
+        -I"$SYS/usr/include" -I"$SYS/usr/include/$libdir" \
+        -c "$ROOT/module/jni/jnihooks.c" -o "$d/jnihooks.o"
+
     clang++ --target="$target" --sysroot="$SYS" \
         -O2 -fPIC -nostdlib -fno-exceptions -fno-rtti \
         -I"$ROOT/module/jni" -I"$SYS/usr/include" -I"$SYS/usr/include/$libdir" \
@@ -39,7 +44,7 @@ build_abi() {
         "$SYS/usr/lib/$libdir/21/crtend_so.o" \
         -L"$SYS/usr/lib/$libdir/21" \
         -o "$ROOT/module/zygisk/$abi.so" \
-        "$d/module.o" "$d/engine_glue.o" "$d/native_main.o" \
+        "$d/module.o" "$d/engine_glue.o" "$d/jnihooks.o" "$d/native_main.o" \
         -lc -ldl -llog
 
     echo "    OK $(stat -c%s "$ROOT/module/zygisk/$abi.so") B"

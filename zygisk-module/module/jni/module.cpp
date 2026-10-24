@@ -33,6 +33,9 @@ extern "C" {
     /* maps_hide.h 暴露的桥：符号清单 + 名字到替换函数的映射 */
     const char *const *ahb_got_sym_list(void);
     void *ahb_got_repl(const char *name);
+    /* jnihooks.c：用官方 hookJniNativeMethods 装 JNI 层 hook */
+    int ahb_install_jni_hooks(JNIEnv *env,
+                              void (*hk)(JNIEnv *, const char *, JNINativeMethod *, int));
 }
 
 /*
@@ -156,6 +159,10 @@ static int got_phdr_cb(struct dl_phdr_info *info, size_t, void *data) {
  *   - 按 dev+inode 定位库，天然不会认错同名库
  *   - 一次 commit 生效，没有"扫一半崩了"的中间态
  */
+/* 给 C 侧用的 api 句柄（JNI hook 安装需要一个裸函数指针，不能带 C++ this） */
+static zygisk::Api *g_api_for_jni = nullptr;
+static zygisk::Api *zygisk_api_for_jni(void) { return g_api_for_jni; }
+
 static int install_got_hooks_via_api(zygisk::Api *api) {
     const char *const *syms;
     GotCtx ctx;
@@ -218,6 +225,7 @@ public:
             }
         }
         ZLOGE("postAppSpecialize 启动引擎 pkg=%s", pkg ? pkg : "(null)");
+        g_api_for_jni = api_;
 
         /*
          * 先走官方 pltHookRegister 装 GOT 补丁，再启动引擎。
@@ -227,6 +235,18 @@ public:
          * 引擎先跑起来那几毫秒里读到的是未过滤视图。
          */
         install_got_hooks_via_api(api_);
+
+        /*
+         * 再装 JNI 层 hook。
+         *
+         * 顺序在 GOT 之后：Field.get 的改写依赖 String 的 value 字段
+         * 能被正常读到，而那条路走 GetFieldID，不经过 GOT；
+         * 放后面只是为了让日志顺序和依赖链条一致，便于排查。
+         */
+        ahb_install_jni_hooks(env_,
+            [](JNIEnv *e, const char *cn, JNINativeMethod *m, int n) {
+                zygisk_api_for_jni()->hookJniNativeMethods(e, cn, m, n);
+            });
 
         ahb_zygisk_engine_init(env_, pkg);
     }
