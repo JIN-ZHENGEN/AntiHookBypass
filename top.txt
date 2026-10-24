@@ -1,0 +1,294 @@
+---- TIME 2026/10/24 20:23:46 ----
+TASK 11054:com.cshlolss.antihook.detect id=150 userId=0 displayId=6(type=VIRTUAL)
+  ACTIVITY com.cshlolss.antihook.detect/.MainActivity 9af90a2 pid=23318 userId=0 uid=11054 displayId=6(type=VIRTUAL)
+    Failure while dumping the activity: java.io.IOException: Timeout
+
+TASK 10379:com.zhenxi.hunter id=151 userId=0 displayId=6(type=VIRTUAL)
+  ACTIVITY com.zhenxi.hunter/.MainActivity 330a65e pid=30195 userId=0 uid=10379 displayId=6(type=VIRTUAL)
+    Local Activity 4f13c1c State:
+      mResumed=true mStopped=false mFinished=false
+      mIsInMultiWindowMode=false mIsInPictureInPictureMode=false
+      mChangingConfigurations=false
+      mCurrentConfig={1.0 ??mcc??mnc [zh_CN] ldltr sw360dp w360dp h784dp 480dpi nrml long compactNeeded port -touch -keyb/v/h -nav/h winConfig={ mBounds=Rect(0, 0 - 1080, 2352) mAppBounds=Rect(0, 0 - 1080, 2352) mMaxBounds=Rect(0, 0 - 1080, 2352) mDisplayRotation=ROTATION_0 mWindowingMode=fullscreen mActivityType=standard mAlwaysOnTop=undefined mRotation=ROTATION_0} s.2 fontWeightAdjustment=0mThemeChanged= 0, mThemeChangedFlags= 0, mFlipFont= 0, mScenario= 0, mAccessibleChanged= -1, mUxIconConfig= 201e177015180120, mMaterialColor= 0, mUserId= 0, mFontUserId= 0, mFontVariationSettings= 1226, mFoldingAngle = -1.0, mIconPackName= , mDarkModeBackgroundMaxL= 0.0, mDarkModeDialogBgMaxL= 27.0, mDarkModeForegroundMinL= 100.0, mOplusConfigType= 1, mOplusChangedConfigs= 0, OpSans= -1, mBurmeseFontFlag= 2, mFlag= 0, mExtraFlag= 0, mFlexibleActivitySuitable= -1, mPuttDisplayFlag= -1}
+      mLoadersStarted=true
+      Active Fragments in 18a6a3c:
+        #0: QN{ab5b3c5 #0 androidx.lifecycle.LifecycleDispatcher.report_fragment_tag}
+          mFragmentId=#0 mContainerId=#0 mTag=androidx.lifecycle.LifecycleDispatcher.report_fragment_tag
+          mState=5 mIndex=0 mWho=android:fragment:0 mBackStackNesting=0
+          mAdded=true mRemoving=false mFromLayout=false mInLayout=false
+          mHidden=false mDetached=false mMenuVisible=true mHasMenu=false
+          mRetainInstance=false mRetaining=false mUserVisibleHint=true
+          mFragmentManager=FragmentManager{18a6a3c in HostCallbacks{b81c11a}}
+          mHost=android.app.Activity$HostCallbacks@b81c11a
+          Child FragmentManager{331544b in QN{ab5b3c5}}:
+            FragmentManager misc state:
+              mHost=android.app.Activity$HostCallbacks@b81c11a
+              mContainer=android.app.Fragment$1@b1ee28
+              mParent=QN{ab5b3c5 #0 androidx.lifecycle.LifecycleDispatcher.report_fragment_tag}
+              mCurState=5 mStateSaved=false mDestroyed=false
+      Added Fragments:
+        #0: QN{ab5b3c5 #0 androidx.lifecycle.LifecycleDispatcher.report_fragment_tag}
+      FragmentManager misc state:
+        mHost=android.app.Activity$HostCallbacks@b81c11a
+        mContainer=android.app.Activity$HostCallbacks@b81c11a
+        mCurState=5 mStateSaved=false mDestroyed=false
+    ViewRoot:
+      mAdded=true
+      mRemoved=false
+      mStopped=false
+      mPausedForTransition=false
+      mConsumeBatchedInputScheduled=false
+      mConsumeBatchedInputImmediatelyScheduled=false
+      mPendingInputEventCount=0
+      mProcessInputEventsScheduled=false
+      mTraversalScheduled=false
+      mReportNextDraw=false
+      mLastDisplaySource=From Constructor 6 state 2 caller 
+      mLastDisplayStateSource=State 2 caller 
+      mLastDisplayListenerState=registerListeners , time 1792844568136 caller 
+      mLastScheduleTraversalsInfo=mLastScheduleTraversalTime=0,CurrentTime=95778641
+      mLastReportedMergedConfiguration={mGlobalConfig={1.0 ??mcc??mnc [zh_CN] ldltr sw360dp w360dp h784dp 480dpi nrml long compactNeeded port -touch -keyb/v/h -nav/h winConfig={ mBounds=Rect(0, 0 - 1080, 2352) mAppBounds=Rect(0, 0 - 1080, 2352) mMaxBounds=Rect(0, 0 - 1080, 2352) mDisplayRotation=ROTATION_0 mWindowingMode=fullscreen mActivityType=undefined mAlwaysOnTop=undefined mRotation=ROTATION_0} s.195 fontWeightAdjustment=0mThemeChanged= 0, mThemeChangedFlags= 0, mFlipFont= 0, mScenario= 0, mAccessibleChanged= -1, mUxIconConfig= 201e177015180120, mMaterialColor= 0, mUserId= 0, mFontUserId= 0, mFontVariationSettings= 1226, mFoldingAngle = -1.0, mIconPackName= , mDarkModeBackgroundMaxL= 0.0, mDarkModeDialogBgMaxL= 27.0, mDarkModeForegroundMinL= 100.0, mOplusConfigType= 1, mOplusChangedConfigs= 0, OpSans= -1, mBurmeseFontFlag= 2, mFlag= 0, mExtraFlag= 0, mFlexibleActivitySuitable= -1, mPuttDisplayFlag= -1} mOverrideConfig={0.0 ?mcc??mnc ?localeList ?layoutDir sw360dp w360dp h784dp 480dpi nrml long compactNeeded port ?uimode ?night -touch -keyb/v/h -nav/h winConfig={ mBounds=Rect(0, 0 - 1080, 2352) mAppBounds=Rect(0, 0 - 1080, 2352) mMaxBounds=Rect(0, 0 - 1080, 2352) mDisplayRotation=ROTATION_0 mWindowingMode=fullscreen mActivityType=standard mAlwaysOnTop=undefined mRotation=ROTATION_0} s.2 ?fontWeightAdjustmentmThemeChanged= 0, mThemeChangedFlags= 0, mFlipFont= 0, mScenario= 0, mAccessibleChanged= 0, mUxIconConfig= 0, mMaterialColor= ffffffffffffffff, mUserId= -1, mFontUserId= -1, mFontVariationSettings= ffffffff, mFoldingAngle = -1.0, mIconPackName= , mDarkModeBackgroundMaxL= -1.0, mDarkModeDialogBgMaxL= -1.0, mDarkModeForegroundMinL= -1.0, mOplusConfigType= 0, mOplusChangedConfigs= 0, OpSans= -1, mBurmeseFontFlag= -1, mFlag= 0, mExtraFlag= 0, mFlexibleActivitySuitable= -1, mPuttDisplayFlag= -1}}
+      mLastConfigurationFromResources={1.0 ??mcc??mnc [zh_CN] ldltr sw360dp w360dp h784dp 480dpi nrml long compactNeeded port -touch -keyb/v/h -nav/h winConfig={ mBounds=Rect(0, 0 - 1080, 2352) mAppBounds=Rect(0, 0 - 1080, 2352) mMaxBounds=Rect(0, 0 - 1080, 2352) mDisplayRotation=ROTATION_0 mWindowingMode=fullscreen mActivityType=standard mAlwaysOnTop=undefined mRotation=ROTATION_0} s.2 fontWeightAdjustment=0mThemeChanged= 0, mThemeChangedFlags= 0, mFlipFont= 0, mScenario= 0, mAccessibleChanged= -1, mUxIconConfig= 201e177015180120, mMaterialColor= 0, mUserId= 0, mFontUserId= 0, mFontVariationSettings= 1226, mFoldingAngle = -1.0, mIconPackName= , mDarkModeBackgroundMaxL= 0.0, mDarkModeDialogBgMaxL= 27.0, mDarkModeForegroundMinL= 100.0, mOplusConfigType= 1, mOplusChangedConfigs= 0, OpSans= -1, mBurmeseFontFlag= 2, mFlag= 0, mExtraFlag= 0, mFlexibleActivitySuitable= -1, mPuttDisplayFlag= -1}
+      ViewRootImplExtImpl
+        mCancelDrawCount:0
+        mWaitingLastSyncDraw:false
+        showDecorNavBarBg: false
+        mDecorNavigationBarColor: 0
+        NotShowDecorNavBarBg: EdgeToEdgeEnforced
+      OplusSystemUINavigationGesture
+      packageName:com.zhenxi.hunter ,systemGestureExclusionChanged rect = SkRegion()
+      mLastReportedActivityWindowInfo=ActivityWindowInfo{isEmbedded=false, taskBounds=Rect(0, 0 - 1080, 2352), taskFragmentBounds=Rect(0, 0 - 1080, 2352)}
+      mIsAmbientMode=false
+      mUnbufferedInputSource=0
+      mIsHardwareRendererOutputDisabledfalse
+      mIsDisablingViewAnimationsRequestedfalse
+      mAttachInfo=       AttachInfo:
+        mHasWindowFocus=false
+        mWindowVisibility=0
+        mInTouchMode=true
+        mUnbufferedDispatchRequested=false
+      android.view.ViewRootImpl$NativePreImeInputStage: mQueueLength=0
+      android.view.ViewRootImpl$ImeInputStage: mQueueLength=0
+      android.view.ViewRootImpl$NativePostImeInputStage: mQueueLength=0
+      android.view.ViewRootImpl$WindowInputEventReceiver
+       mSeqMap: {}
+       mReceiverPtr:
+        mBatchedInputEventPending: false
+        mOutboundQueue:
+        {}  <empty>
+        
+    Choreographer:
+      mFrameScheduled=false
+      mLastFrameTime=95751022 (27619 ms ago)
+    InsetsController:
+        InsetsState
+          mDisplayFrame=Rect(0, 0 - 1080, 2352)
+          mDisplayCutout=DisplayCutout{insets=Rect(0, 0 - 0, 0) waterfall=Insets{left=0, top=0, right=0, bottom=0} boundingRect={Bounds=[Rect(0, 0 - 0, 0), Rect(0, 0 - 0, 0), Rect(0, 0 - 0, 0), Rect(0, 0 - 0, 0)]} cutoutPathParserInfo={CutoutPathParserInfo{displayWidth=0 displayHeight=0 physicalDisplayWidth=0 physicalDisplayHeight=0 density={0.0} cutoutSpec={} rotation={0} scale={0.0} physicalPixelDisplaySizeRatio={0.0}}} sideOverrides=null}
+          mRoundedCorners=RoundedCorners{[RoundedCorner{position=TopLeft, radius=0, center=Point(0, 0)}, RoundedCorner{position=TopRight, radius=0, center=Point(0, 0)}, RoundedCorner{position=BottomRight, radius=0, center=Point(0, 0)}, RoundedCorner{position=BottomLeft, radius=0, center=Point(0, 0)}]}
+          mRoundedCornerFrame=Rect(0, 0 - 1080, 2352)
+          mPrivacyIndicatorBounds=PrivacyIndicatorBounds {static bounds=null rotation=0}
+          mDisplayShape=DisplayShape{type=3, displayWidth=1080, displayHeight=2352, physicalPixelDisplaySizeRatio=1.0, rotation=0, offsetX=0, offsetY=0, scale=1.0}
+        mIsPredictiveBackImeHideAnimInProgress=false
+        mFrame=Rect(0, 0 - 1080, 2352)
+    WindowOnBackDispatcher:
+        Top Callback: android.app.Activity$2@48ae015
+        Callbacks: 
+          Callback: android.app.Activity$2@48ae015 Priority=-1
+    ImeBackAnimationController:
+        mLastProgress=0.0
+        mTriggerBack=false
+        mIsPreCommitAnimationInProgress=false
+        mStartRootScrollY=0
+        isBackAnimationAllowed=true
+        isAdjustPan=false
+        isHideAnimationInProgress=false
+    View Hierarchy:
+      com.android.internal.policy.DecorView{98cd9be V.E...... R....... 0,0-1080,2352 alpha=1.0 viewInfo = }[MainActivity]
+        android.widget.LinearLayout{ac01893 V.E...... ........ 0,0-1080,2352 alpha=1.0 viewInfo = }
+          android.view.ViewStub{d42c741 G.E...... ......I. 0,0-0,0 #10201ff android:id/action_mode_bar_stub alpha=1.0 viewInfo = }
+          android.widget.FrameLayout{d0b4982 V.E...... ........ 0,0-1080,2352 alpha=1.0 viewInfo = }
+            androidx.appcompat.widget.FitWindowsLinearLayout{957fccd V.E...... ........ 0,0-1080,2352 #7f090037 app:id/Zhenxi alpha=1.0 viewInfo = }
+              androidx.appcompat.widget.ViewStubCompat{b6ad4e6 G.E...... ......I. 0,0-0,0 #7f090042 app:id/Zhenxi alpha=1.0 viewInfo = }
+              androidx.appcompat.widget.ContentFrameLayout{7639264 V.E...... ........ 0,0-1080,2352 #1020002 android:id/content alpha=1.0 viewInfo = }
+                androidx.coordinatorlayout.widget.CoordinatorLayout{6633f7 V.E...... ........ 0,0-1080,2352 #7f09008e app:id/Zhenxi alpha=1.0 viewInfo = }
+                  com.google.android.material.appbar.AppBarLayout{40502b8 V.E...... ........ 0,0-1080,168 #7f090054 app:id/Zhenxi alpha=1.0 viewInfo = }
+                    com.google.android.material.appbar.MaterialToolbar{2a87bce V.E...... ........ 0,0-1080,168 #7f090225 app:id/Zhenxi alpha=1.0 viewInfo = }
+                      YouAreLoser.n4{6c9aaef V.ED..... ........ 48,12-239,93 alpha=1.0 viewInfo = }
+                      androidx.appcompat.widget.ActionMenuView{e7498c9 V.E...... ........ 960,0-1080,168 alpha=1.0 viewInfo = }
+                        YouAreLoser.o1{ff970d0 VFED..CL. ........ 0,12-120,156 alpha=1.0 viewInfo = }
+                      YouAreLoser.n4{4763920 V.ED..... ........ 48,93-322,158 alpha=1.0 viewInfo = }
+                  androidx.recyclerview.widget.RecyclerView{f466891 VFED..... ........ 0,168-1080,2352 #7f09012a app:id/Zhenxi alpha=1.0 viewInfo = }
+                    android.widget.LinearLayout{f9d1d65 V.E...... ........ 0,0-1080,2108 #7f090125 app:id/Zhenxi alpha=1.0 viewInfo = }
+                      androidx.appcompat.widget.AppCompatImageView{5f87a3a VFED..C.. ........ 360,270-720,630 #7f09010f app:id/Zhenxi alpha=1.0 viewInfo = }
+                      YouAreLoser.UD{2e5e6eb VFED..CL. ........ 72,702-1008,854 #7f09024b app:id/Zhenxi alpha=1.0 viewInfo = }
+                      android.widget.LinearLayout{9e40006 V.E...... ........ 0,926-1080,2108 #7f090121 app:id/Zhenxi alpha=1.0 viewInfo = }
+                        android.widget.LinearLayout{7c72ae1 V.E...... ........ 48,96-1032,1182 alpha=1.0 viewInfo = }
+                          YouAreLoser.UD{d011c48 VFED..CL. ........ 48,48-397,113 alpha=1.0 viewInfo = }
+                          YouAreLoser.UD{8ba06c7 VFED..CL. ........ 48,125-936,592 #7f09023a app:id/Zhenxi alpha=1.0 viewInfo = }
+                          YouAreLoser.UD{93eea27 VFED..CL. ........ 48,616-551,681 #7f090242 app:id/Zhenxi alpha=1.0 viewInfo = }
+                          YouAreLoser.UD{c4bc4d4 VFED..CL. ........ 48,693-452,746 #7f090240 app:id/Zhenxi alpha=1.0 viewInfo = }
+                          YouAreLoser.UD{233967d VFED..CL. ........ 48,770-587,835 #7f090247 app:id/Zhenxi alpha=1.0 viewInfo = }
+                          YouAreLoser.UD{b6aaadc VFED..CL. ........ 48,847-936,1038 #7f090244 app:id/Zhenxi alpha=1.0 viewInfo = }
+                    android.widget.LinearLayout{eec2fb7 V.E...... ........ 0,2108-1080,2349 #7f090125 app:id/Zhenxi alpha=1.0 viewInfo = }
+                      android.widget.LinearLayout{3674842 V.E...... ........ 0,0-1080,241 #7f090121 app:id/Zhenxi alpha=1.0 viewInfo = }
+                        android.widget.LinearLayout{73dbe8d V.E...... ........ 48,48-1032,241 alpha=1.0 viewInfo = }
+                          android.widget.LinearLayout{fa44324 V.E...C.. ........ 48,48-936,145 #7f090128 app:id/Zhenxi alpha=1.0 viewInfo = }
+                            YouAreLoser.UD{a1053 V.ED..... ........ 0,12-486,85 alpha=1.0 viewInfo = }
+                            YouAreLoser.UD{8746d90 V.ED..... ........ 486,24-780,73 #7f090235 app:id/Zhenxi alpha=1.0 viewInfo = }
+                            androidx.appcompat.widget.AppCompatImageView{54b689 V.ED..... ........ 816,12-888,84 #7f09010c app:id/Zhenxi alpha=1.0 viewInfo = }
+                          android.widget.LinearLayout{97f5972 G.E...... ......I. 0,0-0,0 #7f090124 app:id/Zhenxi alpha=1.0 viewInfo = }
+                            android.widget.LinearLayout{8a601c3 V.E...... ......I. 0,0-0,0 #7f090126 app:id/Zhenxi alpha=1.0 viewInfo = }
+                              YouAreLoser.UD{30a5a40 V.ED..... ......ID 0,0-0,0 alpha=1.0 viewInfo = }
+                              YouAreLoser.UD{681d79 V.ED..... ......ID 0,0-0,0 alpha=1.0 viewInfo = }
+                            android.widget.LinearLayout{9e59abe G.E...... ......I. 0,0-0,0 #7f090122 app:id/Zhenxi alpha=1.0 viewInfo = }
+                              YouAreLoser.UD{8dcf71f V.ED..... ......ID 0,0-0,0 alpha=1.0 viewInfo = }
+                              android.widget.LinearLayout{a5ada6c V.E...... ......I. 0,0-0,0 alpha=1.0 viewInfo = }
+                                com.github.mikephil.charting.charts.PieChart{2c41835 V.ED..... ......I. 0,0-0,0 #7f090089 app:id/Zhenxi alpha=1.0 viewInfo = }
+                                android.widget.LinearLayout{adca4ca V.E...... ......I. 0,0-0,0 alpha=1.0 viewInfo = }
+                                  YouAreLoser.UD{863e63b V.ED..... ......ID 0,0-0,0 #7f09024d app:id/Zhenxi alpha=1.0 viewInfo = }
+                                  YouAreLoser.UD{f513158 V.ED..... ......ID 0,0-0,0 #7f09024f app:id/Zhenxi alpha=1.0 viewInfo = }
+                                  YouAreLoser.UD{4ab02b1 V.ED..... ......ID 0,0-0,0 #7f09024e app:id/Zhenxi alpha=1.0 viewInfo = }
+                              YouAreLoser.UD{d884396 V.ED..... ......ID 0,0-0,0 alpha=1.0 viewInfo = }
+                              android.widget.LinearLayout{3a0ab17 V.E...... ......I. 0,0-0,0 #7f090127 app:id/Zhenxi alpha=1.0 viewInfo = }
+                            YouAreLoser.UD{a540b04 G.ED..... ......I. 0,0-0,0 #7f090144 app:id/Zhenxi alpha=1.0 viewInfo = }
+    Looper (main, tid 2) {a3c18ed}
+      (MessageQueue is using Legacy implementation)
+      (Total messages: 0, polling=false, quitting=false)
+    ResourcesManager:
+      total apks: 9
+      resources: 5
+      resource impls: 5
+      
+      context: com.zhenxi.hunter.App@4c913fe
+      res: android.content.res.Resources@117e2b7
+      res: {1.0 ??mcc??mnc [zh_CN] ldltr sw360dp w360dp h784dp 480dpi nrml long compactNeeded port -touch -keyb/v/h -nav/h winConfig={ mBounds=Rect(0, 0 - 1080, 2352) mAppBounds=Rect(0, 0 - 1080, 2352) mMaxBounds=Rect(0, 0 - 1080, 2352) mDisplayRotation=ROTATION_0 mWindowingMode=fullscreen mActivityType=undefined mAlwaysOnTop=undefined mRotation=ROTATION_0} s.195 fontWeightAdjustment=0mThemeChanged= 0, mThemeChangedFlags= 0, mFlipFont= 0, mScenario= 0, mAccessibleChanged= -1, mUxIconConfig= 201e177015180120, mMaterialColor= 0, mUserId= 0, mFontUserId= 0, mFontVariationSettings= 1226, mFoldingAngle = -1.0, mIconPackName= , mDarkModeBackgroundMaxL= 0.0, mDarkModeDialogBgMaxL= 27.0, mDarkModeForegroundMinL= 100.0, mOplusConfigType= 1, mOplusChangedConfigs= 0, OpSans= -1, mBurmeseFontFlag= 2, mFlag= 0, mExtraFlag= 0, mFlexibleActivitySuitable= -1, mPuttDisplayFlag= -1}
+      context: com.zhenxi.hunter.MainActivity@4f13c1c
+      res: android.content.res.Resources@21a0024
+      res: {1.0 ??mcc??mnc [zh_CN] ldltr sw360dp w360dp h784dp 480dpi nrml long compactNeeded port -touch -keyb/v/h -nav/h winConfig={ mBounds=Rect(0, 0 - 1080, 2352) mAppBounds=Rect(0, 0 - 1080, 2352) mMaxBounds=Rect(0, 0 - 1080, 2352) mDisplayRotation=ROTATION_0 mWindowingMode=fullscreen mActivityType=standard mAlwaysOnTop=undefined mRotation=ROTATION_0} s.2 fontWeightAdjustment=0mThemeChanged= 0, mThemeChangedFlags= 0, mFlipFont= 0, mScenario= 0, mAccessibleChanged= -1, mUxIconConfig= 201e177015180120, mMaterialColor= 0, mUserId= 0, mFontUserId= 0, mFontVariationSettings= 1226, mFoldingAngle = -1.0, mIconPackName= , mDarkModeBackgroundMaxL= 0.0, mDarkModeDialogBgMaxL= 27.0, mDarkModeForegroundMinL= 100.0, mOplusConfigType= 1, mOplusChangedConfigs= 0, OpSans= -1, mBurmeseFontFlag= 2, mFlag= 0, mExtraFlag= 0, mFlexibleActivitySuitable= -1, mPuttDisplayFlag= -1}
+      
+      1 token android.os.BinderProxy@d2e82d5
+      com.zhenxi.hunter/.MainActivity
+      overrideDisplayId 6
+      overrideConfig sw360dp-w360dp-h784dp-normal-long-notround-nowidecg-lowdr-port-xxhdpi-notouch-keysexposed-nokeys-navhidden-nonav-v37
+      1.1 
+      android.content.res.Resources@21a0024 --> android.content.res.ResourcesImpl@f7d0322 --> android.content.res.ResourcesImplExt@d7ae1b3
+      overrideDisplayId null
+      overrideConfig v37
+      {1.0 ??mcc??mnc [zh_CN] ldltr sw360dp w360dp h784dp 480dpi nrml long compactNeeded port -touch -keyb/v/h -nav/h winConfig={ mBounds=Rect(0, 0 - 1080, 2352) mAppBounds=Rect(0, 0 - 1080, 2352) mMaxBounds=Rect(0, 0 - 1080, 2352) mDisplayRotation=ROTATION_0 mWindowingMode=fullscreen mActivityType=standard mAlwaysOnTop=undefined mRotation=ROTATION_0} s.2 fontWeightAdjustment=0mThemeChanged= 0, mThemeChangedFlags= 0, mFlipFont= 0, mScenario= 0, mAccessibleChanged= -1, mUxIconConfig= 201e177015180120, mMaterialColor= 0, mUserId= 0, mFontUserId= 0, mFontVariationSettings= 1226, mFoldingAngle = -1.0, mIconPackName= , mDarkModeBackgroundMaxL= 0.0, mDarkModeDialogBgMaxL= 27.0, mDarkModeForegroundMinL= 100.0, mOplusConfigType= 1, mOplusChangedConfigs= 0, OpSans= -1, mBurmeseFontFlag= 2, mFlag= 0, mExtraFlag= 0, mFlexibleActivitySuitable= -1, mPuttDisplayFlag= -1}
+      
+      mResourceReferences:
+      
+      android.content.res.Resources@117e2b7 --> android.content.res.ResourcesImpl@188d370 --> android.content.res.ResourcesImplExt@4e56e9
+      android.content.res.Resources@7956e44 --> android.content.res.ResourcesImpl@10c2f6e --> android.content.res.ResourcesImplExt@5b7e60f
+      android.content.res.Resources@ab62861 --> android.content.res.ResourcesImpl@5ffb69c --> android.content.res.ResourcesImplExt@2c78a5
+      android.content.res.Resources@204599e --> android.content.res.ResourcesImpl@44fd47a --> android.content.res.ResourcesImplExt@916d42b
+      mResourceImpls:
+      
+      android.content.res.ResourcesImpl@f7d0322
+      ResourcesKey{ mHash=8f3f4b46 mResDir=/data/app/~~uw7tNvpMMHE0TZq8AkoLow==/com.zhenxi.hunter-Sgb3r2pn8c1SobJ4mba5Cw==/base.apk mSplitDirs=[] mOverlayDirs=[/product/overlay/NavigationBarModeGestural/NavigationBarModeGesturalOverlay.apk,/data/resource-cache/com.android.systemui-neutral-RHgX.frro,/data/resource-cache/com.android.systemui-accent-SryV.frro,/data/resource-cache/com.android.systemui-dynamic-AJXX.frro] mLibDirs=[] mDisplayId=6 mOverrideConfig=sw360dp-w360dp-h784dp-normal-long-notround-nowidecg-lowdr-port-xxhdpi-notouch-keysexposed-nokeys-navhidden-nonav-v37 mCompatInfo={640dpi always-compat} mLoaders=[]}
+      {1.0 ??mcc??mnc [zh_CN] ldltr sw360dp w360dp h784dp 480dpi nrml long compactNeeded port -touch -keyb/v/h -nav/h winConfig={ mBounds=Rect(0, 0 - 1080, 2352) mAppBounds=Rect(0, 0 - 1080, 2352) mMaxBounds=Rect(0, 0 - 1080, 2352) mDisplayRotation=ROTATION_0 mWindowingMode=fullscreen mActivityType=standard mAlwaysOnTop=undefined mRotation=ROTATION_0} s.2 fontWeightAdjustment=0mThemeChanged= 0, mThemeChangedFlags= 0, mFlipFont= 0, mScenario= 0, mAccessibleChanged= -1, mUxIconConfig= 201e177015180120, mMaterialColor= 0, mUserId= 0, mFontUserId= 0, mFontVariationSettings= 1226, mFoldingAngle = -1.0, mIconPackName= , mDarkModeBackgroundMaxL= 0.0, mDarkModeDialogBgMaxL= 27.0, mDarkModeForegroundMinL= 100.0, mOplusConfigType= 1, mOplusChangedConfigs= 0, OpSans= -1, mBurmeseFontFlag= 2, mFlag= 0, mExtraFlag= 0, mFlexibleActivitySuitable= -1, mPuttDisplayFlag= -1}
+      DisplayMetrics{density=3.0, width=1080, height=2352, scaledDensity=3.0, xdpi=480.0, ydpi=480.0}
+      
+      
+      android.content.res.ResourcesImpl@5ffb69c
+      ResourcesKey{ mHash=bf4424d0 mResDir=/system/framework/framework-res.apk mSplitDirs=[] mOverlayDirs=[/product/overlay/NavigationBarModeGestural/NavigationBarModeGesturalOverlay.apk,/data/resource-cache/com.android.systemui-neutral-RHgX.frro,/data/resource-cache/com.android.systemui-accent-SryV.frro,/data/resource-cache/com.android.systemui-dynamic-AJXX.frro] mLibDirs=[] mDisplayId=-1 mOverrideConfig=mcc460-mnc11-zh-rCN-ldltr-sw360dp-w360dp-h784dp-normal-long-notround-nowidecg-lowdr-port-notnight-xxhdpi-notouch-keysexposed-nokeys-navhidden-nonav-v37 mCompatInfo={640dpi always-compat} mLoaders=[android.content.res.loader.ResourcesLoader@be2ef86]}
+      {1.0 ??mcc??mnc [zh_CN] ldltr sw360dp w360dp h784dp 480dpi nrml long compactNeeded port -touch -keyb/v/h -nav/h winConfig={ mBounds=Rect(0, 0 - 1080, 2352) mAppBounds=Rect(0, 0 - 1080, 2352) mMaxBounds=Rect(0, 0 - 1080, 2352) mDisplayRotation=ROTATION_0 mWindowingMode=fullscreen mActivityType=undefined mAlwaysOnTop=undefined mRotation=ROTATION_0} s.10 fontWeightAdjustment=0mThemeChanged= 0, mThemeChangedFlags= 0, mFlipFont= 0, mScenario= 0, mAccessibleChanged= -1, mUxIconConfig= 201e177015180120, mMaterialColor= 0, mUserId= 0, mFontUserId= 0, mFontVariationSettings= 1226, mFoldingAngle = -1.0, mIconPackName= , mDarkModeBackgroundMaxL= 0.0, mDarkModeDialogBgMaxL= 27.0, mDarkModeForegroundMinL= 100.0, mOplusConfigType= 1, mOplusChangedConfigs= 0, OpSans= -1, mBurmeseFontFlag= 2, mFlag= 0, mExtraFlag= 0, mFlexibleActivitySuitable= -1, mPuttDisplayFlag= -1}
+      DisplayMetrics{density=3.0, width=1080, height=2352, scaledDensity=3.0, xdpi=515.1549, ydpi=507.35284}
+      
+      android.content.res.ResourcesImpl@188d370
+      ResourcesKey{ mHash=14b45e49 mResDir=/data/app/~~uw7tNvpMMHE0TZq8AkoLow==/com.zhenxi.hunter-Sgb3r2pn8c1SobJ4mba5Cw==/base.apk mSplitDirs=[] mOverlayDirs=[/product/overlay/NavigationBarModeGestural/NavigationBarModeGesturalOverlay.apk,/data/resource-cache/com.android.systemui-neutral-RHgX.frro,/data/resource-cache/com.android.systemui-accent-SryV.frro,/data/resource-cache/com.android.systemui-dynamic-AJXX.frro] mLibDirs=[] mDisplayId=-1 mOverrideConfig=v37 mCompatInfo={640dpi always-compat} mLoaders=[]}
+      {1.0 ??mcc??mnc [zh_CN] ldltr sw360dp w360dp h784dp 480dpi nrml long compactNeeded port -touch -keyb/v/h -nav/h winConfig={ mBounds=Rect(0, 0 - 1080, 2352) mAppBounds=Rect(0, 0 - 1080, 2352) mMaxBounds=Rect(0, 0 - 1080, 2352) mDisplayRotation=ROTATION_0 mWindowingMode=fullscreen mActivityType=undefined mAlwaysOnTop=undefined mRotation=ROTATION_0} s.195 fontWeightAdjustment=0mThemeChanged= 0, mThemeChangedFlags= 0, mFlipFont= 0, mScenario= 0, mAccessibleChanged= -1, mUxIconConfig= 201e177015180120, mMaterialColor= 0, mUserId= 0, mFontUserId= 0, mFontVariationSettings= 1226, mFoldingAngle = -1.0, mIconPackName= , mDarkModeBackgroundMaxL= 0.0, mDarkModeDialogBgMaxL= 27.0, mDarkModeForegroundMinL= 100.0, mOplusConfigType= 1, mOplusChangedConfigs= 0, OpSans= -1, mBurmeseFontFlag= 2, mFlag= 0, mExtraFlag= 0, mFlexibleActivitySuitable= -1, mPuttDisplayFlag= -1}
+      DisplayMetrics{density=3.0, width=1080, height=2352, scaledDensity=3.0, xdpi=515.1549, ydpi=507.35284}
+      
+      
+      android.content.res.ResourcesImpl@44fd47a
+      ResourcesKey{ mHash=14b78ce2 mResDir=/data/app/~~uw7tNvpMMHE0TZq8AkoLow==/com.zhenxi.hunter-Sgb3r2pn8c1SobJ4mba5Cw==/base.apk mSplitDirs=[] mOverlayDirs=[/product/overlay/NavigationBarModeGestural/NavigationBarModeGesturalOverlay.apk,/data/resource-cache/com.android.systemui-neutral-RHgX.frro,/data/resource-cache/com.android.systemui-accent-SryV.frro,/data/resource-cache/com.android.systemui-dynamic-AJXX.frro] mLibDirs=[] mDisplayId=6 mOverrideConfig=sw360dp-w360dp-h784dp-normal-long-port-xxhdpi-notouch-v37 mCompatInfo={640dpi always-compat} mLoaders=[]}
+      {1.0 ??mcc??mnc [zh_CN] ldltr sw360dp w360dp h784dp 480dpi nrml long compactNeeded port -touch -keyb/v/h -nav/h winConfig={ mBounds=Rect(0, 0 - 1080, 2352) mAppBounds=Rect(0, 0 - 1080, 2352) mMaxBounds=Rect(0, 0 - 1080, 2352) mDisplayRotation=ROTATION_0 mWindowingMode=fullscreen mActivityType=undefined mAlwaysOnTop=undefined mRotation=ROTATION_0} s.195 fontWeightAdjustment=0mThemeChanged= 0, mThemeChangedFlags= 0, mFlipFont= 0, mScenario= 0, mAccessibleChanged= -1, mUxIconConfig= 201e177015180120, mMaterialColor= 0, mUserId= 0, mFontUserId= 0, mFontVariationSettings= 1226, mFoldingAngle = -1.0, mIconPackName= , mDarkModeBackgroundMaxL= 0.0, mDarkModeDialogBgMaxL= 27.0, mDarkModeForegroundMinL= 100.0, mOplusConfigType= 1, mOplusChangedConfigs= 0, OpSans= -1, mBurmeseFontFlag= 2, mFlag= 0, mExtraFlag= 0, mFlexibleActivitySuitable= -1, mPuttDisplayFlag= -1}
+      DisplayMetrics{density=3.0, width=1080, height=2352, scaledDensity=3.0, xdpi=480.0, ydpi=480.0}
+      
+      
+      android.content.res.ResourcesImpl@10c2f6e
+      ResourcesKey{ mHash=157ff6d1 mResDir=/data/app/~~9FZG_hDqvvHRkca99S88GA==/com.google.android.gms-7s2JyOTaoqKqFP-MQ3MxmQ==/base.apk mSplitDirs=[/data/app/~~9FZG_hDqvvHRkca99S88GA==/com.google.android.gms-7s2JyOTaoqKqFP-MQ3MxmQ==/split_config.xxxhdpi.apk,/data/app/~~9FZG_hDqvvHRkca99S88GA==/com.google.android.gms-7s2JyOTaoqKqFP-MQ3MxmQ==/split_config.zh.apk] mOverlayDirs=[/product/overlay/NavigationBarModeGestural/NavigationBarModeGesturalOverlay.apk,/data/resource-cache/com.android.systemui-neutral-RHgX.frro,/data/resource-cache/com.android.systemui-accent-SryV.frro,/data/resource-cache/com.android.systemui-dynamic-AJXX.frro] mLibDirs=[/system/framework/org.apache.http.legacy.jar,/system/framework/com.android.location.provider.jar,/system/framework/com.android.media.remotedisplay.jar,/system_ext/framework/com.android.extensions.appfunctions.jar,/system_ext/framework/androidx.window.extensions.jar,/system_ext/framework/androidx.window.sidecar.jar] mDisplayId=-1 mOverrideConfig=v37 mCompatInfo={640dpi always-compat} mLoaders=[]}
+      {1.0 ??mcc??mnc [zh_CN] ldltr sw360dp w360dp h784dp 480dpi nrml long compactNeeded port -touch -keyb/v/h -nav/h winConfig={ mBounds=Rect(0, 0 - 1080, 2352) mAppBounds=Rect(0, 0 - 1080, 2352) mMaxBounds=Rect(0, 0 - 1080, 2352) mDisplayRotation=ROTATION_0 mWindowingMode=fullscreen mActivityType=undefined mAlwaysOnTop=undefined mRotation=ROTATION_0} s.195 fontWeightAdjustment=0mThemeChanged= 0, mThemeChangedFlags= 0, mFlipFont= 0, mScenario= 0, mAccessibleChanged= -1, mUxIconConfig= 201e177015180120, mMaterialColor= 0, mUserId= 0, mFontUserId= 0, mFontVariationSettings= 1226, mFoldingAngle = -1.0, mIconPackName= , mDarkModeBackgroundMaxL= 0.0, mDarkModeDialogBgMaxL= 27.0, mDarkModeForegroundMinL= 100.0, mOplusConfigType= 1, mOplusChangedConfigs= 0, OpSans= -1, mBurmeseFontFlag= 2, mFlag= 0, mExtraFlag= 0, mFlexibleActivitySuitable= -1, mPuttDisplayFlag= -1}
+      DisplayMetrics{density=3.0, width=1080, height=2352, scaledDensity=3.0, xdpi=515.1549, ydpi=507.35284}
+      
+    1 dumpables:
+    #0: AutofillManager
+        AutofillManager:
+          sessionId: 2147483647
+          state: UNKNOWN
+          context: com.zhenxi.hunter.MainActivity@4f13c1c
+          service client: null
+          client: android.view.autofill.AutofillClientController@79fa088 (android.os.BinderProxy@d2e82d5)
+          enabled: false
+          enabledAugmentedOnly: false
+          hasService: true
+          hasCallback: false
+          onInvisibleCalled false
+          last autofilled data: null
+          id of last fill UI shown: null
+          tracked views: null
+          fillable ids: null
+          entered ids: null
+          save trigger id: null
+          save on finish(): false
+          options: logLvl=6, compatMode=false, augmented=false, appDisabledExpiration=0
+          fill dialog enabled: false
+          fill dialog enabled hints: []
+          compat mode enabled: false
+          debug: true verbose: true
+        Autofill Compat Mode: false
+    ViewExtraInfo:
+DynamicFrameRateManagerImpl # 
+Key: 10016, Value: TypeItem{ enable=false, type=10016, enableInvalidRequest=false, enableBreakAppRate60=true, enableBreakAppRate90=false, enableEndLowRate=false, isInGameAnim=false, isWidespreadAnim=false, isLauncherAnim=false, targetFramerate=120, velocityFramerate=false, enableActivitiyList=}
+Key: 0, Value: TypeItem{ enable=false, type=0, enableInvalidRequest=false, enableBreakAppRate60=true, enableBreakAppRate90=true, enableEndLowRate=true, isInGameAnim=true, isWidespreadAnim=true, isLauncherAnim=false, targetFramerate=120, velocityFramerate=true, enableActivitiyList=null}
+Key: 1, Value: TypeItem{ enable=true, type=1, enableInvalidRequest=false, enableBreakAppRate60=true, enableBreakAppRate90=false, enableEndLowRate=false, isInGameAnim=true, isWidespreadAnim=false, isLauncherAnim=false, targetFramerate=120, velocityFramerate=false, enableActivitiyList=}
+Key: 2, Value: TypeItem{ enable=true, type=2, enableInvalidRequest=false, enableBreakAppRate60=true, enableBreakAppRate90=false, enableEndLowRate=false, isInGameAnim=true, isWidespreadAnim=false, isLauncherAnim=false, targetFramerate=120, velocityFramerate=false, enableActivitiyList=}
+Key: 20103, Value: TypeItem{ enable=true, type=20103, enableInvalidRequest=false, enableBreakAppRate60=true, enableBreakAppRate90=false, enableEndLowRate=false, isInGameAnim=true, isWidespreadAnim=true, isLauncherAnim=false, targetFramerate=120, velocityFramerate=false, enableActivitiyList=}
+Key: 10001, Value: TypeItem{ enable=true, type=10001, enableInvalidRequest=false, enableBreakAppRate60=false, enableBreakAppRate90=false, enableEndLowRate=false, isInGameAnim=false, isWidespreadAnim=false, isLauncherAnim=false, targetFramerate=120, velocityFramerate=false, enableActivitiyList=}
+Key: 10003, Value: TypeItem{ enable=true, type=10003, enableInvalidRequest=false, enableBreakAppRate60=false, enableBreakAppRate90=false, enableEndLowRate=true, isInGameAnim=false, isWidespreadAnim=false, isLauncherAnim=false, targetFramerate=120, velocityFramerate=false, enableActivitiyList=}
+Key: 10101, Value: TypeItem{ enable=true, type=10101, enableInvalidRequest=false, enableBreakAppRate60=true, enableBreakAppRate90=false, enableEndLowRate=false, isInGameAnim=true, isWidespreadAnim=false, isLauncherAnim=false, targetFramerate=120, velocityFramerate=false, enableActivitiyList=}
+Key: 10011, Value: TypeItem{ enable=false, type=10011, enableInvalidRequest=false, enableBreakAppRate60=true, enableBreakAppRate90=false, enableEndLowRate=false, isInGameAnim=false, isWidespreadAnim=false, isLauncherAnim=false, targetFramerate=120, velocityFramerate=false, enableActivitiyList=}
+Key: 10012, Value: TypeItem{ enable=false, type=10012, enableInvalidRequest=false, enableBreakAppRate60=true, enableBreakAppRate90=false, enableEndLowRate=false, isInGameAnim=false, isWidespreadAnim=false, isLauncherAnim=false, targetFramerate=120, velocityFramerate=false, enableActivitiyList=}
+Key: 10013, Value: TypeItem{ enable=false, type=10013, enableInvalidRequest=false, enableBreakAppRate60=true, enableBreakAppRate90=false, enableEndLowRate=false, isInGameAnim=false, isWidespreadAnim=false, isLauncherAnim=false, targetFramerate=120, velocityFramerate=false, enableActivitiyList=}
+Key: 10014, Value: TypeItem{ enable=false, type=10014, enableInvalidRequest=false, enableBreakAppRate60=true, enableBreakAppRate90=false, enableEndLowRate=false, isInGameAnim=false, isWidespreadAnim=false, isLauncherAnim=false, targetFramerate=120, velocityFramerate=false, enableActivitiyList=}
+Key: 10015, Value: TypeItem{ enable=false, type=10015, enableInvalidRequest=false, enableBreakAppRate60=true, enableBreakAppRate90=false, enableEndLowRate=false, isInGameAnim=false, isWidespreadAnim=false, isLauncherAnim=false, targetFramerate=120, velocityFramerate=false, enableActivitiyList=}
+    FlexibleWindow ActivityExt:
+      mScenario=0
+      mIsFlexibleTaskAndHasCaption=false
+      mInsensibleFlag=0
+      mIsMinimized=false
+      mIsAdjustInputMethod=false
+      mSupportSplitScreenWindowingMode=false
+      mContainerType=0
+      mIsInFlexibleInputMonitorBlackList=false
+      mViewLocationOffsetModeFromPs=0
+    Local FragmentActivity 4f13c1c State:
+      mCreated=true mResumed=true mStopped=false    Back Stack Index: 0
+    FragmentManager misc state:
+      mHost=YouAreLoser.zs@bd23d34
+      mContainer=YouAreLoser.zs@bd23d34
+      mCurState=7 mStateSaved=false mStopped=false mDestroyed=false
+    r =ActivityClientRecord{paused=false, stopped=false, hideForNow=false, startsNotResumed=false, isForward=true, pendingConfigChanges=0, preserveWindow=false, Activity{resumed=true, stopped=false, finished=false, destroyed=false, startedActivity=false, changingConfigurations=false}}
+    r.overrideConfig={0.0 ?mcc??mnc ?localeList ?layoutDir sw360dp w360dp h784dp 480dpi nrml long compactNeeded port ?uimode ?night -touch -keyb/v/h -nav/h winConfig={ mBounds=Rect(0, 0 - 1080, 2352) mAppBounds=Rect(0, 0 - 1080, 2352) mMaxBounds=Rect(0, 0 - 1080, 2352) mDisplayRotation=ROTATION_0 mWindowingMode=fullscreen mActivityType=standard mAlwaysOnTop=undefined mRotation=ROTATION_0} s.2 ?fontWeightAdjustmentmThemeChanged= 0, mThemeChangedFlags= 0, mFlipFont= 0, mScenario= 0, mAccessibleChanged= 0, mUxIconConfig= 0, mMaterialColor= ffffffffffffffff, mUserId= -1, mFontUserId= -1, mFontVariationSettings= ffffffff, mFoldingAngle = -1.0, mIconPackName= , mDarkModeBackgroundMaxL= -1.0, mDarkModeDialogBgMaxL= -1.0, mDarkModeForegroundMinL= -1.0, mOplusConfigType= 0, mOplusChangedConfigs= 0, OpSans= -1, mBurmeseFontFlag= -1, mFlag= 0, mExtraFlag= 0, mFlexibleActivitySuitable= -1, mPuttDisplayFlag= -1}
+
+TASK 10522:com.fankes.apperrorstracking:detail id=72 userId=0 displayId=0(type=INTERNAL)
+  ACTIVITY com.fankes.apperrorstracking/.ui.activity.errors.AppErrorsDetailActivity d13b89b pid=(not running) userId=0 uid=10522 displayId=0(type=INTERNAL)
+
+TASK 10539:mark.via id=16 userId=0 displayId=0(type=INTERNAL)
+  ACTIVITY mark.via/.Shell 2692c4c pid=(not running) userId=0 uid=10539 displayId=0(type=INTERNAL)
+
+TASK 11044:com.oplus.aipaper id=22 userId=0 displayId=0(type=INTERNAL)
+  ACTIVITY com.oplus.aipaper/.feature.home.activity.AINoteHomeActivity 139581d pid=(not running) userId=0 uid=11044 displayId=0(type=INTERNAL)
+
+TASK 10167:com.oplus.camera id=93 userId=0 displayId=0(type=INTERNAL)
+  ACTIVITY com.oplus.camera/.Camera 872f1bc pid=(not running) userId=0 uid=10167 displayId=0(type=INTERNAL)
+
+TASK 10392:com.jingdong.app.mall id=127 userId=0 displayId=0(type=INTERNAL)
+  ACTIVITY com.jingdong.app.mall/.bundle.cashierfinish.view.CashierUserContentCompleteActivity 13d1704 pid=21983 userId=0 uid=10392 displayId=0(type=INTERNAL)
+
+*** SERVICE 'activity' DUMP TIMEOUT (10000ms) EXPIRED ***
+
+
+*** SERVICE 'activity' DUMP TIMEOUT (10000ms) EXPIRED ***
+

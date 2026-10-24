@@ -1,0 +1,3 @@
+zygisk-module/out/
+zygisk-module/build/
+zygisk-module/module/zygisk/*.so

@@ -1,0 +1,3 @@
+7a3830a000-7a38319000 r-xp 00004000 fe:27 8363438                        /data/app/~~KKh0d6diTLHJfgBNNhKfbw==/com.rev.antihookbypass-J2sykK8OkFHdURXd4amQOw==/base.apk
+7a3831c000-7a3831e000 r--p 00012000 fe:27 8363438                        /data/app/~~KKh0d6diTLHJfgBNNhKfbw==/com.rev.antihookbypass-J2sykK8OkFHdURXd4amQOw==/base.apk
+7a38321000-7a38322000 rw-p 00013000 fe:27 8363438                        /data/app/~~KKh0d6diTLHJfgBNNhKfbw==/com.rev.antihookbypass-J2sykK8OkFHdURXd4amQOw==/base.apk
