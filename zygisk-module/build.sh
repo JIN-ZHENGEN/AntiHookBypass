@@ -11,7 +11,7 @@ OUT="$ROOT/out"
 export PATH=/data/data/com.dsharnessmobile.shell/files/usr/bin:$PATH
 
 [ -d "$SYS" ] || { echo "找不到 NDK sysroot: $SYS"; exit 1; }
-mkdir -p "$OUT" "$ROOT/module/zygisk"
+mkdir -p "$OUT" "$ROOT/module/zygisk" "$ROOT/module/engine"
 
 build_abi() {
     local abi="$1" target="$2" libdir="$3"
@@ -39,15 +39,28 @@ build_abi() {
         -I"$ROOT/module/jni" -I"$SYS/usr/include" -I"$SYS/usr/include/$libdir" \
         -c "$ROOT/module/jni/module.cpp" -o "$d/module.o"
 
+    # ---- 引擎 .so：业务代码全在这里，可热替换 ----
+    mkdir -p "$ROOT/module/engine"
     clang++ --target="$target" --sysroot="$SYS" -shared -fPIC -nostdlib \
         "$SYS/usr/lib/$libdir/21/crtbegin_so.o" \
         "$SYS/usr/lib/$libdir/21/crtend_so.o" \
         -L"$SYS/usr/lib/$libdir/21" \
-        -o "$ROOT/module/zygisk/$abi.so" \
+        -o "$ROOT/module/engine/$abi.so" \
         "$d/module.o" "$d/engine_glue.o" "$d/jnihooks.o" "$d/native_main.o" \
         -lc -ldl -llog
 
-    echo "    OK $(stat -c%s "$ROOT/module/zygisk/$abi.so") B"
+    # ---- 加载器 .so：zygisk 注册 + 把引擎拉起来，逻辑极少 ----
+    clang++ --target="$target" --sysroot="$SYS" -shared -fPIC -nostdlib \
+        -fno-exceptions -fno-rtti \
+        -I"$ROOT/module/jni" -I"$SYS/usr/include" -I"$SYS/usr/include/$libdir" \
+        "$SYS/usr/lib/$libdir/21/crtbegin_so.o" \
+        "$SYS/usr/lib/$libdir/21/crtend_so.o" \
+        -L"$SYS/usr/lib/$libdir/21" \
+        -o "$ROOT/module/zygisk/$abi.so" \
+        "$ROOT/module/jni/loader.cpp" \
+        -lc -ldl -llog
+
+    echo "    引擎 $(stat -c%s "$ROOT/module/engine/$abi.so") B / 加载器 $(stat -c%s "$ROOT/module/zygisk/$abi.so") B"
 }
 
 build_abi arm64-v8a   aarch64-linux-android21    aarch64-linux-android

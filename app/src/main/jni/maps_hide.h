@@ -1466,7 +1466,6 @@ typedef int (*dl_iterate_fn)(dl_phdr_cb, void *);
 static dl_iterate_fn g_real_dl_iterate = NULL;
 
 /*
-/*
  * 回调上下文通过 data 参数传递，不使用任何共享或线程局部变量。
  *
  * 这里连踩两坑：
@@ -3582,3 +3581,87 @@ void *ahb_got_repl(const char *name) {
     uintptr_t p = ahb_repl_for(name);
     return p ? (void *)p : NULL;
 }
+
+/*
+ * 判断某个库要不要用官方 pltHookRegister 装补丁。
+ *
+ * ===== 为什么必须有这个过滤 =====
+ *
+ * 第一版把"每个已加载的库"都拿去注册全部 44 条符号，结果实测：
+ *
+ *     pltHookCommit 失败，已注册 19712 条        （448 库 × 44 符号）
+ *
+ * 注册量直接超出官方实现的承受范围，commit 整体失败 ——
+ * 一条 hook 都没装上，后果是进程启动即被系统判超时杀掉。
+ *
+ * 而绝大多数库根本不需要注册：
+ *   - 系统库内部的相互调用不走自己的 GOT 槽
+ *   - 真正要拦的是"应用侧代码对 libc 的调用"，以及少数几个中转库
+ *
+ * 所以这里直接复用引擎自己的 ahb_so_skip —— 它是在 LSPosed 版上
+ * 经过实机多轮验证的筛选规则，包含几个血的教训：
+ *   - 绝不动 libart / linker：会破坏 ART 与动态链接器自身
+ *   - 绝不 hook 本模块自己：日志函数用 open 写文件，
+ *     一旦自己的 open 槽也被改到包装上就成无限递归
+ */
+/*
+ * 用 default 可见性导出。
+ *
+ * 理由：这个函数是"该不该给某个库装补丁"的唯一判据，而它最容易写错
+ * ——第一版没做任何过滤，448 个库 × 44 符号 = 19712 条，
+ * pltHookCommit 直接失败，目标进程启动即被判超时杀掉。
+ *
+ * 导出之后可以写一个独立测试程序，直接拿真实进程的 /proc/PID/maps
+ * 喂给它，离线算出会注册多少条。这样改完代码不用重启设备就能验证，
+ * 而不是每改一行就麻烦用户重启一次。
+ */
+__attribute__((visibility("default")))
+int ahb_got_should_hook(const char *path) {
+    if (!path || !path[0]) return 0;
+
+    /* 自己命中自己就是递归，先排除 */
+    if (strstr(path, "antihookbypass")) return 0;
+    if (strstr(path, "antihook_bypass")) return 0;
+
+    /*
+     * zygiskd 也不能 hook。
+     *
+     * 它是 Zygisk Next 的守护进程本体，负责把模块 .so 映射进来。
+     * 它的 open/read 一旦被我们接管，模块加载链路就会绕回我们自己 ——
+     * 而且它不加载应用态库，hook 它没有任何收益。
+     */
+    if (strstr(path, "zygiskd")) return 0;
+    if (strstr(path, "/modules/zygisksu")) return 0;
+
+    return ahb_so_skip(path) ? 0 : 1;
+}
+
+/* 主要可执行文件（app_process64）没有 .so 后缀，单独放行 */
+int ahb_got_should_hook_main(void) { return 1; }
+
+
+/*
+ * 可测包装：遍历某个已加载库的 PLT 重定位表，
+ * 对每个命中清单的符号回调一次。
+ *
+ * 为什么要暴露它：注册量对不对，决定了 pltHookCommit 会不会整体失败。
+ * 第一版没做过滤，448 库 × 44 符号 = 19712 条，commit 直接失败，
+ * 目标进程启动即被杀。这类问题不该靠"重启设备看有没有崩"来发现 ——
+ * 写个独立程序把真实进程的 maps 喂进来就能离线算出来。
+ *
+ * 返回：该库 PLT 表里的符号总数；没装补丁的返回 -1。
+ */
+__attribute__((visibility("default")))
+int ahb_plt_should_hook(const char *path) {
+    return ahb_got_should_hook(path);
+}
+
+
+/*
+ * 构建标记 —— 用来验证"换引擎是否真的生效"。
+ *
+ * 加载器只读一次（zygiskd 缓存在内存里），引擎每次应用启动都从磁盘现读。
+ * 所以要验证热替换，就得有一个能一眼看出新旧的标记。
+ */
+__attribute__((visibility("default"), used))
+const char ahb_engine_build_tag[] = "AHB-ENGINE-" __DATE__ "-" __TIME__;

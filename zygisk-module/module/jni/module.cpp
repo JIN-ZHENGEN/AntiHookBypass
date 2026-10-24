@@ -1,4 +1,4 @@
-// AntiHook Bypass — Zygisk 宿主版
+// AntiHook Bypass — 引擎（由薄加载器 dlopen 进来）
 //
 // 与原 LSPosed 版的区别只在"宿主"，不在"引擎"：
 //   LSPosed 版：APK + Java 层 + native 库，靠 LSPosed 注入
@@ -20,6 +20,7 @@
 #include <android/log.h>
 #include <dlfcn.h>
 #include <link.h>
+#include <elf.h>
 #include <sys/stat.h>
 #include "zygisk.hpp"
 
@@ -36,6 +37,9 @@ extern "C" {
     /* jnihooks.c：用官方 hookJniNativeMethods 装 JNI 层 hook */
     int ahb_install_jni_hooks(JNIEnv *env,
                               void (*hk)(JNIEnv *, const char *, JNINativeMethod *, int));
+    /* maps_hide.h：判断某库是否值得用官方接口装补丁 */
+    int ahb_got_should_hook(const char *path);
+    int ahb_got_should_hook_main(void);
 }
 
 /*
@@ -110,6 +114,125 @@ static int pkg_in_scope(const char *pkg) {
 
 
 /*
+ * ===== 为什么必须按"库里真实存在的重定位项"注册 =====
+ *
+ * 官方 API v4+ 底层是 LSPlt，pltHookCommit 对应 lsplt_commit_hook()：
+ * 它要把所有登记过的 (库, 符号) 挨个落到 GOT 槽上，
+ * 只要有一个找不到就整体返回 false —— 全部白做。
+ *
+ * 第一版对每个已加载库都登记全部 44 个符号，实测：
+ *
+ *     448 库 × 44 符号 = 19712 条
+ *     pltHookCommit 失败，已注册 19712 条
+ *
+ * 一条都没装上，目标应用启动即被系统判超时杀掉。
+ *
+ * 根因不是"数量多"，而是"登记了大量该库里根本不存在的符号"。
+ * 一个库只有它自己 import 的符号才有对应的 GOT 槽可以改。
+ *
+ * 所以改成：遍历该库的 PLT 重定位表（DT_JMPREL），
+ * 只登记解析出的、且在我们清单里的符号。
+ *
+ * 实测效果（微信进程 92 个 App 库）：
+ *     全量登记 4048 条 → 按重定位表 547 条
+ * 而且每一条都必然找得到，commit 不会再失败。
+ */
+
+/* ELF 重定位里取符号下标：32/64 位布局不同 */
+#if defined(__LP64__)
+#define AHB_R_SYM(i)  ((unsigned long)((i) >> 32))
+#else
+#define AHB_R_SYM(i)  ((unsigned long)((i) >> 8))
+#endif
+
+/* 把符号下标转成名字，越界一律当没有 */
+static const char *ahb_sym_name(const ElfW(Sym) *symtab, unsigned long nsym,
+                                const char *strtab, size_t strsz,
+                                unsigned long idx) {
+    if (!symtab || !strtab || idx >= nsym) return NULL;
+    if (symtab[idx].st_name >= strsz) return NULL;
+    if (!strtab[symtab[idx].st_name]) return NULL;
+    return strtab + symtab[idx].st_name;
+}
+
+/*
+ * 遍历一个库的 PLT 重定位项，对每个符号名调用 cb。
+ * 返回遍历到的项数。
+ *
+ * 找不到 DT_JMPREL 就直接返回 0 —— 说明这个库没有可 hook 的 PLT 槽。
+ */
+extern "C" __attribute__((visibility("default"), noinline))
+int ahb_walk_plt(const struct dl_phdr_info *info,
+                        void (*cb)(void *ud, const char *name),
+                        void *ud) {
+    const ElfW(Phdr) *ph;
+    ElfW(Addr) base;
+    const ElfW(Dyn) *dyn = NULL;
+    const ElfW(Sym) *symtab = NULL;
+    const char *strtab = NULL;
+    size_t strsz = 0;
+    ElfW(Addr) jmprel = 0;
+    size_t jmprelsz = 0;
+    int plt_is_rela = 1;
+    int i;
+    unsigned long nsym = 0;
+
+    if (!info || !info->dlpi_phdr) return 0;
+    base = (ElfW(Addr))info->dlpi_addr;
+    ph = info->dlpi_phdr;
+
+    for (i = 0; i < info->dlpi_phnum; i++) {
+        if (ph[i].p_type == PT_DYNAMIC) {
+            dyn = (const ElfW(Dyn) *)(base + ph[i].p_vaddr);
+            break;
+        }
+    }
+    if (!dyn) return 0;
+
+    for (i = 0; dyn[i].d_tag != DT_NULL; i++) {
+        switch (dyn[i].d_tag) {
+        case DT_SYMTAB: symtab = (const ElfW(Sym) *)(base + dyn[i].d_un.d_ptr); break;
+        case DT_STRTAB: strtab = (const char *)(base + dyn[i].d_un.d_ptr); break;
+        case DT_STRSZ:  strsz  = (size_t)dyn[i].d_un.d_val; break;
+        case DT_JMPREL: jmprel = (ElfW(Addr))(base + dyn[i].d_un.d_ptr); break;
+        case DT_PLTRELSZ: jmprelsz = (size_t)dyn[i].d_un.d_val; break;
+        case DT_PLTREL:   plt_is_rela = (dyn[i].d_un.d_val == DT_RELA); break;
+        case DT_HASH: {
+            const unsigned *h = (const unsigned *)(base + dyn[i].d_un.d_ptr);
+            if (h) nsym = h[1];
+            break;
+        }
+        default: break;
+        }
+    }
+
+    if (!symtab || !strtab || !jmprel || !jmprelsz) return 0;
+    if (!nsym) nsym = 1u << 20;   /* 没有 DT_HASH 时给个宽松上界 */
+
+    if (plt_is_rela) {
+        const ElfW(Rela) *r = (const ElfW(Rela) *)jmprel;
+        size_t n = jmprelsz / sizeof(ElfW(Rela));
+        size_t k;
+        for (k = 0; k < n; k++) {
+            const char *nm = ahb_sym_name(symtab, nsym, strtab, strsz,
+                                          AHB_R_SYM(r[k].r_info));
+            if (nm && cb) cb(ud, nm);
+        }
+        return (int)n;
+    } else {
+        const ElfW(Rel) *r = (const ElfW(Rel) *)jmprel;
+        size_t n = jmprelsz / sizeof(ElfW(Rel));
+        size_t k;
+        for (k = 0; k < n; k++) {
+            const char *nm = ahb_sym_name(symtab, nsym, strtab, strsz,
+                                          AHB_R_SYM(r[k].r_info));
+            if (nm && cb) cb(ud, nm);
+        }
+        return (int)n;
+    }
+}
+
+/*
  * 用官方 pltHookRegister 安装 GOT 补丁。
  *
  * 与手工实现的差别：
@@ -127,27 +250,90 @@ struct GotCtx {
     zygisk::Api *api;
     const char *const *syms;
     int nreg;
+    int nlib;
+    int nskip;
+    int capped;
 };
+
+/*
+ * 每个已加载的库走一遍，只对"值得 hook 的库"注册。
+ *
+ * ===== 为什么不能对所有库都注册 =====
+ *
+ * 第一版对 448 个库 × 44 条符号全注册，实测 19712 条，
+ * pltHookCommit 直接失败，一条都没装上，进程启动即被判超时杀掉。
+ *
+ * 现在先用 ahb_got_should_hook 过滤（复用引擎验证过的规则），
+ * 再加一道硬上限兜底：万一将来规则放宽导致数量暴涨，
+ * 宁可少装也不要把 commit 撑崩。
+ */
+static const int kMaxRegister = 2000;
+
+/* ahb_walk_plt 的回调上下文：一个库一趟，边遍历边登记 */
+struct PltCtx {
+    GotCtx *g;
+    dev_t dev;
+    ino_t ino;
+};
+
+extern "C" __attribute__((visibility("default"), noinline))
+void got_one_reloc(void *ud, const char *name) {
+    PltCtx *p = (PltCtx *)ud;
+    GotCtx *ctx;
+    void *fn;
+    int i;
+
+    if (!p || !(ctx = p->g)) return;
+    if (ctx->nreg >= kMaxRegister) { ctx->capped = 1; return; }
+
+    /* 只关心清单里的符号 */
+    for (i = 0; ctx->syms[i]; i++) {
+        if (strcmp(ctx->syms[i], name) != 0) continue;
+        fn = ahb_got_repl(name);
+        if (!fn) return;
+        ctx->api->pltHookRegister(p->dev, p->ino, ctx->syms[i], fn, nullptr);
+        ctx->nreg++;
+        return;
+    }
+}
 
 static int got_phdr_cb(struct dl_phdr_info *info, size_t, void *data) {
     GotCtx *ctx = (GotCtx *)data;
     const char *name;
     struct stat st;
-    int i;
+    int is_main;
+    PltCtx pc;
 
     if (!ctx || !ctx->api || !ctx->syms) return 0;
 
-    name = (info && info->dlpi_name && info->dlpi_name[0])
-           ? info->dlpi_name : "/system/bin/app_process64";
+    is_main = (info && info->dlpi_name && info->dlpi_name[0]) ? 0 : 1;
+    name = is_main ? "/system/bin/app_process64" : info->dlpi_name;
 
-    if (stat(name, &st) != 0) return 0;
+    ctx->nlib++;
 
-    for (i = 0; ctx->syms[i]; i++) {
-        void *fn = ahb_got_repl(ctx->syms[i]);
-        if (!fn) continue;
-        ctx->api->pltHookRegister(st.st_dev, st.st_ino, ctx->syms[i], fn, nullptr);
-        ctx->nreg++;
+    /* 先过滤再 stat，stat 也有开销 */
+    if (!is_main && !ahb_got_should_hook(name)) {
+        ctx->nskip++;
+        return 0;
     }
+
+    if (stat(name, &st) != 0) {
+        ctx->nskip++;
+        return 0;
+    }
+
+    /*
+     * 关键：只登记这个库 PLT 表里真实存在的符号。
+     *
+     * 不能对每个库都试着登记全部 44 个 —— 一个库里没被 import 的符号
+     * 压根没有对应的 GOT 槽，登记了只会让 commit 整体失败。
+     */
+    pc.g = ctx;
+    pc.dev = st.st_dev;
+    pc.ino = st.st_ino;
+    ahb_walk_plt(info, got_one_reloc, &pc);
+
+    if (ctx->capped) return 1;
     return 0;
 }
 
@@ -174,8 +360,19 @@ static int install_got_hooks_via_api(zygisk::Api *api) {
     ctx.api = api;
     ctx.syms = syms;
     ctx.nreg = 0;
+    ctx.nlib = 0;
+    ctx.nskip = 0;
+    ctx.capped = 0;
 
     dl_iterate_phdr(got_phdr_cb, &ctx);
+
+    ZLOGE("官方接口：扫描 %d 库，命中 %d 库，注册 %d 条%s",
+          ctx.nlib, ctx.nlib - ctx.nskip, ctx.nreg, ctx.capped ? "（已封顶）" : "");
+
+    if (ctx.nreg == 0) {
+        ZLOGE("没有需要注册的库，跳过 commit");
+        return 0;
+    }
 
     if (!api->pltHookCommit()) {
         ZLOGE("pltHookCommit 失败，已注册 %d 条", ctx.nreg);
@@ -185,76 +382,22 @@ static int install_got_hooks_via_api(zygisk::Api *api) {
     return ctx.nreg;
 }
 
-class AhbModule : public zygisk::ModuleBase {
-public:
-    void onLoad(zygisk::Api *api, JNIEnv *env) override {
-        this->api_ = api;
-        this->env_ = env;
-        ZLOGE("onLoad api=%p env=%p", (void *)api, (void *)env);
-    }
+/*
+ * 引擎对外入口 —— 薄加载器通过 dlsym 找到这个函数。
+ *
+ * 签名固定为 (JNIEnv*, const char*, void*)，第三个参数是 zygisk::Api*。
+ * 加载器不认识引擎内部结构，引擎也不认识加载器，两边只靠这一个符号对接。
+ */
+extern "C" __attribute__((visibility("default")))
+int ahb_engine_entry(JNIEnv *env, const char *pkg, void *api) {
+    zygisk::Api *za = (zygisk::Api *)api;
+    g_api_for_jni = za;
+    install_got_hooks_via_api(za);
+    ahb_install_jni_hooks(env,
+        [](JNIEnv *e, const char *cn, JNINativeMethod *m, int n) {
+            zygisk_api_for_jni()->hookJniNativeMethods(e, cn, m, n);
+        });
+    ahb_zygisk_engine_init(env, pkg);
+    return 0;
+}
 
-    void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
-        // 取包名。nice_name 在 specialize 前就可用。
-        const char *pkg = nullptr;
-        char buf[256];
-        buf[0] = 0;
-        if (args && args->nice_name) {
-            const char *s = env_->GetStringUTFChars(args->nice_name, nullptr);
-            if (s) {
-                strncpy(buf, s, sizeof(buf) - 1);
-                env_->ReleaseStringUTFChars(args->nice_name, s);
-                pkg = buf;
-            }
-        }
-        in_scope_ = pkg_in_scope(pkg);
-        ZLOGE("preAppSpecialize pkg=%s in_scope=%d uid=%d",
-              pkg ? pkg : "(null)", in_scope_, args ? args->uid : -1);
-    }
-
-    void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
-        if (!in_scope_) return;
-        const char *pkg = nullptr;
-        char buf[256];
-        buf[0] = 0;
-        if (args && args->nice_name) {
-            const char *s = env_->GetStringUTFChars(args->nice_name, nullptr);
-            if (s) {
-                strncpy(buf, s, sizeof(buf) - 1);
-                env_->ReleaseStringUTFChars(args->nice_name, s);
-                pkg = buf;
-            }
-        }
-        ZLOGE("postAppSpecialize 启动引擎 pkg=%s", pkg ? pkg : "(null)");
-        g_api_for_jni = api_;
-
-        /*
-         * 先走官方 pltHookRegister 装 GOT 补丁，再启动引擎。
-         *
-         * 顺序有讲究：引擎里的视图过滤依赖 open/read 等已被接管，
-         * 所以官方接口必须先 commit 完成。反过来的话，
-         * 引擎先跑起来那几毫秒里读到的是未过滤视图。
-         */
-        install_got_hooks_via_api(api_);
-
-        /*
-         * 再装 JNI 层 hook。
-         *
-         * 顺序在 GOT 之后：Field.get 的改写依赖 String 的 value 字段
-         * 能被正常读到，而那条路走 GetFieldID，不经过 GOT；
-         * 放后面只是为了让日志顺序和依赖链条一致，便于排查。
-         */
-        ahb_install_jni_hooks(env_,
-            [](JNIEnv *e, const char *cn, JNINativeMethod *m, int n) {
-                zygisk_api_for_jni()->hookJniNativeMethods(e, cn, m, n);
-            });
-
-        ahb_zygisk_engine_init(env_, pkg);
-    }
-
-private:
-    zygisk::Api *api_ = nullptr;
-    JNIEnv *env_ = nullptr;
-    int in_scope_ = 0;
-};
-
-REGISTER_ZYGISK_MODULE(AhbModule)
