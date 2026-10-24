@@ -1410,13 +1410,19 @@ static void *jvmti_watch_thread(void *arg) {
          * ahb_try_patch_jvmti 内部第一步就是廉价的子串扫描，
          * 库不在时立刻返回，所以 1ms 一次的代价可以接受。
          */
-        ahb_try_patch_jvmti();
-        if (g_jvmti_patched) break;
         /*
-         * 自证一次就够。
-         * 放在这里而不是 early_init：实测进程启动最初几毫秒打的日志
-         * 会被 logd 丢掉（EARLY_BODY / EARLY_INIT 一条都看不到，
-         * 而稍后的 DLOPEN[n] 正常），所以推迟到 400ms 之后。
+         * 自证必须在 ahb_try_patch_jvmti 的成功退出口**之前**跑。
+         *
+         * 踩过的坑：原来写成
+         *     ahb_try_patch_jvmti();
+         *     if (g_jvmti_patched) break;   // <- 自检在这句后面
+         * 于是"patch 成功"这个最关键、也正是最需要验证的场景里，
+         * 循环直接 break 掉，自检一次都不执行。
+         * 表现成"VIEWART / PATHCHK 一条日志都没有"，
+         * 很容易误判成自检代码坏了，实际是 Timing 问题。
+         *
+         * 现在把它提到 patch 之前：先自检、再 patch。
+         * 400ms 的延迟仍保留（避开 logd 未就绪的窗口）。
          */
 #if AHB_SAY
         if (!sc_done && ahb_now_us() - t0 > 400000UL) {
@@ -1427,6 +1433,8 @@ static void *jvmti_watch_thread(void *arg) {
 #endif
         }
 #endif
+        ahb_try_patch_jvmti();
+        if (g_jvmti_patched) break;
         usleep(1000);
     }
     return NULL;
