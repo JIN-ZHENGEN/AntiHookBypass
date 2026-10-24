@@ -399,6 +399,43 @@ F jit_code_cache.cc:1309 Check failed: !ContainsElement(zombie_code_, code_ptr)
 
 
 ### 视图痕迹：三个实测出来的漏点
+### 替换路径必须连 dev/inode 一起换
+
+把痕迹行的路径换成 `/system/framework/framework.jar` 之后，目标报了这条：
+
+```
+(inode不匹配)inode mismatching -> /system/framework/framework.jar 21619546 8356463
+```
+
+它拿新路径去 `stat`，把拿到的 dev/inode/size 与行内旧值对比，不符就判。
+
+教训是：**「路径合理但身份字段造假」比「路径可疑」更容易被抓**——它把两处信息交叉验证了一次。只换路径等于留下一个自相矛盾的行。
+
+修法是 `stat` 一次被替换文件，把真实 dev/inode 一并写进去（结果缓存，不必每次重取），让路径、dev、inode 三者互相印证。
+
+### readlink 必须逐字复现请求路径
+
+目标校验的写法是「先 open，再 readlink 这个 fd，看能否读回我请求的那条路径」。所以重点不是内容对不对，而是**能否与请求逐字一致**：
+
+| 目标请求 | 我们回的 | 结果 |
+|---|---|---|
+| `/proc/24708/task/25061/maps` | `/proc/24708/maps` | 少 `task/<tid>` 段 → 报「readlink异常」 |
+
+修法是把请求里的 `task/<tid>/` 原样抄回去，fd 解析同时支持 `<pid>/fd/N` 与 `<pid>/task/<tid>/fd/N`。
+
+### 写内存前必须校验基址
+
+有一轮把 JVMTI 库的基址算成了 `0x2000000`（不是真实映射起点），于是按 `base + 0x4ce00` 往 `0x204ce00` 写了 8 字节，打穿 ART 数据结构：
+
+```
+Abort message: 'GC tried to mark invalid reference 0x52800020'
+#00 libart.so (art::mirror::Object::PrettyTypeOf()+40)
+```
+
+这类**写坏内存**比「不 patch」严重得多：不 patch 只是 ART abort，写坏则是不确定的随机崩溃，而且现场看起来完全无关。
+
+修法是在写之前先读基址处 4 字节、校验 ELF 魔数（`0x7f 'E' 'L' 'F'`），不是 ELF 就跳过。成本 4 字节读，足以拦住算错的基址。
+
 ### 改代码段：`/proc/self/mem` 而不是 `mprotect`
 
 给已加载的 `.so` 打字节补丁，最直觉的做法是先 `mprotect` 该页为 RWX、写完改回 RX。
