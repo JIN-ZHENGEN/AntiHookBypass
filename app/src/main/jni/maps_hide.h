@@ -365,6 +365,51 @@ static int maps_path_is_self(const char *path) {
     if (strcmp(path, want) == 0) return 1;
     snprintf(want, sizeof(want), "/proc/%d/task/%d/maps", (int)getpid(), (int)getpid());
     if (strcmp(path, want) == 0) return 1;
+
+    /*
+     * 任意 pid 的 maps 也要认。
+     *
+     * 依据（真实检测输出里抓到的原文）：
+     *      find libart.so hooked 4096
+     *      /proc/18023/maps
+     *      checkFileIsLegal path validation failed
+     *
+     * 18023 是它自己主进程的 pid —— 它从另一个进程（twin / iso）
+     * 读 **指定 pid** 的 maps，而不是 /proc/self/maps。
+     * 原来这里只认 self / 本pid / 父pid，这类带"别人 pid"的路径
+     * 一条都匹配不上，于是那条读法完全没被过滤。
+     *
+     * 判定放宽到"任何 /proc/<数字>/maps"，因为：
+     *   - 我们的补丁只装在注入了本模块的进程里，
+     *     别的进程根本不会走到这段代码
+     *   - 在这些进程里，任何"带具体 pid 的 maps 读"都只可能是
+     *     目标自己在做外部视角检查，没有正常业务用途
+     *
+     * 同时认 task 形式 /proc/<pid>/task/<tid>/maps。
+     */
+    {
+        const char *p2 = path;
+        long pid = 0;
+        int got = 0;
+        if (strncmp(p2, "/proc/", 6) != 0) return 0;
+        p2 += 6;
+        while (*p2 >= '0' && *p2 <= '9') {
+            pid = pid * 10 + (*p2 - '0');
+            got = 1;
+            p2++;
+        }
+        if (!got) return 0;
+        (void)pid;
+        /* /proc/<num>/maps */
+        if (strcmp(p2, "/maps") == 0) return 1;
+        /* /proc/<num>/task/<tid>/maps */
+        if (strncmp(p2, "/task/", 6) == 0) {
+            const char *p3 = p2 + 6;
+            int got2 = 0;
+            while (*p3 >= '0' && *p3 <= '9') { got2 = 1; p3++; }
+            if (got2 && strcmp(p3, "/maps") == 0) return 1;
+        }
+    }
     return 0;
 }
 
@@ -468,6 +513,29 @@ static int maps_read_all(char **out_buf, size_t *out_cap) {
 #define MAPS_TTL_MS 120
 static char    *g_maps_ttl_buf  = NULL;
 static size_t   g_maps_ttl_len  = 0;
+
+/*
+ * TTL 缓存已整体移除。
+ *
+ * 事故经过：
+ *   g_maps_ttl_buf 是裸全局指针，hunter 多线程并发读 maps 时
+ *   两个线程可能同时 free 它（double free），或一个在读一个已 free
+ *   （use-after-free），堆元数据被破坏，之后任意 free 就崩：
+ *       signal 11 in je_free -> arena_run_dalloc
+ *       #03 ... base.apk (maps_make_clean_fd_ex+2960)
+ *   特点是偶发：三轮一中。
+ *
+ * 两次加锁尝试都失败了，且失败得更彻底（每轮必崩、jit 断言回来）：
+ *   一版把 maps_memfd_of 放进锁内 -> 它内部 register fd 可能再触发
+ *   maps 读取 -> 递归申请非递归锁 -> 看门线程卡死 -> ART 断开没执行。
+ *   改到锁外仍不行，说明这把锁在这条高频路径上本身就是不可接受的代价
+ *   （目标启动期读 300+ 次 maps，看门线程必须持续跑才能压住 JVMTI）。
+ *
+ * 最终选择：**不要缓存**。
+ * 每次读都重新过滤一遍。代价是每次多一次 malloc + 3000 行扫描，
+ * 但换来的是零共享状态、零锁、零竞态 —— 这条路径上任何阻塞
+ * 都会让 JVMTI 断开超时，那个代价远大于几百微秒的过滤。
+ */
 static time_t   g_maps_ttl_sec  = 0;
 static long     g_maps_ttl_nsec = 0;
 static unsigned long g_maps_ttl_hits = 0;
@@ -879,51 +947,43 @@ static size_t maps_emit_masked_line(char *out, size_t w, size_t cap,
  * 所以这个名字在这个位置完全合理。关键仍然是**行数不变**。
  */
 /*
- * 匿名可执行段：**保留全部原字段，只在末尾追加一个短路径**。
+ * 匿名可执行段：**从视图里整行剔除**，不输出、不改写。
  *
- * 这一条是两次试错试出来的，两个方向都踩过：
+ * ===== 五次试错的完整账，一次比一次接近真相 =====
  *
- * 1) 先改成 [anon:dalvik-jit-code-cache]，想让"匿名"看起来正常。
- *    结果检测器确实数不出匿名段了（它只数"无路径的 r-x"），
- *    但 hunter 6.58 恰恰按这个前缀判：
- *        Found suspicious anonymous memory :
- *        name -> [[anon:dalvik-jit-code-cache]]
- *    "[anon:" 本身就是"无归属"的标记，等于主动告诉对方。
+ * 1) [anon:dalvik-jit-code-cache]
+ *    hunter 按 "[anon:" 前缀判 "Found suspicious anonymous memory"。
  *
- * 2) 再改成伪装成真实的 boot.oat 映射，还给它配了 stat 出来的 dev/inode。
- *    更糟 —— 那条路径 60 字节，目标按固定长度缓冲解析，直接炸：
- *        Abort message: 'FORTIFY: strcpy: prevented 8-byte write into 5-byte buffer'
+ * 2) 伪装成 boot.oat + stat 出来的 dev/inode
+ *    路径 60 字节 -> FORTIFY 溢出崩溃。
  *
- * 现在这版是两条路的最小公约数：
- *   - 起止地址、权限、偏移、dev、inode **一个字节都不动**，只追加路径
- *   - 路径用系统本来就有的短名，不含 "[anon:" 前缀
- *   - 总长度只增加 33 字节，不会让任何按定长缓冲解析的地方溢出
+ * 3) 行尾追加 "/system/framework/framework.jar"
+ *    hunter stat 这个路径拿到 size=21619546，与行里 dev/inode=00:00/0
+ *    打架 -> 判 "libart.so 被修改"。
  *
- * 为什么要加路径而不是原样输出：com.cshlolss.antihook.detect 的
- * native_anon_exec 项就是数"无路径的 r-x 段"。原样输出时它判 RISK。
+ * 4) 原样输出
+ *    detect 的 native_anon_exec 立刻从 SAFE 掉到 RISK（它数"无路径的 r-x"）。
+ *
+ * 5) [anon_shmem:dalvik-jit-cache]（带自洽的 dev=00:01 与 inode）
+ *    又崩了，还是 FORTIFY：'prevented 8-byte write into 5-byte buffer'。
+ *    这次连名字本身都危险 —— hunter 会把方括号里的名字按 '-' 切开再拷，
+ *    "dalvik" 是 7 字符 + 终止符 = 8 字节，写进 5 字节缓冲。
+ *    也就是说：**在名字里放任何结构化片段都可能触发它的小缓冲区**。
+ *
+ * ===== 现在这版：不写名字，整行不输出 =====
+ *
+ * 依据：这类段对双方都只是"证据"，不是功能依赖。
+ *   - hunter 找不到可执行匿名段，就没有 "suspicious anonymous memory" 可报
+ *   - detect 的 native_anon_exec 数到 0 个，判 SAFE
+ *   - 我们给不出名字，就不会触发它任何一段按名解析的代码路径
+ *
+ * 行数变化不影响其它段：真实进程里这些段本来就是独立 VMA，
+ * 与相邻有路径的段不共享区间，删掉不会留下空洞地址。
  */
 static size_t maps_emit_anon_exec_masked(char *out, size_t w, size_t cap,
                                          const char *line, size_t len, int seq) {
-    static const char path[] = " /system/framework/framework.jar";
-    size_t pl = sizeof(path) - 1;
-    size_t body = len;
-
-    (void)seq;
-    if (w + len + pl + 2 > cap) return w;
-
-    /* 原行末尾可能是 '\n'，也可能没有；把路径插在换行之前 */
-    if (body > 0 && line[body - 1] == '\n') body--;
-
-    memcpy(out + w, line, body);
-    w += body;
-    /* 原行尾若已有空格就不再重复加 */
-    if (body > 0 && line[body - 1] != ' ' && line[body - 1] != '\t') {
-        out[w++] = ' ';
-    }
-    memcpy(out + w, path + 1, pl - 1);   /* 跳过开头那个空格，前面已补 */
-    w += pl - 1;
-    out[w++] = '\n';
-    return w;
+    (void)out; (void)w; (void)cap; (void)line; (void)len; (void)seq;
+    return w;   /* 直接不输出这一行 */
 }
 
 static size_t maps_emit_line(char *out, size_t w, size_t cap, const struct maps_ent *e) {
@@ -1000,16 +1060,7 @@ static int maps_make_clean_fd_ex(int is_smaps) {
      */
     {
         struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        if (!is_smaps && g_maps_ttl_buf && g_maps_ttl_len &&
-            (now.tv_sec - g_maps_ttl_sec) * 1000L +
-            (now.tv_nsec - g_maps_ttl_nsec) / 1000000L < MAPS_TTL_MS) {
-            int f = maps_memfd_of(g_maps_ttl_buf, g_maps_ttl_len);
-            if (f >= 0) {
-                g_maps_ttl_hits++;
-                return f;
-            }
-        }
+        /* TTL 缓存已移除：这里原本会在 120ms 窗口内复用上次结果 */
     }
 
     n = maps_read_all(&raw, &cap);
@@ -1221,21 +1272,7 @@ static int maps_make_clean_fd_ex(int is_smaps) {
     syscall(SYS_lseek, (int)fd, 0, SEEK_SET);
 
     /* 记录时间戳 + 保存内容副本供窗口内复用 */
-    {
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        if (!is_smaps && g_maps_ttl_buf) { free(g_maps_ttl_buf); g_maps_ttl_buf = NULL; g_maps_ttl_len = 0; }
-        {
-            char *cp = (char *)malloc(w ? w : 1);
-            if (cp) {
-                memcpy(cp, out, w);
-                g_maps_ttl_buf = cp;
-                g_maps_ttl_len = w;
-                g_maps_ttl_sec = now.tv_sec;
-                g_maps_ttl_nsec = now.tv_nsec;
-            }
-        }
-    }
+    /* TTL 缓存已移除：不再保存任何跨调用的缓冲副本 */
 
     free(raw);
     free(out);
@@ -1404,14 +1441,35 @@ static int ahb_is_libview_target(const char *path);
  *   也不能输出结构错乱的内容——错乱本身就比泄漏更容易被识别。
  */
 
+/*
+ * smaps / smaps_rollup 判定。
+ *
+ * 必须支持任意 pid，理由与 maps 完全相同：
+ * 目标是从子进程读「主进程」的 /proc/<pid>/smaps，
+ * 只认 self / 本pid / 父pid 会整条漏掉。
+ *
+ * smaps 比 maps 更敏感 —— 它带 Pss/Swap 等逐段统计，
+ * 漏掉一处就能被拿去做内存指纹。
+ */
 static int ahb_is_smaps_path(const char *path) {
     char want[64];
+    const char *p2;
+    int got = 0;
+
     if (!path) return 0;
-    if (strcmp(path, "/proc/self/smaps") == 0) return 1;
+    if (strcmp(path, "/proc/self/smaps") == 0 ||
+        strcmp(path, "/proc/self/smaps_rollup") == 0) return 1;
     snprintf(want, sizeof(want), "/proc/%d/smaps", (int)getpid());
     if (strcmp(path, want) == 0) return 1;
     snprintf(want, sizeof(want), "/proc/%d/smaps", (int)getppid());
     if (strcmp(path, want) == 0) return 1;
+
+    /* 任意 pid：/proc/<num>/smaps 或 /proc/<num>/smaps_rollup */
+    if (strncmp(path, "/proc/", 6) != 0) return 0;
+    p2 = path + 6;
+    while (*p2 >= '0' && *p2 <= '9') { got = 1; p2++; }
+    if (!got) return 0;
+    if (strcmp(p2, "/smaps") == 0 || strcmp(p2, "/smaps_rollup") == 0) return 1;
     return 0;
 }
 
@@ -1584,6 +1642,19 @@ static int ahb_make_text_filtered_fd(const char *path, int mounts_mode) {
 static int ahb_proc_filter_wanted(const char *path) {
     return maps_path_is_self(path) || ahb_is_smaps_path(path) ||
            ahb_is_mounts_path(path) || ahb_is_modules_path(path);
+}
+
+/*
+ * 这个路径会不会被过滤（只看分流判定，不真的生成 fd）。
+ * 自检专用，避免为了"测一下"去分配一整份 memfd。
+ */
+static int ahb_path_would_filter(const char *path) {
+    if (!path) return 0;
+    if (ahb_is_smaps_path(path)) return 1;
+    if (maps_path_is_self(path)) return 1;
+    if (ahb_is_mounts_path(path)) return 1;
+    if (ahb_is_modules_path(path)) return 1;
+    return 0;
 }
 
 static int ahb_filtered_fd_for(const char *path) {
@@ -3255,7 +3326,9 @@ void *ahb_android_dlopen_ext_wrap(const char *name, int flags, const void *extin
     void *h;
     if (n2 < 24) {
         n2++;
+        #if AHB_DIAG
         LOGI("DLOPEN_EXT[%d] %s", n2, name ? name : "(null)");
+        #endif
     }
 #if AHB_BLOCK_JVMTI
     if (ahb_is_jvmti_path(name)) {

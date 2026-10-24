@@ -73,6 +73,10 @@
 #define AHB_SAYL(...) do { } while (0)
 #endif
 
+#if AHB_SAY
+static void ahb_pathcheck(void);   /* 前向声明：调用点在定义之前 */
+#endif
+
 #define LOG_TAG "AntiHookBypass"
 
 /* 诊断落文件：logcat 环形缓冲会被系统高频输出冲掉，证据必须留盘 */
@@ -1414,10 +1418,13 @@ static void *jvmti_watch_thread(void *arg) {
          * 会被 logd 丢掉（EARLY_BODY / EARLY_INIT 一条都看不到，
          * 而稍后的 DLOPEN[n] 正常），所以推迟到 400ms 之后。
          */
-#if AHB_DIAG
+#if AHB_SAY
         if (!sc_done && ahb_now_us() - t0 > 400000UL) {
             sc_done = 1;
+            ahb_pathcheck();
+#if AHB_DIAG
             ahb_selfcheck_fd();
+#endif
         }
 #endif
         usleep(1000);
@@ -3934,7 +3941,9 @@ Java_com_rev_antihookbypass_NativeLayer_nativeEarlyInit(JNIEnv *env, jclass cls)
 __attribute__((visibility("default")))
 jint JNICALL
 Java_com_rev_antihookbypass_NativeLayer_nativeSanitizeRuntime(JNIEnv *env, jclass cls, jint ops) {
+#if AHB_DIAG
     { int i; for (i = 0; i < 3; i++) LOGE("SANITIZE-ENTER v=NEUTRAL2 pid=%d", (int)getpid()); }
+#endif
     /*
      * 这里才是本模块真实的 native 入口。
      *
@@ -4330,6 +4339,56 @@ static char *ahb_read_path_raw(const char *path, size_t *out_len) {
     if (out_len) *out_len = len;
     return b;
 }
+
+
+#if AHB_SAY
+/* 路径判定自检：构造若干路径，直接看 maps_path_is_self 认不认。 */
+static void ahb_pathcheck(void) {
+    static const char *yes[] = {
+        "/proc/self/maps",
+        "/proc/18023/maps",                 /* 目标从子进程读主进程 —— 关键 */
+        "/proc/1/maps",
+        "/proc/21624/task/21624/maps",
+        "/proc/18023/smaps",              /* 外部 pid 的 smaps，同样关键 */
+        "/proc/18023/smaps_rollup",
+        "/proc/self/smaps",               /* 自身 smaps 当然也要过滤 */
+        "/proc/self/smaps_rollup",
+        NULL
+    };
+    static const char *no[] = {
+        "/proc/self/status",
+        "/proc/self/fd/3",
+        "/system/lib64/libc.so",
+        NULL
+    };
+    char buf[256];
+    int i, bad = 0;
+    /*
+     * 这里必须问「真实的分发函数」，而不是单独问 maps_path_is_self。
+     *
+     * 踩过的坑：第一版所有用例都丢给 maps_path_is_self，
+     * 但 /proc/<pid>/smaps 实际由 ahb_is_smaps_path 负责，
+     * 于是在自检里显示"漏"，而线上路径是好的 ——
+     * 自检本身给错了结论，比不测更糟。
+     *
+     * ahb_filtered_fd_for 才是 open 包装真正调用的入口，
+     * 它内部已按 maps / smaps / mounts / modules 分流。
+     */
+    for (i = 0; yes[i]; i++) {
+        int r = ahb_path_would_filter(yes[i]);
+        if (!r) bad++;
+        snprintf(buf, sizeof(buf), "PATHCHK 应认 %s -> %s", yes[i], r ? "认" : "漏");
+        AHB_SAYL("%s", buf);
+    }
+    for (i = 0; no[i]; i++) {
+        int r = ahb_path_would_filter(no[i]);
+        if (r) bad++;
+        snprintf(buf, sizeof(buf), "PATHCHK 应弃 %s -> %s", no[i], r ? "误认" : "弃");
+        AHB_SAYL("%s", buf);
+    }
+    AHB_SAYL("PATHCHK 结论 错判=%d", bad);
+}
+#endif
 
 #if AHB_DIAG
 static void ahb_selfcheck_fd(void) {

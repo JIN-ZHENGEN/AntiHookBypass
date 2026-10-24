@@ -871,6 +871,48 @@ final class PathHiding {
     }
 
 
+
+    /**
+     * 命中 module= 之后那一整段路径（到逗号或右括号为止）。
+     *
+     * <p>形如：
+     * <pre>
+     * LspModuleClassLoader[module=/data/app/~~xxx==/com.rev.xxx-yyy==/base.apk,
+     *   o1[DexPathList[...]]]
+     * </pre>
+     * 要把 {@code module=} 后面到第一个逗号为止的内容整体换掉。
+     */
+    private static final java.util.regex.Pattern MODULE_SEG =
+            java.util.regex.Pattern.compile(
+                    "(module=)/[^,\\]]*");
+
+    /**
+     * 把 {@code module=<我们的路径>} 整段换成系统自带的框架路径。
+     *
+     * <h2>为什么这里可以不等长</h2>
+     * 拦的是 StringBuilder.toString / String.concat 的<b>返回值</b>，
+     * 用 {@code setResult} 换成一个全新的 String，不受长度约束。
+     * 之前走的「原地改字节」那条路才必须等长（改的是已有对象的内容）。
+     *
+     * <h2>为什么必须换掉整段，而不是只换包名</h2>
+     * 只把 antihookbypass 换成 androidruntime 时，hunter 照样报
+     * "Find Lsposed Hook Module"，因为它看的是「这里有一个模块 apk 路径」
+     * 这件事本身，名字变中性并不让它消失。
+     *
+     * 而 com.rev.androidruntime 这个包名在系统里根本不存在，
+     * 一个指向不存在应用的路径比原名更可疑。所以换成真实存在的框架路径。
+     */
+    static String scrubModuleSegment(String s) {
+        if (s == null || s.indexOf("module=") < 0) return s;
+        if (!s.contains(SELF_SHORT) && !s.contains(SELF)) return s;
+        String out = MODULE_SEG.matcher(s).replaceAll("$1" + REPLACE);
+        /* 兜底：容器里可能还有残留路径 */
+        out = out.replace(SELF_SO, REPL_SO)
+                 .replace(SELF_SHORT, REPL_SHORT)
+                 .replace(SELF, REPL_SHORT);
+        return out;
+    }
+
     /**
      * 拦截字符串拼接的出口。
      *
@@ -900,11 +942,10 @@ final class PathHiding {
                         protected void afterHookedMethod(MethodHookParam param) {
                             if (selfCalling()) return;
                             Object r = param.getResult();
-                            if (r instanceof String && ((String) r).contains(SELF_SHORT)) {
-                                String fixed = String.valueOf(r)
-                                        .replace(SELF_SO, REPL_SO)
-                                        .replace(SELF_SHORT, REPL_SHORT);
-                                param.setResult(fixed);
+                            if (!(r instanceof String)) return;
+                            String v = (String) r;
+                            if (v.contains(SELF_SHORT) || v.contains(SELF)) {
+                                param.setResult(scrubModuleSegment(v));
                             }
                         }
                     });
@@ -921,11 +962,10 @@ final class PathHiding {
                         protected void afterHookedMethod(MethodHookParam param) {
                             if (selfCalling()) return;
                             Object r = param.getResult();
-                            if (r instanceof String && ((String) r).contains(SELF_SHORT)) {
-                                String fixed = String.valueOf(r)
-                                        .replace(SELF_SO, REPL_SO)
-                                        .replace(SELF_SHORT, REPL_SHORT);
-                                param.setResult(fixed);
+                            if (!(r instanceof String)) return;
+                            String v = (String) r;
+                            if (v.contains(SELF_SHORT) || v.contains(SELF)) {
+                                param.setResult(scrubModuleSegment(v));
                             }
                         }
                     });
