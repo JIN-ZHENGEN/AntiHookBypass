@@ -399,6 +399,44 @@ F jit_code_cache.cc:1309 Check failed: !ContainsElement(zombie_code_, code_ptr)
 
 
 ### 视图痕迹：三个实测出来的漏点
+### 自检放在 `break` 之后，等于永远不验证
+
+看门线程原来这样写：
+
+```c
+ahb_try_patch_jvmti();
+if (g_jvmti_patched) break;   // 成功就退出循环
+/* ... 自检代码在这里 ... */
+```
+
+结果是：**patch 成功时循环直接 `break`，自检一次都不执行**。
+表现成 `VIEWART` / `PATHCHK` 一条日志都没有，很容易误判成自检代码坏了，
+于是跑去翻自检实现，越翻越远。实际是时序问题——最需要验证的成功路径恰好被跳过。
+
+修法是把自检提到成功退出口之前。修完之后才第一次看到真实的包装视图：
+
+```
+VIEWART seg=4 frag=0
+VIEWMNT len=64482 adb=0
+CMP 内核 len=285698 痕迹=3 | 包装 len=284930 痕迹=0
+```
+
+> 由此得出一条通用判据：在任何「重试直到成功」的循环里放埋点，
+> 先问一句**成功时还会不会执行到这里**。绝大多数写法都会在成功时
+> `break` / `return`，把这些代码全部绕开。
+
+### libart 那条「被修改」的证据链
+
+hunter 报的 `find libart.so hooked 4096` 指的是这样一个 4KB 段：
+
+```
+7a8e44e000-7a8e44f000 r-xp 00ba0000 ... /apex/com.android.art/lib64/libart.so
+```
+
+它正是本模块 patch `UpdateEntrypointsForDebuggable` 时 `mprotect` 拆出来的 VMA
+（`0xba0534` 落在 `0xba0000` 这一页）。段合并判据从「只认 linker64」改成
+「**同路径 + 首尾相接**」之后，内核视角的 6 段（含 1 个碎片）在视图里合并成 4 段、碎片 0。
+
 ### 一个我自己引入的堆竞态
 
 `maps_emit_*` 这条路径原来挂着一个 TTL 缓存（120ms 内复用上次过滤结果），
