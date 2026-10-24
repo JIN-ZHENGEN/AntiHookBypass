@@ -29,19 +29,72 @@ extern "C" {
     void ahb_zygisk_engine_set_scope(int on);
 }
 
-// 作用域：只有这些包在进程内启用引擎。
-// 留空字符串表示"全部进程"，便于先验证通路。
-static const char *const kScopePkgs[] = {
+/*
+ * 作用域：从模块目录下的 scope.txt 读，**不编进 so**。
+ *
+ * 为什么这么做：把包名编进二进制，意味着"多加一个应用就要重编 + 重装 + 重启"，
+ * 这是最难受的迭代成本。改成读文件后，加应用只要：
+ *     echo 包名 >> /data/adb/modules/antihookbypass_zygisk/scope.txt
+ * 然后重开那个应用，一个字节都不用重编。
+ *
+ * 读取时机必须在 preAppSpecialize：那时进程还是 zygote 权限，
+ * 能读到 /data/adb；到 postAppSpecialize 已经被沙箱限制。
+ *
+ * 格式：一行一个包名，支持前缀匹配；空行和 # 开头忽略。
+ * 文件不存在时用下面的内置默认值。
+ */
+#define SCOPE_FILE "/data/adb/modules/antihookbypass_zygisk/scope.txt"
+#define SCOPE_MAX  32
+#define SCOPE_LEN  128
 
+static char g_scope[SCOPE_MAX][SCOPE_LEN];
+static int  g_scope_n = 0;
+static int  g_scope_loaded = 0;
+
+static const char *const kScopeDefault[] = {
     "com.zhenxi.hunter",
     "com.cshlolss.antihook.detect",
 };
 
+static void scope_load(void) {
+    FILE *f;
+    char line[SCOPE_LEN];
+    if (g_scope_loaded) return;
+    g_scope_loaded = 1;
+
+    f = fopen(SCOPE_FILE, "r");
+    if (!f) {
+        for (unsigned i = 0; i < sizeof(kScopeDefault) / sizeof(kScopeDefault[0]); i++) {
+            if (g_scope_n >= SCOPE_MAX) break;
+            strncpy(g_scope[g_scope_n], kScopeDefault[i], SCOPE_LEN - 1);
+            g_scope_n++;
+        }
+        ZLOGE("scope: 用内置默认 %d 条", g_scope_n);
+        return;
+    }
+    while (fgets(line, sizeof(line), f) && g_scope_n < SCOPE_MAX) {
+        char *p = line;
+        char *e;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\n' || *p == 0) continue;
+        e = p + strlen(p);
+        while (e > p && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ')) e--;
+        *e = 0;
+        if (!*p) continue;
+        strncpy(g_scope[g_scope_n], p, SCOPE_LEN - 1);
+        g_scope[g_scope_n][SCOPE_LEN - 1] = 0;
+        g_scope_n++;
+    }
+    fclose(f);
+    ZLOGE("scope: 从文件读到 %d 条", g_scope_n);
+}
+
 static int pkg_in_scope(const char *pkg) {
+    int i;
     if (!pkg) return 0;
-    for (unsigned i = 0; i < sizeof(kScopePkgs) / sizeof(kScopePkgs[0]); i++) {
-        const char *s = kScopePkgs[i];
-        if (strncmp(pkg, s, strlen(s)) == 0) return 1;
+    scope_load();
+    for (i = 0; i < g_scope_n; i++) {
+        if (strncmp(pkg, g_scope[i], strlen(g_scope[i])) == 0) return 1;
     }
     return 0;
 }

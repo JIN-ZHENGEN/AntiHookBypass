@@ -1,0 +1,4 @@
+# AntiHook Bypass 作用域：一行一个包名，前缀匹配
+# 改完这个文件不需要重编、不需要重启，只要重开目标应用即可
+com.zhenxi.hunter
+com.cshlolss.antihook.detect
