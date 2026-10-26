@@ -7,6 +7,10 @@
 # 差异大，且不同 triple 的 crt 目录不同，极易写错导致 "no such file"）。
 # 改为交给 clang 用 --target=<triple><api> + --sysroot 自动定位 crt，
 # 显式链接 -lc -ldl -llog 即可。-nostdlib 也去掉，避免阻止 clang 放 crt。
+#
+# 注意：不要加 -fvisibility=hidden。源码已用 __attribute__((visibility("default")))
+# 显式导出 native_init / JNI 入口；全局 hidden 会把这些符号从动态符号表抹掉，
+# 导致 LSPosed 加载时找不到 native_init（readelf --dyn-syms 查无此符号）。
 set -e
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -24,8 +28,11 @@ SRC="$ROOT/app/src/main/jni/native_main.c"
 OUT="$ROOT/build/lib"
 CLANG_BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
-# 将 NDK 工具链加入 PATH（clang / readelf 等）
+# 将 NDK 工具链加入 PATH（clang / llvm-readelf 等）
 export PATH="$CLANG_BIN:$PATH"
+
+# 优先用 NDK 自带的 llvm-readelf（系统可能只有 readelf 或都没有）
+READELF="$(command -v llvm-readelf || command -v readelf || echo llvm-readelf)"
 
 mkdir -p "$OUT"
 
@@ -36,16 +43,17 @@ build() {
   mkdir -p "$d"
 
   # shellcheck disable=SC2086
-  # 注意：不要加 -fvisibility=hidden。源码已用 __attribute__((visibility("default")))
-  # 显式导出 native_init / JNI 入口；全局 hidden 会把这些符号从动态符号表抹掉，
-  # 导致 LSPosed 加载时找不到 native_init（readelf --dyn-syms 查无此符号）。
   clang --target="$target" --sysroot="$SYS" $extra \
       -shared -fPIC -O2 \
       -o "$d/libantihook_bypass.so" "$SRC" -lc -ldl -llog
 
-  if readelf --dyn-syms "$d/libantihook_bypass.so" | grep -q native_init && \
-     readelf --dyn-syms "$d/libantihook_bypass.so" | grep -q Java_com_rev_antihookbypass_NativeLayer_nativeSanitizeRuntime; then
-    echo "    $abi  OK  $(stat -c%s "$d/libantihook_bypass.so") B"
+  echo "    $abi  .so size: $(stat -c%s "$d/libantihook_bypass.so") B"
+  echo "    $abi  dyn-syms (native_init / sanitize):"
+  "$READELF" --dyn-syms "$d/libantihook_bypass.so" 2>/dev/null | grep -iE 'native_init|nativeSanitizeRuntime' || echo "    (none matched)"
+
+  if "$READELF" --dyn-syms "$d/libantihook_bypass.so" 2>/dev/null | grep -q native_init && \
+     "$READELF" --dyn-syms "$d/libantihook_bypass.so" 2>/dev/null | grep -q Java_com_rev_antihookbypass_NativeLayer_nativeSanitizeRuntime; then
+    echo "    $abi  OK"
   else
     echo "    $abi  FAIL: 关键符号未导出"
     return 1
@@ -54,6 +62,7 @@ build() {
 
 echo "==> SDK_ROOT=$SDK_ROOT  NDK=$NDK"
 echo "==> clang: $(command -v clang)"
+echo "==> readelf: $READELF"
 
 echo "==> 编译 native（4 个 ABI）"
 build arm64-v8a    aarch64-linux-android24    ""
