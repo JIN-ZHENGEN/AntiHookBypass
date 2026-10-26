@@ -2,10 +2,10 @@ name: Build AntiHookBypass
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, l1-default-on ]
   workflow_dispatch:
   pull_request:
-    branches: [ main, master ]
+    branches: [ main, master, l1-default-on ]
 
 jobs:
   build:
@@ -25,7 +25,8 @@ jobs:
           java-version: '17'
 
       # 仓库根目录为 $GITHUB_WORKSPACE；原 build.sh 用 W="$(cd $ROOT/..)" 即仓库的父目录
-      # 因此把 SDK/NDK/.libs 都放在 $GITHUB_WORKSPACE/.. 下，让原脚本的硬路径恰好命中。
+      # 因此把 SDK/NDK 都放在 $GITHUB_WORKSPACE/.. 下，让原脚本的硬路径恰好命中。
+      # .libs/xposed-api.jar 已随仓库 checkout 下来（不再依赖外部下载）。
       - name: Compute paths
         id: paths
         run: |
@@ -80,26 +81,14 @@ jobs:
           mv "$NDK_DIR/android-ndk-r26b" "$NDK_DIR/26.3.11579264"
 
       # ---------- Xposed API jar (.libs/xposed-api.jar) ----------
-      - name: Cache Xposed API jar
-        id: xposed-cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/.libs/xposed-api.jar
-          key: ahb-xposed-api-jar-v1
-
-      - name: Download Xposed API jar
-        if: steps.xposed-cache.outputs.cache-hit != 'true'
+      # 已随仓库 checkout，无需下载。仅做存在性校验，缺失时给出明确报错。
+      - name: Verify Xposed API jar
         run: |
           set -e
-          mkdir -p ${{ github.workspace }}/.libs
-          # 优先 Maven Central 的官方 API 坐标
-          curl -fsSL -o ${{ github.workspace }}/.libs/xposed-api.jar \
-            "https://repo1.maven.org/maven2/de/robv/android/xposed/api/82/api-82.jar" || \
-          curl -fsSL -o ${{ github.workspace }}/.libs/xposed-api.jar \
-            "https://jitpack.io/com/github/rovo89/XposedBridge/api-82.jar" || \
-          curl -fsSL -o ${{ github.workspace }}/.libs/xposed-api.jar \
-            "https://raw.githubusercontent.com/LSPosed/LSPosed/master/core/api/api.jar" || true
-          ls -la ${{ github.workspace }}/.libs/xposed-api.jar
+          ls -la "${{ github.workspace }}/.libs/xposed-api.jar"
+          unzip -l "${{ github.workspace }}/.libs/xposed-api.jar" | grep -q 'XposedHelpers.class' \
+            && echo "xposed-api.jar OK" \
+            || (echo "xposed-api.jar is NOT a valid Xposed API jar" && exit 1)
 
       # ---------- 使 build.sh / build_native.sh 在 runner 上可执行 ----------
       - name: Fix shebang + exec
