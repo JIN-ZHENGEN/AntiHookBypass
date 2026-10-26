@@ -14,25 +14,32 @@ export PATH="$PATH"
 
 mkdir -p "$OUT"
 
-# 探测 NDK sysroot 实际存在的 API level（r26b 仅有 24+，无 21）。
-# 取 aarch64-linux-android 目录下数值最小的那个，作为 crt/link 路径的 API 级。
-detect_api() {
+# 探测 sysroot 中真实存在 crtbegin_so.o 的 API 级目录。
+# NDK r26(r26b) 的 unified sysroot 布局与旧版不同：aarch64-linux-android/ 下
+# 可能没有数字子目录，crt 直接放在该 triple 目录根；也可能按 24/27 分目录。
+# 这里直接找"含 crtbegin_so.o 的目录"，兼容两种布局。
+detect_crtdir() {
     local libroot="$SYS/usr/lib/aarch64-linux-android"
-    local best=""
-    for d in "$libroot"/*; do
-        local n
-        n="$(basename "$d")"
-        case "$n" in
-            (*[!0-9]*) continue ;;
-        esac
-        if [ -z "$best" ] || [ "$n" -lt "$best" ]; then
-            best="$n"
-        fi
+    local found=""
+    # 优先在 数字子目录 中找
+    for d in "$libroot"/*/crtbegin_so.o; do
+        [ -f "$d" ] || continue
+        found="$(dirname "$d")"
+        break
     done
-    echo "${best:-24}"
+    # 若没有数字子目录，回退到 triple 根目录（unified sysroot）
+    if [ -z "$found" ] && [ -f "$libroot/crtbegin_so.o" ]; then
+        found="$libroot"
+    fi
+    echo "$found"
 }
 
-API="$(detect_api)"
+CRTDIR="$(detect_crtdir)"
+if [ -z "$CRTDIR" ]; then
+    echo "    FAIL: 在 $SYS/usr/lib 下找不到 crtbegin_so.o"
+    exit 1
+fi
+echo "==> 使用 crt 目录: $CRTDIR"
 
 build() {
     local abi="$1" target="$2" libdir="$3"; shift 3
@@ -43,9 +50,9 @@ build() {
     # shellcheck disable=SC2086
     clang --target="$target" --sysroot="$SYS" $extra \
         -shared -fPIC -O2 -fvisibility=hidden -nostdlib \
-        "$SYS/usr/lib/$libdir/$API/crtbegin_so.o" \
-        "$SYS/usr/lib/$libdir/$API/crtend_so.o" \
-        -L"$SYS/usr/lib/$libdir/$API" \
+        "$CRTDIR/crtbegin_so.o" \
+        "$CRTDIR/crtend_so.o" \
+        -L"$CRTDIR" \
         -o "$d/libantihook_bypass.so" $SRC -lc -ldl -llog
 
     if readelf --dyn-syms "$d/libantihook_bypass.so" | grep -q native_init && \
@@ -57,11 +64,11 @@ build() {
     fi
 }
 
-echo "==> 编译 native（4 个 ABI），NDK sysroot API=$API"
+echo "==> 编译 native（4 个 ABI）"
 
-build arm64-v8a    aarch64-linux-android$API    aarch64-linux-android    ""
-build armeabi-v7a  armv7a-linux-androideabi$API arm-linux-androideabi    "-march=armv7-a -mfloat-abi=softfp -mfpu=vfpv3-d16"
-build x86          i686-linux-android$API       i686-linux-android       ""
-build x86_64       x86_64-linux-android$API     x86_64-linux-android     ""
+build arm64-v8a    aarch64-linux-android24    aarch64-linux-android    ""
+build armeabi-v7a  armv7a-linux-androideabi24 arm-linux-androideabi    "-march=armv7-a -mfloat-abi=softfp -mfpu=vfpv3-d16"
+build x86          i686-linux-android24       i686-linux-android       ""
+build x86_64       x86_64-linux-android24     x86_64-linux-android     ""
 
 echo "==> native 编译完成"
