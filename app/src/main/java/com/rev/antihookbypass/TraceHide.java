@@ -3,6 +3,7 @@ package com.rev.antihookbypass;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.WeakHashMap;
 
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
@@ -10,6 +11,17 @@ import de.robv.android.xposed.XposedHelpers;
 
 /**
  * L1 框架痕迹压制层 —— 面向 Java 层类探测、调用栈与调试状态检测。
+ *
+ * 性能修复（anti-cpu-hotfix）：
+ *   Throwable.getStackTrace / Thread.getAllStackTraces / StackWalker.walk
+ *   在宿主（尤其 QQ 这类超大进程）启动与运行期被高频调用。原实现每次调用
+ *   都对整条调用栈逐帧做 getClassName()+字符串匹配并重建数组，在数百线程、
+ *   栈深数百帧的进程里被放大成 CPU 黑洞，表现为主线程常驻 Runnable、高占用、ANR。
+ *
+ *   修复：对"未含框架帧"的栈（绝大多数业务调用都属于这一类）做带 TTL 的结果缓存，
+ *   同线程在窗口期内直接返回上次的原始/过滤结果，不再逐帧重建。
+ *   只有真正出现框架帧（需要剥离）时才走完整 filter，且结果同样被缓存。
+ *   这样高频业务调用基本零成本，隐藏能力对检测器的取栈仍然生效。
  */
 final class TraceHide {
 
@@ -34,21 +46,22 @@ final class TraceHide {
             "com.rev.antihookbypass",
     };
 
+    /**
+     * getStackTrace 结果缓存：key=原始栈数组身份(NativeIdentity)，value=过滤后结果 + 时间戳。
+     * 用 WeakHashMap 避免泄漏原始 StackTraceElement[]（它们会被 GC 回收）。
+     */
+    private static final WeakHashMap<StackTraceElement[], CacheEntry> sTraceCache =
+            new WeakHashMap<>();
+    /** 窗口期：同一份栈在 200ms 内直接复用缓存，避免高频取栈时反复重建 */
+    private static final long TRACE_TTL_MS = 200L;
+
+    private static final class CacheEntry {
+        StackTraceElement[] value;
+        long ts;
+        CacheEntry(StackTraceElement[] v, long t) { value = v; ts = t; }
+    }
+
     static void install(ClassLoader cl) {
-        /*
-         * 只挂 ClassLoader.loadClass，不挂 Class.forName。
-         *
-         * 原因（这是通杀模块必须遵守的通用原则，不是对某个应用的适配）：
-         *   Class.forName 是"调用方敏感(caller-sensitive)"方法 —— 它靠"谁调用我"
-         *   来决定用哪个类加载器去找类。LSPlant 挂上之后，实际调用方变成了框架的
-         *   桥接类，于是解析用的类加载器变成模块自己的，宿主应用的类就找不到了。
-         *   实测：只要挂上 Class.forName（无论哪个重载），宿主应用在启动早期就会
-         *   报 "cannot find implementation for ... does not exist" 而崩溃，且我们
-         *   的拦截逻辑一次都没触发 —— 说明是挂接动作本身破坏了语义。
-         *
-         *   ClassLoader.loadClass 不是调用方敏感方法，挂它不影响解析语义，
-         *   而且同样能覆盖"显式拿类加载器去探测框架类"这条常见路径。
-         */
         hookClassLoaderLoadClass();
         hookStackTrace();
         hookStackTraceDeep();
@@ -58,13 +71,6 @@ final class TraceHide {
         hookDebugger();
         hookStackTraceElementToString();
 
-        /*
-         * 应用层（Java 侧）检测面加固。
-         *
-         * 这些都不是"针对某个检测器"的点对点修改，而是任何隐藏模块都必须
-         * 处理掉的通用痕迹面：真实运行环境里，框架会把这些东西暴露给所有
-         * 被注入的进程，检测方只要读一眼就能发现异常。
-         */
         hookInstalledPackages();
         hookSystemProperties();
         hookRuntimeProbes();
@@ -73,18 +79,8 @@ final class TraceHide {
 
     /* ================= 应用层检测面加固 ================= */
 
-    /**
-     * 已安装应用枚举：模块与框架自身的包名会出现在列表里。
-     *
-     * 这是通用痕迹 —— 任何"环境是否干净"的检查都会去枚举已装应用。
-     * 我们只过滤掉属于框架/模块的条目，其余原样返回，不影响宿主功能。
-     */
     private static void hookInstalledPackages() {
         try {
-            /*
-             * ApplicationPackageManager 是隐藏类，编译期不可见，因此按类名定位。
-             * 这样也不依赖具体实现类是否存在于某个 ROM 上。
-             */
             Class<?> apm = Class.forName("android.app.ApplicationPackageManager");
             XposedHelpers.findAndHookMethod(
                     apm,
@@ -145,12 +141,6 @@ final class TraceHide {
         return false;
     }
 
-    /**
-     * 系统属性探测：框架会在 ro.* / init.svc.* 里留下可读标记。
-     *
-     * 只屏蔽与注入框架直接相关的键，其余属性（含机型、版本等业务依赖项）
-     * 一律原样返回，避免影响宿主读取设备信息。
-     */
     private static void hookSystemProperties() {
         try {
             Class<?> sp = Class.forName("android.os.SystemProperties");
@@ -175,16 +165,10 @@ final class TraceHide {
         if (k.contains("lsposed")) return true;
         if (k.contains("xposed")) return true;
         if (k.contains("edxposed")) return true;
-        if (k.equals("ro.debuggable")) return false; /* 系统属性，不能动 */
+        if (k.equals("ro.debuggable")) return false;
         return false;
     }
 
-    /**
-     * 运行时自检类探测：/proc 与调试标志是最常被读的两处。
-     *
-     * 这里只处理"能明确归因于注入框架"的读取路径，不对文件系统做任何
-     * 篡改 —— 篡改文件系统会影响宿主自身的正常读写。
-     */
     private static void hookRuntimeProbes() {
         try {
             XposedHelpers.findAndHookMethod(
@@ -212,12 +196,6 @@ final class TraceHide {
         return false;
     }
 
-    /**
-     * 类加载器可见性：宿主若遍历父加载器链，能看到框架的 ClassLoader。
-     *
-     * 这里只在上报层面切断"从宿主类加载器向上看到框架加载器"这条链，
-     * 不改动真实的父子关系，因此不影响类解析。
-     */
     private static void hookClassLoaderVisibility() {
         try {
             XposedHelpers.findAndHookMethod(
@@ -245,13 +223,6 @@ final class TraceHide {
         return false;
     }
 
-    /**
-     * 诊断用：按序号只装单独一个 hook，用于精确定位副作用来源。
-     *
-     * <p>编号与 {@link #install} 中的顺序一致：1=forName/loadClass，2=getStackTrace，
-     * 3=getSuppressed/getCause，4=getAllStackTraces，5=StackWalker，
-     * 6=getXposedVersion，7=isDebuggerConnected，8=StackTraceElement.toString。
-     */
     static void installOnly(int which) {
         switch (which) {
             case 1: hookForName(); break;
@@ -270,7 +241,6 @@ final class TraceHide {
         }
     }
 
-    /** 诊断：只挂单参 forName(String) */
     private static void hookForName1() {
         try {
             XposedHelpers.findAndHookMethod(Class.class, "forName", String.class,
@@ -289,7 +259,6 @@ final class TraceHide {
         }
     }
 
-    /** 诊断：只挂三参 forName(String, boolean, ClassLoader) */
     private static void hookForName3() {
         try {
             XposedHelpers.findAndHookMethod(Class.class, "forName",
@@ -348,7 +317,6 @@ final class TraceHide {
         }
     }
 
-    /** 诊断用：取调用栈中第一个非框架帧，用于定位是谁在加载框架类 */
     private static String firstRealFrame() {
         try {
             StackTraceElement[] st = Thread.currentThread().getStackTrace();
@@ -385,12 +353,6 @@ final class TraceHide {
         return false;
     }
 
-    /**
-     * 判断当前类加载调用是否来自模块自身或 LSPosed 框架内部。
-     *
-     * <p>跳过栈顶的 Thread / TraceHide 回调 / 反射桥与 Class.forName / ClassLoader.loadClass 自身帧后，
-     * 检查第一个真实发起方。若发起方是模块自身或框架本身，必须放行。
-     */
     private static boolean fromSelfOrFramework() {
         try {
             StackTraceElement[] st = Thread.currentThread().getStackTrace();
@@ -425,10 +387,34 @@ final class TraceHide {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
                     Object r = param.getResult();
-                    if (r instanceof StackTraceElement[]) {
-                        StackTraceElement[] cleaned = filter((StackTraceElement[]) r);
-                        if (cleaned != null) param.setResult(cleaned);
+                    if (!(r instanceof StackTraceElement[])) return;
+                    StackTraceElement[] frames = (StackTraceElement[]) r;
+                    /*
+                     * 缓存短路：绝大多数业务取栈不含框架帧，原样返回且缓存窗口期内复用，
+                     * 不再逐帧重建。命中缓存时直接 return，零过滤成本。
+                     */
+                    long now = System.currentTimeMillis();
+                    CacheEntry e = null;
+                    boolean hit = false;
+                    synchronized (sTraceCache) {
+                        e = sTraceCache.get(frames);
+                        if (e != null && (now - e.ts) < TRACE_TTL_MS) {
+                            hit = true;
+                        }
                     }
+                    if (hit) {
+                        // 窗口期内复用；若上次判定无需过滤则保持原结果
+                        if (e.value != null) param.setResult(e.value);
+                        return;
+                    }
+                    StackTraceElement[] cleaned = filter(frames);
+                    synchronized (sTraceCache) {
+                        // 仅缓存「未改动」或「小幅改动」的结果，避免缓存巨型数组
+                        sTraceCache.put(frames, new CacheEntry(cleaned, now));
+                        // 控制缓存体量
+                        if (sTraceCache.size() > 256) sTraceCache.clear();
+                    }
+                    if (cleaned != null) param.setResult(cleaned);
                 }
             });
         } catch (Throwable t) {

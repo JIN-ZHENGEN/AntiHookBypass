@@ -1,0 +1,135 @@
+name: Build AntiHookBypass
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # 仓库根目录为 $GITHUB_WORKSPACE；原 build.sh 用 W="$(cd $ROOT/..)" 即仓库的父目录
+      # 因此把 SDK/NDK/.libs 都放在 $GITHUB_WORKSPACE/.. 下，让原脚本的硬路径恰好命中。
+      - name: Compute paths
+        id: paths
+        run: |
+          echo "REPO_PARENT=${{ github.workspace }}" >> "$GITHUB_ENV"
+          echo "SDK=${{ github.workspace }}/android-sdk" >> "$GITHUB_ENV"
+
+      # ---------- Android SDK (cmdline-tools + build-tools 34 + platform 34) ----------
+      - name: Cache Android SDK
+        id: sdk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/android-sdk
+          key: ahb-android-sdk-34-v1
+
+      - name: Install Android SDK
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          SDK=${{ github.workspace }}/android-sdk
+          mkdir -p "$SDK/cmdline-tools"
+          curl -fsSL -o cmdline.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q cmdline.zip -d "$SDK/cmdline-tools"
+          mv "$SDK/cmdline-tools/cmdline-tools" "$SDK/cmdline-tools/latest"
+          rm cmdline.zip
+          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK" \
+            "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Export Android SDK env
+        run: |
+          SDK=${{ github.workspace }}/android-sdk
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "PATH=$SDK/cmdline-tools/latest/bin:$SDK/platform-tools:$SDK/build-tools/34.0.0:$PATH" >> "$GITHUB_ENV"
+
+      # ---------- NDK r26.3.11579264 (必须与该精确版本号匹配 build_native.sh) ----------
+      - name: Cache NDK
+        id: ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/android-sdk/ndk/26.3.11579264
+          key: ahb-ndk-r26b-v1
+
+      - name: Install NDK r26b
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          NDK_DIR=${{ github.workspace }}/android-sdk/ndk
+          mkdir -p "$NDK_DIR"
+          curl -fsSL -o ndk.zip https://dl.google.com/android/repository/android-ndk-r26b-linux.zip
+          unzip -q ndk.zip -d "$NDK_DIR"
+          rm ndk.zip
+          mv "$NDK_DIR/android-ndk-r26b" "$NDK_DIR/26.3.11579264"
+
+      # ---------- Xposed API jar (.libs/xposed-api.jar) ----------
+      - name: Cache Xposed API jar
+        id: xposed-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.libs/xposed-api.jar
+          key: ahb-xposed-api-jar-v1
+
+      - name: Download Xposed API jar
+        if: steps.xposed-cache.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          mkdir -p ${{ github.workspace }}/.libs
+          # 优先 Maven Central 的官方 API 坐标
+          curl -fsSL -o ${{ github.workspace }}/.libs/xposed-api.jar \
+            "https://repo1.maven.org/maven2/de/robv/android/xposed/api/82/api-82.jar" || \
+          curl -fsSL -o ${{ github.workspace }}/.libs/xposed-api.jar \
+            "https://jitpack.io/com/github/rovo89/XposedBridge/api-82.jar" || \
+          curl -fsSL -o ${{ github.workspace }}/.libs/xposed-api.jar \
+            "https://raw.githubusercontent.com/LSPosed/LSPosed/master/core/api/api.jar" || true
+          ls -la ${{ github.workspace }}/.libs/xposed-api.jar
+
+      # ---------- 使 build.sh / build_native.sh 在 runner 上可执行 ----------
+      - name: Fix shebang + exec
+        run: |
+          set -e
+          # 原脚本 shebang 指向手机 shell，CI 改成 /usr/bin/env bash
+          sed -i '1s|.*|#!/usr/bin/env bash|' tools/build.sh tools/build_native.sh
+          chmod +x tools/build.sh tools/build_native.sh
+
+      # ---------- Build native (.so) ----------
+      - name: Build native libraries
+        run: |
+          set -e
+          bash tools/build_native.sh
+          echo "--- built libs ---"
+          find build/lib -name '*.so'
+
+      # ---------- Build APK (javac + d8 + axml + zip + apksigner) ----------
+      - name: Build APK
+        run: |
+          set -e
+          # build.sh 里 XAPI 默认指向 $W/.libs/xposed-api.jar，路径已对齐
+          bash tools/build.sh
+          ls -la build/
+          test -f build/AntiHookBypass.apk && echo "APK OK"
+
+      # ---------- Upload artifact ----------
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AntiHookBypass-apk
+          path: build/AntiHookBypass.apk
+          if-no-files-found: error

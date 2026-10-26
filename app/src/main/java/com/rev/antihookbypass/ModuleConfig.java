@@ -70,6 +70,19 @@ final class ModuleConfig {
      */
     private static final String CFG = null;
 
+    /*
+     * 默认层配置（无配置文件时生效）。
+     *
+     * anti-cpu-hotfix：原默认 ALL（L1+L2+L3）会让 L1（TraceHide 的
+     * Throwable.getStackTrace 全量栈过滤）在 QQ 这类超大进程里高频触发，
+     * 主线程常驻 Runnable、CPU 占用极高、ANR。
+     *
+     * 改为默认只开 L2+L3（native 视图伪造 + 代码段还原），它们已覆盖本模块
+     * 要绕的六项 native 检测；L1 的 Java 栈过滤改为「按需开启」——
+     * 需要它时显式写 all / l1 重新打包即可（见 parseLayers 的 s 分支）。
+     */
+    private static final int DEFAULT_WITHOUT_L1 = LAYER_L2 | LAYER_L3;
+
     private static volatile int cachedLayers = -1;
     private static volatile int cachedNative = -1;
     private static volatile int cachedL1 = -1;
@@ -218,7 +231,7 @@ final class ModuleConfig {
          * 需要时（比如某个检测器去查 Java 栈）改这里重新打包即可 ——
          * 模块没有设置界面，默认值就应该是"对目标进程副作用最小"的那个。
          */
-        if (s == null) return ALL;
+        if (s == null) return DEFAULT_WITHOUT_L1;
         if (s.equals("all") || s.equals("default")) return ALL;
         if (s.equals("none") || s.equals("off") || s.equals("0")) return 0;
 
