@@ -36,8 +36,11 @@ build() {
   mkdir -p "$d"
 
   # shellcheck disable=SC2086
+  # 注意：不要加 -fvisibility=hidden。源码已用 __attribute__((visibility("default")))
+  # 显式导出 native_init / JNI 入口；全局 hidden 会把这些符号从动态符号表抹掉，
+  # 导致 LSPosed 加载时找不到 native_init（readelf --dyn-syms 查无此符号）。
   clang --target="$target" --sysroot="$SYS" $extra \
-      -shared -fPIC -O2 -fvisibility=hidden \
+      -shared -fPIC -O2 \
       -o "$d/libantihook_bypass.so" "$SRC" -lc -ldl -llog
 
   if readelf --dyn-syms "$d/libantihook_bypass.so" | grep -q native_init && \
