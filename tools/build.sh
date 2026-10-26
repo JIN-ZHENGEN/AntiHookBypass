@@ -12,14 +12,31 @@ set -e
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PREFIX=/data/data/com.dsharnessmobile.shell/files/usr
-W="$(cd "$ROOT/.." && pwd)"
-SDK="$W/android-sdk"
+# 定位 android-sdk：CI 装在仓库根（android-sdk），手机装在仓库父目录，做回退探测
+SDK=""
+for c in "$ROOT/android-sdk" "$ROOT/../android-sdk" "${ANDROID_SDK_ROOT:-}"; do
+  [ -n "$c" ] && [ -d "$c/build-tools/34.0.0" ] && SDK="$c" && break
+done
+[ -z "$SDK" ] && SDK="$ROOT/android-sdk"
 BT="$SDK/build-tools/34.0.0"
 AJ="$SDK/platforms/android-34/android.jar"
-XAPI="$W/.libs/xposed-api.jar"
+# 定位 xposed-api.jar（同样兼容仓库根 / 父目录）
+XAPI=""
+for c in "$ROOT/.libs/xposed-api.jar" "$ROOT/../.libs/xposed-api.jar"; do
+  [ -f "$c" ] && XAPI="$c" && break
+done
+[ -z "$XAPI" ] && XAPI="$ROOT/.libs/xposed-api.jar"
 
-export JAVA_HOME="$PREFIX/lib/jvm/java-17-openjdk"
-export PATH="$JAVA_HOME/bin:$PREFIX/bin:$PATH"
+# JDK：优先用 PATH 里现成的 javac（CI / 已装 JDK），否则回退手机 PREFIX
+if command -v javac >/dev/null 2>&1; then
+  echo "==> 使用系统 javac: $(command -v javac)"
+elif [ -d "$PREFIX/lib/jvm/java-17-openjdk" ]; then
+  export JAVA_HOME="$PREFIX/lib/jvm/java-17-openjdk"
+  export PATH="$JAVA_HOME/bin:$PREFIX/bin:$PATH"
+else
+  echo "    FAIL: 找不到 javac，请先安装 JDK 17" >&2
+  exit 1
+fi
 
 OUT="$ROOT/build"
 CLS="$OUT/classes"
