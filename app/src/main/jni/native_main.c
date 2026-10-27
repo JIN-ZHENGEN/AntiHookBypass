@@ -1034,7 +1034,34 @@ static char *ahb_read_real_maps(size_t *out_len) {
  * 中和次数一直是 0。所以这里对每一行都算一次 base = start - offset，
  * 去重后逐个尝试，成功为止。
  */
+/*
+ * ahb_collect_bases 慢路节流状态（实测修复）。
+ *
+ * 本函数读完整 /proc/self/maps 后逐行 strstr 找库名。
+ * 注释记录的「单次 1~3ms」是普通 App 的量级；QQ 这类进程
+ * maps 达数 MB、几百个映射段，单次实测几十毫秒。
+ * clv_fast_patch_thread 原来每轮都调它，3000 轮累积成
+ * 数分钟满核 CPU（实测该线程 utime 245 秒）。
+ *
+ * 两条闸门：
+ *   1) 时间节流：maps 扫描最多每 50ms 一次。库加载是毫秒级
+ *      一次性事件，50ms 粒度足够；未到间隔按「未加载」返回。
+ *   2) 熔断：连续 400 次未命中（约 20 秒）后不再扫，认定该库
+ *      在本进程内不会出现。
+ *
+ * 命中时的行为完全不变：库真出现了，照样返回基址。
+ */
+static unsigned long g_cb_last_us = 0;
+static int g_cb_miss = 0;
+
 static int ahb_collect_bases(const char *lib, uintptr_t *out, int max) {
+    /* 闸门：熔断 + 50ms 节流，均按「未加载」返回 0 */
+    if (g_cb_miss > 400) return 0;
+    {
+        unsigned long cb_now = ahb_now_us();
+        if (g_cb_last_us && (cb_now - g_cb_last_us) < 50000UL) return 0;
+        g_cb_last_us = cb_now;
+    }
     size_t len = 0;
     char *m = ahb_read_real_maps(&len);
     char *line;
@@ -1067,6 +1094,7 @@ static int ahb_collect_bases(const char *lib, uintptr_t *out, int max) {
         line = nl + 1;
     }
     free(m);
+    if (n == 0) { if (g_cb_miss < 1000000) g_cb_miss++; } else { g_cb_miss = 0; }
     return n;
 }
 
@@ -3793,9 +3821,27 @@ static void *clv_fast_patch_thread(void *arg) {
      */
     g_jvmti_watch_pending = 0;
 
+    /*
+     * 墙钟总时长兜底（实测修复）。
+     *
+     * 原实现只靠 3000 轮 x 1ms 的 nanosleep 隐含 3 秒上限，
+     * 但 ahb_neutralize_jvmti() 每轮要读一遍 /proc/self/maps
+     * （QQ 进程里数 MB）+ 逐行 strstr，单轮实测几十毫秒。
+     * 3000 轮累积成数分钟满核空转，实测该线程消耗 245 秒 CPU。
+     *
+     * 这里改为按墙钟判定：超过 3 秒无条件退出本循环。
+     * 不降低拦截能力 —— 检测器实测 435ms 内完成扫描，
+     * 3 秒窗口远超；超时后由 guard_loop 长期兜底。
+     */
+    unsigned long fb_t0 = ahb_now_us();
     for (int i = 0; i < 3000; i++) {
-        int before = g_clv_got_patched;
+        if (ahb_now_us() - fb_t0 > 3000000UL) {   /* 3 秒硬上限 */
+            AHB_SAYL("FASTPATCH: 3 秒墙钟到，退出抢跑循环（第 %d 轮，累计接管 %d）",
+                 i, g_clv_got_patched);
+            break;
+        }
         /* 每轮检查一次：库出现了就改掉它，没出现就下一轮 */
+        int before = g_clv_got_patched;
         if (ahb_neutralize_jvmti() == 1) {
             LOGE("JVMTI 中和完成（循环第 %d 轮）", i);
             break;
