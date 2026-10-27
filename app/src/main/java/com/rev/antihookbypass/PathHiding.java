@@ -47,15 +47,6 @@ final class PathHiding {
 
     private static final String REPLACE = "/system/framework/framework.jar";
 
-    /*
-     * 重入保护：用 ThreadLocal 代替 new Throwable().getStackTrace()。
-     * 旧实现每个 hook 回调都全量抓一次调用栈，QQ 这种高频 Field.get /
-     * StringBuilder.toString 环境下直接把 CPU 打满（实测 ANR 里主线程与多个
-     * binder 线程同时卡在 selfCalling，proc/pressure/cpu 54）。
-     * ThreadLocal 只需一次 map 读写，零栈捕获。
-     */
-    private static final ThreadLocal<Boolean> IN_SELF = new ThreadLocal<Boolean>();
-
     private PathHiding() { }
 
     static void install() {
@@ -172,9 +163,7 @@ final class PathHiding {
                              * 的反射读，直接放行原值。
                              */
                             if (selfCalling()) return;
-                            try {
-                                scrubResult(param);
-                            } finally { exitSelf(); }
+                            scrubResult(param);
                         }
                     });
         } catch (Throwable t) {
@@ -184,12 +173,13 @@ final class PathHiding {
 
     /** 当前调用栈里是否有本类自己的帧。 */
     private static boolean selfCalling() {
-        if (Boolean.TRUE.equals(IN_SELF.get())) return true;
-        IN_SELF.set(Boolean.TRUE);
+        StackTraceElement[] st = new Throwable().getStackTrace();
+        for (StackTraceElement e : st) {
+            String cn = e.getClassName();
+            if (cn != null && cn.startsWith("com.rev.antihookbypass.")) return true;
+        }
         return false;
     }
-
-    private static void exitSelf() { IN_SELF.remove(); }
 
     private static void scrubResult(de.robv.android.xposed.XC_MethodHook.MethodHookParam param) {
         Object r = param.getResult();
@@ -951,14 +941,12 @@ final class PathHiding {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
                             if (selfCalling()) return;
-                            try {
                             Object r = param.getResult();
                             if (!(r instanceof String)) return;
                             String v = (String) r;
                             if (v.contains(SELF_SHORT) || v.contains(SELF)) {
                                 param.setResult(scrubModuleSegment(v));
                             }
-                            } finally { exitSelf(); }
                         }
                     });
             HookEntry.log("PathHiding 已挂 StringBuilder.toString");
@@ -973,14 +961,12 @@ final class PathHiding {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
                             if (selfCalling()) return;
-                            try {
                             Object r = param.getResult();
                             if (!(r instanceof String)) return;
                             String v = (String) r;
                             if (v.contains(SELF_SHORT) || v.contains(SELF)) {
                                 param.setResult(scrubModuleSegment(v));
                             }
-                            } finally { exitSelf(); }
                         }
                     });
             HookEntry.log("PathHiding 已挂 String.concat");
