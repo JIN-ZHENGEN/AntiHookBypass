@@ -47,18 +47,46 @@ final class TraceHide {
     };
 
     /**
-     * getStackTrace 结果缓存：key=原始栈数组身份(NativeIdentity)，value=过滤后结果 + 时间戳。
-     * 用 WeakHashMap 避免泄漏原始 StackTraceElement[]（它们会被 GC 回收）。
+     * getStackTrace 结果缓存（anti-cpu-hotfix v2）。
+     *
+     * 原做法以 StackTraceElement[] 数组身份为 key，但 getStackTrace 每次都
+     * new 一个全新数组，key 永不相同 → 缓存 100% miss，等于没缓存。
+     *
+     * 正确做法：以「线程 + 栈指纹」为 key。
+     *   指纹 = 最近 FINGERPRINT_DEPTH 帧的 className.hashCode() 混合。
+     *   同一线程反复取栈（业务代码在热点循环里取栈、检测器轮询）指纹稳定 → 命中。
+     *   指纹不同（换调用点）才走一次完整 filter。
+     * 用 ThreadLocal 持有本线程上一份结果，避免全局 map 的锁竞争与 GC 压力。
      */
-    private static final WeakHashMap<StackTraceElement[], CacheEntry> sTraceCache =
-            new WeakHashMap<>();
-    /** 窗口期：同一份栈在 200ms 内直接复用缓存，避免高频取栈时反复重建 */
+    private static final int FINGERPRINT_DEPTH = 8;
     private static final long TRACE_TTL_MS = 200L;
 
-    private static final class CacheEntry {
-        StackTraceElement[] value;
+    private static final class TraceCache {
+        long fp;
         long ts;
-        CacheEntry(StackTraceElement[] v, long t) { value = v; ts = t; }
+        StackTraceElement[] value;
+    }
+
+    private static final ThreadLocal<TraceCache> TL_TRACE_CACHE = new ThreadLocal<TraceCache>();
+
+    /** 计算栈指纹：取前 depth 帧的类名 + 方法名哈希混合。 */
+    private static long fingerprint(StackTraceElement[] frames) {
+        int n = frames.length < FINGERPRINT_DEPTH ? frames.length : FINGERPRINT_DEPTH;
+        long h = 1125899906842597L;
+        for (int i = 0; i < n; i++) {
+            StackTraceElement e = frames[i];
+            if (e == null) {
+                h = h * 31 + 7;
+                continue;
+            }
+            String cn = e.getClassName();
+            String mn = e.getMethodName();
+            h = h * 31 + (cn == null ? 0 : cn.hashCode());
+            h = h * 31 + (mn == null ? 0 : mn.hashCode());
+        }
+        /* 长度也纳入指纹：同前缀不同深度视为不同栈 */
+        h = h * 31 + (long) frames.length;
+        return h;
     }
 
     static void install(ClassLoader cl) {
@@ -390,30 +418,23 @@ final class TraceHide {
                     if (!(r instanceof StackTraceElement[])) return;
                     StackTraceElement[] frames = (StackTraceElement[]) r;
                     /*
-                     * 缓存短路：绝大多数业务取栈不含框架帧，原样返回且缓存窗口期内复用，
-                     * 不再逐帧重建。命中缓存时直接 return，零过滤成本。
+                     * anti-cpu-hotfix v2：按「线程 + 栈指纹」做 TTL 缓存。
+                     * 命中时直接复用上次结果，零 filter 成本。
                      */
                     long now = System.currentTimeMillis();
-                    CacheEntry e = null;
-                    boolean hit = false;
-                    synchronized (sTraceCache) {
-                        e = sTraceCache.get(frames);
-                        if (e != null && (now - e.ts) < TRACE_TTL_MS) {
-                            hit = true;
-                        }
-                    }
-                    if (hit) {
-                        // 窗口期内复用；若上次判定无需过滤则保持原结果
-                        if (e.value != null) param.setResult(e.value);
+                    long fp = fingerprint(frames);
+                    TraceCache c = TL_TRACE_CACHE.get();
+                    if (c != null && c.fp == fp && (now - c.ts) < TRACE_TTL_MS) {
+                        if (c.value != null) param.setResult(c.value);
                         return;
                     }
                     StackTraceElement[] cleaned = filter(frames);
-                    synchronized (sTraceCache) {
-                        // 仅缓存「未改动」或「小幅改动」的结果，避免缓存巨型数组
-                        sTraceCache.put(frames, new CacheEntry(cleaned, now));
-                        // 控制缓存体量
-                        if (sTraceCache.size() > 256) sTraceCache.clear();
-                    }
+                    TraceCache nc = (c == null) ? new TraceCache() : c;
+                    nc.fp = fp;
+                    nc.ts = now;
+                    /* 只在「无需剥离」或「剥离后仍非空」时缓存，避免缓存 null 掩盖真实剥离 */
+                    nc.value = (cleaned == null) ? frames : cleaned;
+                    TL_TRACE_CACHE.set(nc);
                     if (cleaned != null) param.setResult(cleaned);
                 }
             });
